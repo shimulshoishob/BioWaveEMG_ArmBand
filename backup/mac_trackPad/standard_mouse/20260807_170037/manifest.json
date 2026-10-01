@@ -1,9 +1,0 @@
-{
-  "participant_id": "mac_trackPad",
-  "controller_mode": "Standard mouse",
-  "base_target_width": 60,
-  "base_target_distance": 400,
-  "trials_per_block": 16,
-  "random_seed": 92419,
-  "fixed_step_size": 30.0
-}

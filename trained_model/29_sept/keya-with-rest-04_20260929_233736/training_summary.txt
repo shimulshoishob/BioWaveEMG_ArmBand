@@ -1,0 +1,8 @@
+Run Folder: trained_model/29_sept/keya-with-rest-04_20260929_233736
+Model File: trained_model/29_sept/keya-with-rest-04_20260929_233736/rf_realtime_model.joblib
+Datasets: 3 file(s)
+Accuracy: 0.9455
+Train windows: 4183 | Test windows: 1046
+Window: 250 ms (125 samples) | Stride: 50 ms (25 samples)
+Input channels: 11
+Classes: Down, Left, Rest, Right, Up, down, fist_close, up

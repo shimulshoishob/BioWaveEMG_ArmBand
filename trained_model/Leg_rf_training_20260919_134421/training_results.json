@@ -1,0 +1,136 @@
+{
+  "created_at_text": "2026-09-19 13:44:21",
+  "accuracy": 0.9485815602836879,
+  "train_windows": 2253,
+  "test_windows": 564,
+  "num_features": 231,
+  "classes": [
+    "Down",
+    "Fist_Close",
+    "Left",
+    "Rest",
+    "Right",
+    "Up"
+  ],
+  "class_window_counts": {
+    "Down": 342,
+    "Fist_Close": 342,
+    "Left": 342,
+    "Rest": 1108,
+    "Right": 341,
+    "Up": 342
+  },
+  "segment_count_by_file": {
+    "dataset/Leg_Shimul-19-sept-2026_20260919_134319/emg_data_Leg_Shimul-19-sept-2026_20260919_134319.csv": 60
+  },
+  "channel_count_by_file": {
+    "dataset/Leg_Shimul-19-sept-2026_20260919_134319/emg_data_Leg_Shimul-19-sept-2026_20260919_134319.csv": 11
+  },
+  "input_channels": 11,
+  "skipped_channel_segments": 0,
+  "confusion_matrix": [
+    [
+      68,
+      0,
+      0,
+      1,
+      0,
+      0
+    ],
+    [
+      0,
+      61,
+      0,
+      4,
+      0,
+      3
+    ],
+    [
+      0,
+      0,
+      67,
+      2,
+      0,
+      0
+    ],
+    [
+      0,
+      7,
+      1,
+      208,
+      4,
+      2
+    ],
+    [
+      3,
+      0,
+      0,
+      2,
+      63,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      68
+    ]
+  ],
+  "classification_report_text": "              precision     recall   f1-score    support\n\n        Down     0.9577     0.9855     0.9714         69\n  Fist_Close     0.8971     0.8971     0.8971         68\n        Left     0.9853     0.9710     0.9781         69\n        Rest     0.9585     0.9369     0.9476        222\n       Right     0.9403     0.9265     0.9333         68\n          Up     0.9315     1.0000     0.9645         68\n\n    accuracy                           0.9486        564\n   macro avg     0.9451     0.9528     0.9487        564\nweighted avg     0.9488     0.9486     0.9485        564",
+  "classification_report_dict": {
+    "Down": {
+      "precision": 0.9577464788732394,
+      "recall": 0.9855072463768116,
+      "f1-score": 0.9714285714285714,
+      "support": 69.0
+    },
+    "Fist_Close": {
+      "precision": 0.8970588235294118,
+      "recall": 0.8970588235294118,
+      "f1-score": 0.8970588235294118,
+      "support": 68.0
+    },
+    "Left": {
+      "precision": 0.9852941176470589,
+      "recall": 0.9710144927536232,
+      "f1-score": 0.9781021897810219,
+      "support": 69.0
+    },
+    "Rest": {
+      "precision": 0.9585253456221198,
+      "recall": 0.9369369369369369,
+      "f1-score": 0.9476082004555809,
+      "support": 222.0
+    },
+    "Right": {
+      "precision": 0.9402985074626866,
+      "recall": 0.9264705882352942,
+      "f1-score": 0.9333333333333333,
+      "support": 68.0
+    },
+    "Up": {
+      "precision": 0.9315068493150684,
+      "recall": 1.0,
+      "f1-score": 0.9645390070921985,
+      "support": 68.0
+    },
+    "accuracy": 0.9485815602836879,
+    "macro avg": {
+      "precision": 0.9450716870749308,
+      "recall": 0.9528313479720131,
+      "f1-score": 0.9486783542700196,
+      "support": 564.0
+    },
+    "weighted avg": {
+      "precision": 0.9488389931718058,
+      "recall": 0.9485815602836879,
+      "f1-score": 0.9484786563360585,
+      "support": 564.0
+    }
+  },
+  "model_file": "rf_realtime_model.joblib",
+  "run_dir": "trained_model/Leg_rf_training_20260919_134421",
+  "model_path": "trained_model/Leg_rf_training_20260919_134421/rf_realtime_model.joblib"
+}

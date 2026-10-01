@@ -1,3 +1,0 @@
-participant_id,block_number,difficulty,trial_number,target_id,target_index,target_width,target_distance,target_center_x,target_center_y,trial_start,trial_end,movement_time_s,misses_before_success
-p1,1,Medium,1,p1-block-1-trial-1-target-1,1,60,400,861,309,1786007864.055122,1786007865.68996,1.6349078339990228,0
-p1,1,Medium,2,p1-block-1-trial-2-target-5,5,60,400,579,591,1786007865.690416,1786007866.821557,1.1311894159880467,0

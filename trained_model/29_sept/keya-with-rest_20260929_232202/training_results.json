@@ -1,0 +1,136 @@
+{
+  "created_at_text": "2026-09-29 23:22:02",
+  "accuracy": 0.8553971486761711,
+  "train_windows": 1963,
+  "test_windows": 491,
+  "num_features": 231,
+  "classes": [
+    "Left",
+    "Rest",
+    "Right",
+    "down",
+    "fist_close",
+    "up"
+  ],
+  "class_window_counts": {
+    "Left": 296,
+    "Rest": 969,
+    "Right": 294,
+    "down": 296,
+    "fist_close": 310,
+    "up": 289
+  },
+  "segment_count_by_file": {
+    "dataset/keya-with_rest_20260929_131930/emg_data_keya-with_rest_20260929_131930.csv": 50
+  },
+  "channel_count_by_file": {
+    "dataset/keya-with_rest_20260929_131930/emg_data_keya-with_rest_20260929_131930.csv": 11
+  },
+  "input_channels": 11,
+  "skipped_channel_segments": 0,
+  "confusion_matrix": [
+    [
+      42,
+      4,
+      3,
+      0,
+      0,
+      10
+    ],
+    [
+      2,
+      178,
+      5,
+      1,
+      6,
+      2
+    ],
+    [
+      0,
+      7,
+      45,
+      7,
+      0,
+      0
+    ],
+    [
+      0,
+      4,
+      1,
+      53,
+      1,
+      0
+    ],
+    [
+      0,
+      8,
+      0,
+      0,
+      54,
+      0
+    ],
+    [
+      5,
+      5,
+      0,
+      0,
+      0,
+      48
+    ]
+  ],
+  "classification_report_text": "              precision     recall   f1-score    support\n\n        Left     0.8571     0.7119     0.7778         59\n        Rest     0.8641     0.9175     0.8900        194\n       Right     0.8333     0.7627     0.7965         59\n        down     0.8689     0.8983     0.8833         59\n  fist_close     0.8852     0.8710     0.8780         62\n          up     0.8000     0.8276     0.8136         58\n\n    accuracy                           0.8554        491\n   macro avg     0.8514     0.8315     0.8399        491\nweighted avg     0.8552     0.8554     0.8539        491",
+  "classification_report_dict": {
+    "Left": {
+      "precision": 0.8571428571428571,
+      "recall": 0.711864406779661,
+      "f1-score": 0.7777777777777778,
+      "support": 59.0
+    },
+    "Rest": {
+      "precision": 0.8640776699029126,
+      "recall": 0.9175257731958762,
+      "f1-score": 0.89,
+      "support": 194.0
+    },
+    "Right": {
+      "precision": 0.8333333333333334,
+      "recall": 0.7627118644067796,
+      "f1-score": 0.7964601769911505,
+      "support": 59.0
+    },
+    "down": {
+      "precision": 0.8688524590163934,
+      "recall": 0.8983050847457628,
+      "f1-score": 0.8833333333333333,
+      "support": 59.0
+    },
+    "fist_close": {
+      "precision": 0.8852459016393442,
+      "recall": 0.8709677419354839,
+      "f1-score": 0.8780487804878049,
+      "support": 62.0
+    },
+    "up": {
+      "precision": 0.8,
+      "recall": 0.8275862068965517,
+      "f1-score": 0.8135593220338984,
+      "support": 58.0
+    },
+    "accuracy": 0.8553971486761711,
+    "macro avg": {
+      "precision": 0.8514420368391401,
+      "recall": 0.8314935129933526,
+      "f1-score": 0.8398632317706607,
+      "support": 491.0
+    },
+    "weighted avg": {
+      "precision": 0.8552275034274274,
+      "recall": 0.8553971486761711,
+      "f1-score": 0.8539351752876648,
+      "support": 491.0
+    }
+  },
+  "model_file": "rf_realtime_model.joblib",
+  "run_dir": "trained_model/29_sept/keya-with-rest_20260929_232202",
+  "model_path": "trained_model/29_sept/keya-with-rest_20260929_232202/rf_realtime_model.joblib"
+}

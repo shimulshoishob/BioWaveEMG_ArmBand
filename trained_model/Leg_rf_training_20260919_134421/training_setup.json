@@ -1,0 +1,20 @@
+{
+  "created_at_text": "2026-09-19 13:44:21",
+  "dataset_paths": [
+    "dataset/Leg_Shimul-19-sept-2026_20260919_134319/emg_data_Leg_Shimul-19-sept-2026_20260919_134319.csv"
+  ],
+  "output_dir": "trained_model",
+  "run_name": "Leg_rf_training",
+  "window_ms": 200,
+  "stride_ms": 50,
+  "window_samples": 100,
+  "stride_samples": 25,
+  "n_estimators": 150,
+  "max_depth": 16,
+  "test_size": 0.2,
+  "random_seed": 42,
+  "class_weight_balanced": true,
+  "auto_load_model": true,
+  "sample_rate_hz": 500,
+  "input_channels": 11
+}

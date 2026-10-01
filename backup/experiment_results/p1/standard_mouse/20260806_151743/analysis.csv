@@ -1,2 +1,0 @@
-participant_id,difficulty,target_width,target_distance,trial_count,Movement Time (MT) s,Effective Distance (De) px,Effective Width (We) px,Effective Index of Difficulty (IDe) bits,Throughput (TP) bits/s,Path Efficiency,Target Re-entry Rate,Overshoot Count,Direction Reversal Count,Time to First Movement s,Click Error Rate
-p1,Medium,60.0,400.0,2,1.3830486249935348,390.53040854714504,,,,0.9698171431515494,0.0,0.0,2.0,0.016830921173095703,0.0

@@ -1,2 +1,0 @@
-participant_id,controller_mode,Movement Time (MT) s,Effective Distance (De) px,Effective Width (We) px,Effective Index of Difficulty (IDe) bits,Throughput (TP) bits/s,Path Efficiency,Target Re-entry Rate,Overshoot Count,Direction Reversal Count,Time to First Movement s,Click Error Rate
-p1,Standard mouse,1.2379068546233611,394.6527666099904,45.211634000488026,3.302088582322007,2.9708838297368647,0.9066376209749255,0.09821428571428571,2.4285714285714284,42.285714285714285,0.14060762723286943,0.04108309990662932

@@ -1,0 +1,188 @@
+{
+  "created_at_text": "2026-09-29 23:37:36",
+  "accuracy": 0.9455066921606119,
+  "train_windows": 4183,
+  "test_windows": 1046,
+  "num_features": 231,
+  "classes": [
+    "Down",
+    "Left",
+    "Rest",
+    "Right",
+    "Up",
+    "down",
+    "fist_close",
+    "up"
+  ],
+  "class_window_counts": {
+    "Down": 319,
+    "Left": 836,
+    "Rest": 894,
+    "Right": 838,
+    "Up": 318,
+    "down": 564,
+    "fist_close": 900,
+    "up": 560
+  },
+  "segment_count_by_file": {
+    "dataset/keya-with_rest_20260929_131930/emg_data_keya-with_rest_20260929_131930.csv": 50,
+    "dataset/Keya_without_randomizer_20260929_140911/emg_data_Keya_without_randomizer_20260929_140911.csv": 25,
+    "dataset/keya-0001_20260929_131441/emg_data_keya-0001_20260929_131441.csv": 25
+  },
+  "channel_count_by_file": {
+    "dataset/keya-with_rest_20260929_131930/emg_data_keya-with_rest_20260929_131930.csv": 11,
+    "dataset/Keya_without_randomizer_20260929_140911/emg_data_Keya_without_randomizer_20260929_140911.csv": 11,
+    "dataset/keya-0001_20260929_131441/emg_data_keya-0001_20260929_131441.csv": 11
+  },
+  "input_channels": 11,
+  "skipped_channel_segments": 0,
+  "confusion_matrix": [
+    [
+      60,
+      0,
+      0,
+      1,
+      0,
+      3,
+      0,
+      0
+    ],
+    [
+      0,
+      156,
+      4,
+      4,
+      0,
+      0,
+      0,
+      3
+    ],
+    [
+      0,
+      1,
+      174,
+      0,
+      0,
+      0,
+      3,
+      1
+    ],
+    [
+      0,
+      2,
+      5,
+      160,
+      0,
+      0,
+      1,
+      0
+    ],
+    [
+      0,
+      1,
+      1,
+      1,
+      59,
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      0,
+      2,
+      2,
+      0,
+      104,
+      5,
+      0
+    ],
+    [
+      0,
+      1,
+      8,
+      1,
+      0,
+      0,
+      170,
+      0
+    ],
+    [
+      0,
+      1,
+      5,
+      0,
+      0,
+      0,
+      0,
+      106
+    ]
+  ],
+  "classification_report_text": "              precision     recall   f1-score    support\n\n        Down     1.0000     0.9375     0.9677         64\n        Left     0.9630     0.9341     0.9483        167\n        Rest     0.8744     0.9721     0.9206        179\n       Right     0.9467     0.9524     0.9496        168\n          Up     1.0000     0.9365     0.9672         63\n        down     0.9720     0.9204     0.9455        113\n  fist_close     0.9497     0.9444     0.9471        180\n          up     0.9550     0.9464     0.9507        112\n\n    accuracy                           0.9455       1046\n   macro avg     0.9576     0.9430     0.9496       1046\nweighted avg     0.9475     0.9455     0.9458       1046",
+  "classification_report_dict": {
+    "Down": {
+      "precision": 1.0,
+      "recall": 0.9375,
+      "f1-score": 0.967741935483871,
+      "support": 64.0
+    },
+    "Left": {
+      "precision": 0.9629629629629629,
+      "recall": 0.9341317365269461,
+      "f1-score": 0.9483282674772037,
+      "support": 167.0
+    },
+    "Rest": {
+      "precision": 0.8743718592964824,
+      "recall": 0.9720670391061452,
+      "f1-score": 0.9206349206349206,
+      "support": 179.0
+    },
+    "Right": {
+      "precision": 0.9467455621301775,
+      "recall": 0.9523809523809523,
+      "f1-score": 0.9495548961424333,
+      "support": 168.0
+    },
+    "Up": {
+      "precision": 1.0,
+      "recall": 0.9365079365079365,
+      "f1-score": 0.9672131147540983,
+      "support": 63.0
+    },
+    "down": {
+      "precision": 0.9719626168224299,
+      "recall": 0.9203539823008849,
+      "f1-score": 0.9454545454545454,
+      "support": 113.0
+    },
+    "fist_close": {
+      "precision": 0.9497206703910615,
+      "recall": 0.9444444444444444,
+      "f1-score": 0.947075208913649,
+      "support": 180.0
+    },
+    "up": {
+      "precision": 0.954954954954955,
+      "recall": 0.9464285714285714,
+      "f1-score": 0.9506726457399103,
+      "support": 112.0
+    },
+    "accuracy": 0.9455066921606119,
+    "macro avg": {
+      "precision": 0.9575898283197586,
+      "recall": 0.9429768328369851,
+      "f1-score": 0.949584441825079,
+      "support": 1046.0
+    },
+    "weighted avg": {
+      "precision": 0.9475306724598811,
+      "recall": 0.9455066921606119,
+      "f1-score": 0.9458363687174368,
+      "support": 1046.0
+    }
+  },
+  "model_file": "rf_realtime_model.joblib",
+  "run_dir": "trained_model/29_sept/keya-with-rest-04_20260929_233736",
+  "model_path": "trained_model/29_sept/keya-with-rest-04_20260929_233736/rf_realtime_model.joblib"
+}

@@ -1,0 +1,20 @@
+{
+  "created_at_text": "2026-09-29 23:23:52",
+  "dataset_paths": [
+    "dataset/keya-with_rest_20260929_131930/emg_data_keya-with_rest_20260929_131930.csv"
+  ],
+  "output_dir": "trained_model/29_sept",
+  "run_name": "keya-with-rest-01",
+  "window_ms": 200,
+  "stride_ms": 50,
+  "window_samples": 100,
+  "stride_samples": 25,
+  "n_estimators": 150,
+  "max_depth": 16,
+  "test_size": 0.2,
+  "random_seed": 42,
+  "class_weight_balanced": true,
+  "auto_load_model": true,
+  "sample_rate_hz": 500,
+  "input_channels": 11
+}
