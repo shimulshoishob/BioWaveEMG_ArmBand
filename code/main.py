@@ -13,6 +13,7 @@ import time
 import traceback
 from collections import deque
 from dataclasses import dataclass
+from html import escape as html_escape
 from urllib.parse import quote
 
 import numpy as np
@@ -33,6 +34,7 @@ from PyQt5.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QRegion,
 )
 from PyQt5.QtWidgets import (
@@ -47,6 +49,7 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QFrame,
     QGraphicsOpacityEffect,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -65,6 +68,7 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -74,8 +78,11 @@ from app_theme import (
     THEME_COLORS,
     apply_dark_theme,
     apply_dark_title_bar,
+    clamp_minimum_size,
     configure_high_dpi,
     fit_window_to_screen,
+    install_screen_fit_filter,
+    recommended_font_px,
     wrap_in_scroll_area,
     themed_button_style,
     themed_label_style,
@@ -121,21 +128,6 @@ except Exception:
     delayed = None
     HAS_JOBLIB_PARALLEL = False
 
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = True  # Slam mouse to a screen corner to abort.
-    HAS_PYAUTOGUI = True
-except Exception:
-    pyautogui = None
-    HAS_PYAUTOGUI = False
-
-# Gesture class -> mouse action mapping options (used by MouseControlWindow).
-MOUSE_ACTIONS = [
-    "Ignore",
-    "Move Up", "Move Down", "Move Left", "Move Right",
-    "Left Click", "Right Click", "Double Click",
-]
-
 # --- PATHS ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if os.path.basename(SCRIPT_DIR).lower() == "code":
@@ -147,6 +139,133 @@ TRAINED_MODEL_DIR = os.path.join(PROJECT_ROOT, "trained_model")
 os.makedirs(DATASET_DIR, exist_ok=True)
 os.makedirs(TRAINED_MODEL_DIR, exist_ok=True)
 APP_ICON_PATH = os.path.join(SCRIPT_DIR, "images", "app_icon.png")
+
+# --- GESTURE REFERENCE IMAGES (shown during data collection) ---
+# Searched in order; put the PNGs in images/gestures/ (preferred) or images/.
+GESTURE_IMAGE_DIRS = [
+    os.path.join(SCRIPT_DIR, "images", "gestures"),
+    os.path.join(SCRIPT_DIR, "images"),
+    os.path.join(PROJECT_ROOT, "images", "gestures"),
+    os.path.join(PROJECT_ROOT, "images"),
+]
+# Box (logical px) the reference image is fitted into, aspect ratio kept.
+# Sized for landscape photos (~2:1); square images simply use less width.
+GESTURE_IMAGE_MAX_W = 300
+GESTURE_IMAGE_MAX_H = 160
+GESTURE_IMAGE_RADIUS = 10
+# Keys are normalized labels: lowercase, letters/digits only
+# (so "Double_Closed_Fist", "double closed fist" and "DoubleClosedFist" all match).
+GESTURE_IMAGE_FILES = {
+    "right": "right.png",
+    "left": "left.png",
+    "up": "up.png",
+    "down": "down.png",
+    "fistclose": "fist_close.png",
+    "closefist": "fist_close.png",
+    "fist": "fist_close.png",
+    "victorysign": "v_sign.png",
+    "victory": "v_sign.png",
+    "vsign": "v_sign.png",
+    "doubleclosedfist": "double_fist_close.png",
+    "doublefistclose": "double_fist_close.png",
+    "doublefist": "double_fist_close.png",
+    "pinch": "pinch.png",
+    "pinchusingthumbandindexfinger": "pinch.png",
+    "indexthumbpinch": "pinch.png",
+    "thumbindexpinch": "pinch.png",
+    "thumbsup": "thumbs_up.png",
+    "thumbup": "thumbs_up.png",
+    "rest": "rest.png",
+}
+_GESTURE_PIXMAP_CACHE = {}
+
+
+def _normalize_gesture_key(label):
+    return "".join(ch for ch in str(label or "").lower() if ch.isalnum())
+
+
+def resolve_gesture_image_path(label):
+    key = _normalize_gesture_key(label)
+    if not key:
+        return ""
+    candidates = []
+    mapped = GESTURE_IMAGE_FILES.get(key)
+    if mapped:
+        candidates.append(mapped)
+    # Fallback: a file named after the label itself (e.g. a custom class "wave" -> wave.png).
+    raw = str(label).strip().lower().replace(" ", "_")
+    for ext in (".png", ".jpg", ".jpeg"):
+        candidates.extend([f"{raw}{ext}", f"{key}{ext}"])
+    for folder in GESTURE_IMAGE_DIRS:
+        for name in candidates:
+            p = os.path.join(folder, name)
+            if os.path.isfile(p):
+                return p
+    return ""
+
+
+def get_gesture_pixmap(label, max_w=GESTURE_IMAGE_MAX_W, max_h=GESTURE_IMAGE_MAX_H, dpr=1.0):
+    """Return a scaled, rounded QPixmap for a gesture label, or None if no image is found.
+
+    Results (including misses) are cached, so after the first lookup a label
+    costs one dict hit - no disk access or rescaling while a trial is running.
+    """
+    dpr = max(1.0, float(dpr or 1.0))
+    label_key = (_normalize_gesture_key(label), int(max_w), int(max_h), round(dpr, 2))
+    if label_key in _GESTURE_PIXMAP_CACHE:
+        return _GESTURE_PIXMAP_CACHE[label_key]
+    pix = None
+    p = resolve_gesture_image_path(label)
+    if p:
+        src_pix = QPixmap(p)
+        if not src_pix.isNull():
+            # Scale in device pixels so the image stays sharp on high-DPI screens.
+            scaled = src_pix.scaled(
+                int(round(max_w * dpr)), int(round(max_h * dpr)),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+            pix = QPixmap(scaled.size())
+            pix.fill(Qt.transparent)
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            clip = QPainterPath()
+            r = GESTURE_IMAGE_RADIUS * dpr
+            clip.addRoundedRect(QRectF(0, 0, scaled.width(), scaled.height()), r, r)
+            painter.setClipPath(clip)
+            painter.drawPixmap(0, 0, scaled)
+            painter.end()
+            pix.setDevicePixelRatio(dpr)
+    _GESTURE_PIXMAP_CACHE[label_key] = pix
+    return pix
+
+
+class StableLabel(QLabel):
+    """QLabel that ignores setText/setStyleSheet calls which would not change anything.
+
+    Re-applying an identical stylesheet still makes Qt re-polish and re-layout the
+    widget, which adds up for labels refreshed many times per second.
+    """
+
+    def setText(self, text):
+        if text != self.text():
+            super().setText(text)
+
+    def setStyleSheet(self, style):
+        if style != self.styleSheet():
+            super().setStyleSheet(style)
+
+
+# --- PARTICIPANT INFO (data collection; saved to the metadata file) ---
+BLOOD_GROUP_OPTIONS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+
+
+def _value_or_na(value, fmt, cast=float):
+    """Format a participant measurement, or 'N/A' when it was left empty (<= 0)."""
+    try:
+        v = cast(value)
+    except (TypeError, ValueError):
+        return "N/A"
+    return fmt.format(v) if v > 0 else "N/A"
 
 APP_ICON = None
 
@@ -233,11 +352,26 @@ MAINS_FREQS = [50.0, 60.0]
 MAINS_BAND_HZ = 2.0
 MAX_LAG_SAMPLES = int(0.10 * SAMPLE_RATE)
 DEFAULT_TASK_LABELS ="Left,Right,fist_close,Up,Down,Double_Closed_Fist,Victory_Sign,Thumbs_Up,Pinch_using_thumb_and_index_finger,Rest"
-DEFAULT_TASK_PREP_S = 2.0
+# --- STUDY PROTOCOL (defaults follow the approved study procedure) ---
+# One task cycle = 4 s prepare + 3 s perform/hold + 3 s rest = 10 s. The rest period is
+# recorded as its own class. Each day: 9 repetitions per hand (left + right) of every class.
+DEFAULT_TASK_PREP_S = 4.0
 DEFAULT_TASK_HOLD_S = 3.0
-DEFAULT_TASK_REST_S = 2.0
-DEFAULT_TASK_SETTLE_S = 0.3   # Un-recorded gap after each hold, before Rest capture starts.
-DEFAULT_TASK_REPEATS = 3
+DEFAULT_TASK_REST_S = 3.0
+DEFAULT_TASK_SETTLE_S = 0.0   # Optional un-recorded gap after each hold (0 keeps the cycle at 10 s).
+DEFAULT_TASK_REPEATS = 9      # Repetitions per class PER HAND in one session.
+DEFAULT_SESSION_DAY = 1
+DEFAULT_HAND_ORDER = "left_right"
+HAND_ORDER_OPTIONS = [
+    ("left_right", "Left hand, then Right hand"),
+    ("right_left", "Right hand, then Left hand"),
+    ("left", "Left hand only"),
+    ("right", "Right hand only"),
+]
+DEFAULT_MAX_CYCLES_PER_BLOCK = 30   # <= 30 cycles (~5 min) without a break
+DEFAULT_BLOCK_BREAK_S = 210         # 3-4 min break between blocks
+DEFAULT_HAND_SWITCH_BREAK_S = 300   # ~5 min when the armband moves to the other arm
+STUDY_ENV_KEYS = ("temp_start_c", "humidity_start_pct")
 DEFAULT_RECORD_CSV = "realtime_collected_emg.csv"
 DEFAULT_RF_MODEL_ARTIFACT = "rf_realtime_model.joblib"
 MIN_RECORD_SAMPLE_RATIO = 0.80
@@ -251,6 +385,11 @@ DISCOVERY_ADDRESS = "255.255.255.255"
 DISCOVERY_TIMEOUT = 1.2
 CONTROL_TIMEOUT = 2.0
 KEEPALIVE_INTERVAL_MS = 2000
+GESTURE_BRIDGE_HOST = "127.0.0.1"   # Predictions are mirrored here for the separate gesture_game_app.py
+GESTURE_BRIDGE_PORT = 5005
+UDP_RECV_BUFFER_BYTES = 4 * 1024 * 1024   # Kernel buffer: rides out UI stalls without dropping packets
+STREAM_EMIT_INTERVAL_S = 0.020            # Receiver hands the UI one merged batch per ~20 ms
+PACKET_TRACER_TICK_MS = 250
 WIRELESS_EMG_CHANNELS = 8
 WIRELESS_IMU_CHANNELS = 3
 WIRELESS_TOTAL_CHANNELS = WIRELESS_EMG_CHANNELS + WIRELESS_IMU_CHANNELS
@@ -271,13 +410,6 @@ RF_INFLIGHT_TIMEOUT_S = 1.0       # Self-heal if a submitted window never report
 RF_DEFAULT_N_ESTIMATORS = 150
 RF_DEFAULT_MAX_DEPTH = 16
 RF_DEFAULT_MIN_SAMPLES_LEAF = 2
-# --- GESTURE GAME ---
-GAME_LANES = 3
-GAME_LOOP_MS = 33                  # ~30 FPS render/update loop
-GAME_GESTURE_POLL_MS = 90          # How often we sample the RF prediction for the game
-GAME_MIN_CONFIDENCE_PCT = 12.0     # Low bar so gesture control feels responsive, not laggy
-GAME_ACTION_COOLDOWN_S = 0.45      # Debounce between accepted gesture actions
-
 CAL_REST_MS = 3000               # Rest capture duration
 CAL_FLEX_MS = 3000               # Flex capture duration
 CAL_DURATION_MIN_S = 3           # Per-phase calibration duration lower bound
@@ -311,18 +443,142 @@ LIVE_Y_PADDING_RATIO = 0.10
 LIVE_Y_MIN_HALF_RANGE = 25.0
 IMU_LIVE_Y_MIN_HALF_RANGE = 5.0
 PLOT_AXIS_TICK_FONT_PT = 9
+MONO_FONT_CSS = "Menlo, Consolas, 'Courier New', monospace"   # Menlo on macOS, Consolas on Windows
+
+
+# Packed layout of one wireless frame - identical to struct format WIRELESS_FRAME_FORMAT.
+_WIRELESS_FRAME_DTYPE = np.dtype([
+    ("frame_id", "<u4"), ("frame_ts", "<u4"), ("imu_id", "<u4"), ("imu_ts", "<u4"),
+    ("emg", "<u2", (WIRELESS_EMG_CHANNELS,)), ("imu", "<f4", (WIRELESS_IMU_CHANNELS,)),
+    ("fresh", "u1"), ("pad", "V3"),
+])
+assert _WIRELESS_FRAME_DTYPE.itemsize == WIRELESS_FRAME_SIZE, "wireless frame layout mismatch"
+
+
+class PacketTracer:
+    """Transport health counters: the receive thread writes, the UI thread reads.
+
+    Wireless: counts UDP datagrams and detects missing / out-of-order packets from the
+    firmware's 32-bit packet sequence number. Wired: the text stream has no sequence
+    number, so every malformed/truncated line is counted as one lost sample, and the
+    achieved sample rate is compared against the nominal rate.
+    All writers hold one tiny lock for a few integer updates per packet.
+    """
+
+    HISTORY = 120   # points kept for the tracer plots (HISTORY * tick = 30 s)
+
+    def __init__(self, expected_sample_rate=SAMPLE_RATE):
+        self._lock = threading.Lock()
+        self.expected_sample_rate = float(expected_sample_rate)
+        self.reset()
+
+    def reset(self, kind="wireless", frames_per_packet=WIRELESS_FRAMES_PER_PACKET):
+        with self._lock:
+            self.kind = str(kind)
+            self.frames_per_packet = max(1, int(frames_per_packet))
+            self.stats = WirelessStats()
+            self.invalid_lines = 0
+            self.samples = 0
+            self.bytes = 0
+            self.started = time.monotonic()
+            self.last_arrival = 0.0
+            self.max_gap_s = 0.0
+            self.pkt_rate = 0.0
+            self.sample_rate = 0.0
+            self._points = deque(maxlen=5)
+            self.rate_history = deque(maxlen=self.HISTORY)
+            self.sample_rate_history = deque(maxlen=self.HISTORY)
+            self.missing_history = deque(maxlen=self.HISTORY)
+
+    # -- writers (receive thread) ------------------------------------------------
+    def observe_wireless(self, sequence, n_samples, n_bytes, arrival):
+        """Record one datagram; returns how many packets were missing before it."""
+        with self._lock:
+            gap = self.stats.observe(sequence, arrival)
+            self.samples += int(n_samples)
+            self.bytes += int(n_bytes)
+            if self.last_arrival:
+                self.max_gap_s = max(self.max_gap_s, arrival - self.last_arrival)
+            self.last_arrival = arrival
+            return gap
+
+    def observe_invalid_packet(self):
+        with self._lock:
+            self.stats.invalid_packets += 1
+
+    def observe_serial(self, n_valid, n_bad, n_bytes, arrival):
+        with self._lock:
+            self.stats.packets_received += int(n_valid)
+            self.invalid_lines += int(n_bad)
+            self.samples += int(n_valid)
+            self.bytes += int(n_bytes)
+            if self.last_arrival:
+                self.max_gap_s = max(self.max_gap_s, arrival - self.last_arrival)
+            self.last_arrival = arrival
+
+    # -- reader (UI thread) --------------------------------------------------------
+    def tick(self):
+        """Sample the counters once per UI tick to derive rates and history."""
+        now = time.monotonic()
+        with self._lock:
+            self._points.append((now, self.stats.packets_received, self.samples))
+            if len(self._points) >= 2:
+                t0, p0, s0 = self._points[0]
+                t1, p1, s1 = self._points[-1]
+                dt = max(1e-6, t1 - t0)
+                self.pkt_rate = (p1 - p0) / dt
+                self.sample_rate = (s1 - s0) / dt
+            self.rate_history.append(self.pkt_rate)
+            self.sample_rate_history.append(self.sample_rate)
+            self.missing_history.append(self._missing_locked())
+
+    def _missing_locked(self):
+        if self.kind == "wireless":
+            return int(self.stats.packets_missing)
+        return int(self.invalid_lines)
+
+    def snapshot(self):
+        with self._lock:
+            received = int(self.stats.packets_received)
+            missing = self._missing_locked()
+            total = received + missing
+            elapsed = max(1e-6, time.monotonic() - self.started)
+            return {
+                "kind": self.kind,
+                "received": received,
+                "missing": missing,
+                "missing_samples": missing * (self.frames_per_packet if self.kind == "wireless" else 1),
+                "out_of_order": int(self.stats.packets_out_of_order),
+                "invalid": int(self.stats.invalid_packets) + int(self.invalid_lines),
+                "loss_pct": (100.0 * missing / total) if total else 0.0,
+                "pkt_rate": float(self.pkt_rate),
+                "sample_rate": float(self.sample_rate),
+                "avg_sample_rate": self.samples / elapsed,
+                "expected_pkt_rate": (self.expected_sample_rate / self.frames_per_packet) if self.kind == "wireless" else self.expected_sample_rate,
+                "expected_sample_rate": self.expected_sample_rate,
+                "jitter_ms": float(self.stats.jitter_ms),
+                "max_gap_ms": self.max_gap_s * 1000.0,
+                "samples": int(self.samples),
+                "bytes": int(self.bytes),
+                "uptime_s": elapsed,
+                "rate_history": list(self.rate_history),
+                "missing_history": list(self.missing_history),
+            }
 
 
 class SerialWorker(QThread):
-    batch_received = pyqtSignal(object)  # ndarray shape: (n_samples, n_channels)
+    batch_received = pyqtSignal(object)  # dict: batch (n, channels), packet_numbers, source
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, port_name, baud_rate, num_channels, batch_size=SERIAL_BATCH_SIZE):
+    FLUSH_INTERVAL_S = 0.040
+
+    def __init__(self, port_name, baud_rate, num_channels, batch_size=SERIAL_BATCH_SIZE, tracer=None):
         super().__init__()
         self.port_name = port_name
         self.baud_rate = baud_rate
         self.num_channels = num_channels
         self.batch_size = batch_size
+        self.tracer = tracer
         self.is_socket_url = str(port_name).strip().lower().startswith("socket://")
         self._running = True
         self._serial = None
@@ -345,54 +601,61 @@ class SerialWorker(QThread):
             pass
         self._serial = None
 
+    def _open_serial(self):
+        # Supports both COM ports (e.g. COM3) and URL handlers (e.g. socket://127.0.0.1:7000).
+        ser = serial.serial_for_url(self.port_name, self.baud_rate, timeout=0.02)
+        try:
+            ser.set_buffer_size(rx_size=262144)   # Windows only; headroom against UI stalls
+        except Exception:
+            pass
+        try:
+            ser.reset_input_buffer()
+        except Exception:
+            pass
+        return ser
+
     def run(self):
-        partial_line = ""
+        nch = int(self.num_channels)
+        tail = b""
         batch = []
+        last_flush = time.monotonic()
         try:
             while self._running:
                 try:
                     if self._serial is None or not self._serial.is_open:
-                        # Supports both COM ports (e.g. COM3) and URL handlers (e.g. socket://127.0.0.1:7000).
-                        self._serial = serial.serial_for_url(self.port_name, self.baud_rate, timeout=0.02)
-                        try:
-                            self._serial.reset_input_buffer()
-                        except Exception:
-                            pass
-                        partial_line = ""
+                        self._serial = self._open_serial()
+                        tail = b""
 
-                    waiting = self._serial.in_waiting
-                    chunk = self._serial.read(waiting if waiting else 1)
-                    if not chunk:
-                        time.sleep(0.001)
-                        continue
+                    chunk = self._serial.read(max(1, self._serial.in_waiting))
+                    now = time.monotonic()
+                    if chunk:
+                        lines = (tail + chunk).split(b"\n")
+                        tail = lines.pop()  # Keep incomplete tail for next read.
+                        good = bad = 0
+                        for raw_line in lines:
+                            parts = raw_line.replace(b",", b" ").split()
+                            if not parts:
+                                continue
+                            if len(parts) < nch:
+                                bad += 1
+                                continue
+                            try:
+                                batch.append([float(x) for x in parts[:nch]])
+                                good += 1
+                            except ValueError:
+                                bad += 1
+                        if self.tracer is not None and (good or bad):
+                            self.tracer.observe_serial(good, bad, len(chunk), now)
 
-                    partial_line += chunk.decode("utf-8", errors="ignore")
-                    lines = partial_line.split("\n")
-                    partial_line = lines.pop()  # Keep incomplete tail for next read.
-
-                    for raw_line in lines:
-                        line = raw_line.strip()
-                        if not line:
-                            continue
-
-                        parts = line.replace(",", " ").split()
-                        if len(parts) < self.num_channels:
-                            continue
-
-                        try:
-                            vals = [float(parts[i]) for i in range(self.num_channels)]
-                        except ValueError:
-                            continue
-
-                        batch.append(vals)
-                        if len(batch) >= self.batch_size:
-                            self._emit_batch(batch)
-                            batch = []
+                    if batch and (len(batch) >= self.batch_size or (now - last_flush) >= self.FLUSH_INTERVAL_S):
+                        self._emit_batch(batch)
+                        batch = []
+                        last_flush = now
                 except Exception as e:
                     if not self._running:
                         break
                     self._close_serial()
-                    partial_line = ""
+                    tail = b""
                     if self.is_socket_url:
                         # Auto-recover TCP socket disconnects without hard-failing the app.
                         time.sleep(0.3)
@@ -657,95 +920,135 @@ class WiFiSerialProvisionProtocol:
 
 
 class WirelessStreamWorker(QThread):
+    """UDP receiver. Its only jobs are to drain the socket quickly and parse packets.
+
+    * A 4 MB kernel receive buffer rides out UI stalls (a UDP datagram that arrives while
+      the buffer is full is lost for good, so the buffer is the first line of defence).
+    * Runs at time-critical thread priority and does no per-sample Python work: a packet
+      is decoded with one numpy view instead of a struct.unpack per frame.
+    * Packets are merged for ~20 ms before being handed to the UI, so the main thread
+      does ~50 updates/s instead of one per datagram. Nothing is discarded or reordered.
+    """
     batch_received = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, port=WIFI_STREAM_PORT):
+    def __init__(self, port=WIFI_STREAM_PORT, tracer=None):
         super().__init__()
         self.port = int(port)
         self._running = True
         self._sock = None
         self._fallback_packet_sequence = 0
-        self.stats = WirelessStats()
+        self.tracer = tracer if tracer is not None else PacketTracer()
+        self.stats = self.tracer.stats
+
+    @staticmethod
+    def _frames_to_batch(frames):
+        batch = np.empty((frames.shape[0], WIRELESS_TOTAL_CHANNELS), dtype=np.float32)
+        batch[:, :WIRELESS_EMG_CHANNELS] = frames["emg"]
+        batch[:, WIRELESS_EMG_CHANNELS:] = frames["imu"]
+        return batch
+
+    def _legacy_payload(self, frames, source):
+        batch = self._frames_to_batch(frames)
+        packet_no = int(self._fallback_packet_sequence)
+        self._fallback_packet_sequence += 1
+        return {"batch": batch, "packet_numbers": np.full(batch.shape[0], packet_no, dtype=np.int64),
+                "source": source}
 
     def _parse_datagram(self, data):
-        if len(data) == WIRELESS_PACKET_SIZE:
-            magic, version, frame_count, frame_size, packet_sequence = struct.unpack(
-                WIFI_PACKET_HEADER_FORMAT, data[:WIFI_PACKET_HEADER_SIZE]
+        size = len(data)
+        if size == WIRELESS_PACKET_SIZE:
+            magic, version, frame_count, frame_size, packet_sequence = struct.unpack_from(
+                WIFI_PACKET_HEADER_FORMAT, data, 0
             )
-            if magic != b"BWIM" or version != 1 or frame_size != WIRELESS_FRAME_SIZE:
-                self.stats.invalid_packets += 1
+            if (magic != b"BWIM" or version != 1 or frame_size != WIRELESS_FRAME_SIZE
+                    or frame_count * frame_size != size - WIFI_PACKET_HEADER_SIZE):
+                self.tracer.observe_invalid_packet()
                 return None
-            payload = data[WIFI_PACKET_HEADER_SIZE:]
-            expected_payload = frame_count * frame_size
-            if len(payload) != expected_payload:
-                self.stats.invalid_packets += 1
-                return None
-
-            rows, frame_ids, emg_timestamps, imu_ids, imu_timestamps = [], [], [], [], []
-            for offset in range(0, expected_payload, WIRELESS_FRAME_SIZE):
-                frame = payload[offset : offset + WIRELESS_FRAME_SIZE]
-                frame_id, frame_ts, imu_id, imu_ts, *frame_fields = struct.unpack(WIRELESS_FRAME_FORMAT, frame)
-                row = [float(v) for v in frame_fields[:WIRELESS_EMG_CHANNELS]]
-                row.extend([float(frame_fields[8]), float(frame_fields[9]), float(frame_fields[10])])
-                rows.append(row)
-                frame_ids.append(frame_id); emg_timestamps.append(frame_ts)
-                imu_ids.append(imu_id); imu_timestamps.append(imu_ts)
-            batch = np.asarray(rows, dtype=np.float32)
-            packet_numbers = np.full(batch.shape[0], int(packet_sequence), dtype=np.int64)
+            frames = np.frombuffer(data, dtype=_WIRELESS_FRAME_DTYPE, count=frame_count,
+                                   offset=WIFI_PACKET_HEADER_SIZE)
+            batch = self._frames_to_batch(frames)
             arrival = time.monotonic()
-            return {"batch": batch, "packet_numbers": packet_numbers, "source": "wireless",
-                    "frame_ids": np.asarray(frame_ids, dtype=np.int64), "emg_timestamps": np.asarray(emg_timestamps, dtype=np.int64),
-                    "imu_ids": np.asarray(imu_ids, dtype=np.int64), "imu_timestamps": np.asarray(imu_timestamps, dtype=np.int64),
-                    "host_received_monotonic": arrival, "packet_gap": self.stats.observe(packet_sequence, arrival)}
+            gap = self.tracer.observe_wireless(packet_sequence, frame_count, size, arrival)
+            return {"batch": batch,
+                    "packet_numbers": np.full(frame_count, int(packet_sequence), dtype=np.int64),
+                    "source": "wireless",
+                    "frame_ids": frames["frame_id"].astype(np.int64),
+                    "emg_timestamps": frames["frame_ts"].astype(np.int64),
+                    "imu_ids": frames["imu_id"].astype(np.int64),
+                    "imu_timestamps": frames["imu_ts"].astype(np.int64),
+                    "host_received_monotonic": arrival, "packet_gap": gap}
 
-        if len(data) == (WIRELESS_FRAME_SIZE * WIRELESS_FRAMES_PER_PACKET):
-            rows = []
-            for offset in range(0, len(data), WIRELESS_FRAME_SIZE):
-                frame = data[offset : offset + WIRELESS_FRAME_SIZE]
-                _frame_id, _frame_ts, _imu_id, _imu_ts, *frame_fields = struct.unpack(WIRELESS_FRAME_FORMAT, frame)
-                row = [float(v) for v in frame_fields[:WIRELESS_EMG_CHANNELS]]
-                row.extend([float(frame_fields[8]), float(frame_fields[9]), float(frame_fields[10])])
-                rows.append(row)
-            batch = np.asarray(rows, dtype=np.float32)
-            packet_no = int(self._fallback_packet_sequence)
-            self._fallback_packet_sequence += 1
-            packet_numbers = np.full(batch.shape[0], packet_no, dtype=np.int64)
-            return {"batch": batch, "packet_numbers": packet_numbers, "source": "wireless_legacy"}
+        if size == WIRELESS_FRAME_SIZE * WIRELESS_FRAMES_PER_PACKET:
+            frames = np.frombuffer(data, dtype=_WIRELESS_FRAME_DTYPE, count=WIRELESS_FRAMES_PER_PACKET)
+            return self._legacy_payload(frames, "wireless_legacy")
 
-        if len(data) == WIRELESS_FRAME_SIZE:
-            _frame_id, _frame_ts, _imu_id, _imu_ts, *frame_fields = struct.unpack(WIRELESS_FRAME_FORMAT, data)
-            row = [float(v) for v in frame_fields[:WIRELESS_EMG_CHANNELS]]
-            row.extend([float(frame_fields[8]), float(frame_fields[9]), float(frame_fields[10])])
-            batch = np.asarray([row], dtype=np.float32)
-            packet_no = int(self._fallback_packet_sequence)
-            self._fallback_packet_sequence += 1
-            packet_numbers = np.full(batch.shape[0], packet_no, dtype=np.int64)
-            return {"batch": batch, "packet_numbers": packet_numbers, "source": "wireless_single"}
+        if size == WIRELESS_FRAME_SIZE:
+            frames = np.frombuffer(data, dtype=_WIRELESS_FRAME_DTYPE, count=1)
+            return self._legacy_payload(frames, "wireless_single")
 
+        self.tracer.observe_invalid_packet()
         return None
+
+    @staticmethod
+    def _merge(payloads):
+        """Concatenate consecutive wireless payloads into one (order preserved)."""
+        if len(payloads) == 1:
+            return payloads[0]
+        merged = {"source": payloads[0]["source"]}
+        for key in ("batch", "packet_numbers", "frame_ids", "emg_timestamps", "imu_ids", "imu_timestamps"):
+            merged[key] = np.concatenate([p[key] for p in payloads], axis=0)
+        merged["host_received_monotonic"] = payloads[-1]["host_received_monotonic"]
+        merged["packet_gap"] = int(sum(int(p.get("packet_gap") or 0) for p in payloads))
+        return merged
+
+    def _flush(self, pending):
+        """Emit pending payloads; legacy/odd payloads are never merged with full packets."""
+        group = []
+        for payload in pending:
+            if payload["source"] != "wireless":
+                if group:
+                    self.batch_received.emit(self._merge(group))
+                    group = []
+                self.batch_received.emit(payload)
+            else:
+                group.append(payload)
+        if group:
+            self.batch_received.emit(self._merge(group))
 
     def run(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_BYTES)
+        except OSError:
+            pass
         self._sock.bind(("0.0.0.0", self.port))
-        self._sock.settimeout(1.0)
+        self._sock.settimeout(0.02)
 
+        pending = []
+        last_emit = time.monotonic()
         try:
             while self._running:
                 try:
                     data, _addr = self._sock.recvfrom(2048)
                 except socket.timeout:
-                    continue
+                    data = None
                 except OSError:
                     break
 
-                payload = self._parse_datagram(data)
-                if payload is None:
-                    continue
-                batch = np.asarray(payload.get("batch", []), dtype=np.float32)
-                if batch.size > 0:
-                    self.batch_received.emit(payload)
+                if data is not None:
+                    payload = self._parse_datagram(data)
+                    if payload is not None and payload["batch"].size > 0:
+                        pending.append(payload)
+
+                now = time.monotonic()
+                if pending and (data is None or (now - last_emit) >= STREAM_EMIT_INTERVAL_S):
+                    self._flush(pending)
+                    pending = []
+                    last_emit = now
+            if pending:
+                self._flush(pending)
         except Exception as exc:
             if self._running:
                 self.error_occurred.emit(f"Wireless stream error: {exc}")
@@ -764,7 +1067,7 @@ class WirelessStreamWorker(QThread):
                 self._sock.close()
         except Exception:
             pass
-        self.wait()
+        self.wait(2000)
 
 
 class ConnectionModeDialog(QDialog):
@@ -1099,6 +1402,7 @@ class TimedRecordBatch:
     trial_id: int
     label: str
     data: np.ndarray
+    hand: str = ""
 
 
 class RFRealtimeInferenceWorker(QThread):
@@ -1257,7 +1561,7 @@ class RecordedCsvSaveWorker(QThread):
             os.makedirs(os.path.dirname(self._data_csv_path) or ".", exist_ok=True)
             header = ["Timestamp_ms", "Packet_Number", "Trial_ID"] + [
                 f"Ch{i}" for i in range(1, WIRELESS_TOTAL_CHANNELS + 1)
-            ] + ["Label"]
+            ] + ["Label", "Hand"]
             with open(self._data_csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(header)
@@ -1271,6 +1575,7 @@ class RecordedCsvSaveWorker(QThread):
                     n_cols = int(min(WIRELESS_TOTAL_CHANNELS, data.shape[1]))
                     trial_id = int(batch.trial_id)
                     label = str(batch.label)
+                    hand = str(getattr(batch, "hand", "") or "")
                     pad = [""] * (WIRELESS_TOTAL_CHANNELS - n_cols)
                     # Convert whole arrays to Python scalars once (C-level) instead of boxing
                     # each numpy scalar per cell, then bulk-write. Same output, much faster.
@@ -1290,6 +1595,7 @@ class RecordedCsvSaveWorker(QThread):
                         if pad:
                             row.extend(pad)
                         row.append(label)
+                        row.append(hand)
                         rows.append(row)
                     writer.writerows(rows)
 
@@ -1660,9 +1966,11 @@ class AnimatedStatePanel(QWidget):
         super().__init__(parent)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self._state_colors = {
-            "rest": "#319151",
-            "prepare": "#828726",
-            "activity": THEME_COLORS["accent"],
+            "rest": "#3A6EA5",      # blue - relax (kept distinct from the green Perform)
+            "prepare": "#C62828",   # red - get ready, don't move yet
+            "perform": "#2E7D32",   # green - perform the gesture now
+            "break": "#6D4C9F",     # purple - block / hand-change break
+            "activity": THEME_COLORS["accent"],  # idle / ready / complete
         }
         self._state = ""
         self.set_state("activity")
@@ -1680,14 +1988,69 @@ class AnimatedStatePanel(QWidget):
         )
 
 
+def format_duration(ms, with_tenths=True):
+    """'12.3 s' below a minute (when with_tenths), otherwise 'm:ss'."""
+    ms = max(0, int(ms))
+    if with_tenths and ms < 60000:
+        return f"{ms / 1000.0:.1f} s"
+    total_s = int(round(ms / 1000.0))
+    return f"{total_s // 60}:{total_s % 60:02d}"
+
+
+HAND_SEQUENCES = {
+    "left_right": ["Left", "Right"],
+    "right_left": ["Right", "Left"],
+    "left": ["Left"],
+    "right": ["Right"],
+}
+
+
+def hands_for_order(hand_order):
+    return list(HAND_SEQUENCES.get(str(hand_order), HAND_SEQUENCES[DEFAULT_HAND_ORDER]))
+
+
+def plan_summary(settings):
+    """Numbers for a session plan, shared by the dialog preview and the recorder."""
+    labels = [x for x in (settings.get("task_labels") or []) if str(x).strip()]
+    hands = hands_for_order(settings.get("hand_order", DEFAULT_HAND_ORDER))
+    repeats = int(settings.get("repeats", DEFAULT_TASK_REPEATS))
+    prep = float(settings.get("prep_s", DEFAULT_TASK_PREP_S))
+    hold = float(settings.get("hold_s", DEFAULT_TASK_HOLD_S))
+    rest = float(settings.get("rest_s", DEFAULT_TASK_REST_S))
+    settle = float(settings.get("settle_s", DEFAULT_TASK_SETTLE_S))
+    max_block = max(1, int(settings.get("max_cycles_per_block", DEFAULT_MAX_CYCLES_PER_BLOCK)))
+    block_break = float(settings.get("block_break_s", DEFAULT_BLOCK_BREAK_S))
+    switch_break = float(settings.get("hand_switch_s", DEFAULT_HAND_SWITCH_BREAK_S))
+    cycle_s = prep + hold + settle + rest
+    cycles_per_hand = len(labels) * repeats
+    blocks_per_hand = -(-cycles_per_hand // max_block) if cycles_per_hand else 0
+    cycles = cycles_per_hand * len(hands)
+    block_breaks = max(0, blocks_per_hand - 1) * len(hands)
+    switch_breaks = max(0, len(hands) - 1)
+    active_s = cycles * cycle_s
+    total_s = active_s + block_breaks * block_break + switch_breaks * switch_break
+    return {
+        "hands": hands, "cycles": cycles, "cycles_per_hand": cycles_per_hand,
+        "blocks_per_hand": blocks_per_hand, "cycle_s": cycle_s,
+        "active_s": active_s, "total_s": total_s,
+        "recorded_s": cycles * (hold + (rest if settings.get("record_rest", True) else 0.0)),
+    }
+
+
 class TaskProtocolWidget(QWidget):
     start_clicked = pyqtSignal()
-    phase_started = pyqtSignal(str, int, str, bool)  # label, trial_id, phase_name, record_enabled
+    # label, trial_id, phase_name, record_enabled, hand
+    phase_started = pyqtSignal(str, int, str, bool, str)
     protocol_finished = pyqtSignal()
     protocol_canceled = pyqtSignal()
+    paused_changed = pyqtSignal(bool)
+    rewind_requested = pyqtSignal()   # resume restarts the interrupted cycle; drop its partial data
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.paused = False
+        self._pause_remaining_ms = 0
+        self._pause_saved = None
         self.labels = []
         self.repeats = 1
         self.prep_ms = int(DEFAULT_TASK_PREP_S * 1000)
@@ -1696,54 +2059,103 @@ class TaskProtocolWidget(QWidget):
         self.settle_ms = int(DEFAULT_TASK_SETTLE_S * 1000)
         self.record_rest = True
         self.randomize_order = True
+        self.hand_order = DEFAULT_HAND_ORDER
+        self.session_day = DEFAULT_SESSION_DAY
+        self.max_cycles_per_block = DEFAULT_MAX_CYCLES_PER_BLOCK
+        self.block_break_ms = int(DEFAULT_BLOCK_BREAK_S * 1000)
+        self.hand_switch_ms = int(DEFAULT_HAND_SWITCH_BREAK_S * 1000)
 
         self.steps = []
         self.step_idx = -1
         self.remaining_ms = 0
         self.current_step_total_ms = 1
+        self.step_deadline = 0.0
+        self.session_total_ms = 1
+        self.session_done_ms = 0
         self.is_running = False
         self.is_ready = False
 
+        # Wall-clock driven (not "subtract 100 ms per tick") so a busy UI cannot stretch a
+        # 3 s hold into 3.4 s and silently shorten the recording.
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer)
         self.timer.timeout.connect(self.on_tick)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         self.lbl_title = QLabel("Session Activity")
         self.lbl_title.setStyleSheet("font-weight: bold; font-size: 17px;")
         layout.addWidget(self.lbl_title)
 
         self.phase_box = AnimatedStatePanel()
-        self.phase_box.setMinimumHeight(170)
+        self.phase_box.setMinimumHeight(GESTURE_IMAGE_MAX_H + 36)
         self.phase_box.set_state("activity")
-        phase_box_layout = QVBoxLayout(self.phase_box)
-        phase_box_layout.setContentsMargins(10, 16, 10, 16)
-        phase_box_layout.setSpacing(10)
+        phase_box_layout = QHBoxLayout(self.phase_box)
+        phase_box_layout.setContentsMargins(18, 18, 18, 18)
+        phase_box_layout.setSpacing(20)
+
+        # Gesture reference image. The slot has a fixed size so the text never
+        # shifts between gestures whose photos have slightly different shapes;
+        # the image is centred inside it. Hidden when there is no image.
+        self.lbl_gesture_image = QLabel()
+        self.lbl_gesture_image.setFixedSize(GESTURE_IMAGE_MAX_W, GESTURE_IMAGE_MAX_H)
+        self.lbl_gesture_image.setAlignment(Qt.AlignCenter)
+        self.lbl_gesture_image.setStyleSheet("background: transparent; border: none;")
+        self.lbl_gesture_image.hide()
+        self._gesture_image_label = None
+        phase_box_layout.addWidget(self.lbl_gesture_image, 0, Qt.AlignVCenter)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(8)
+        text_col.addStretch(1)
+        phase_box_layout.addLayout(text_col, 1)
 
         self.lbl_phase = QLabel("Waiting")
         self.lbl_phase.setAlignment(Qt.AlignCenter)
-        self.lbl_phase.setStyleSheet("font-size: 34px; font-weight: 800; color: #FFFFFF; background: transparent;")
-        phase_box_layout.addWidget(self.lbl_phase)
+        self.lbl_phase.setWordWrap(True)
+        self.lbl_phase.setStyleSheet("font-size: 30px; font-weight: 800; color: #FFFFFF; background: transparent;")
+        text_col.addWidget(self.lbl_phase)
 
         self.lbl_instruction = QLabel("Press Proceed to prepare, then Start Recording.")
         self.lbl_instruction.setAlignment(Qt.AlignCenter)
         self.lbl_instruction.setWordWrap(True)
-        self.lbl_instruction.setStyleSheet("color: #FFFFFF; font-weight: normal; background: transparent;")
-        phase_box_layout.addWidget(self.lbl_instruction)
+        self.lbl_instruction.setStyleSheet(
+            "color: #FFFFFF; font-size: 15px; font-weight: normal; background: transparent;"
+        )
+        text_col.addWidget(self.lbl_instruction)
+        text_col.addStretch(1)
         layout.addWidget(self.phase_box)
 
-        self.lbl_meta_info = QLabel("Trial: -/- | Label: -")
+        self.lbl_meta_info = StableLabel("Day - | Hand - | Block -/- | Cycle -/- | Label: -")
+        self.lbl_meta_info.setWordWrap(True)
         self.lbl_meta_info.setStyleSheet(themed_label_style("muted"))
         layout.addWidget(self.lbl_meta_info)
 
-        self.lbl_count = QLabel("Remaining: --.- s")
+        self.lbl_count = StableLabel("Phase: --.- s | Session: --:-- left")
         self.lbl_count.setStyleSheet("font-weight: bold;")
         layout.addWidget(self.lbl_count)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(10)
         layout.addWidget(self.progress)
+
+        self.progress_session = QProgressBar()
+        self.progress_session.setRange(0, 1000)
+        self.progress_session.setValue(0)
+        self.progress_session.setFormat("Session %p%")
+        self.progress_session.setTextVisible(False)
+        self.progress_session.setFixedHeight(6)
+        layout.addWidget(self.progress_session)
+
+        # Live CSV counter: rows captured so far versus what the protocol should produce.
+        self.lbl_csv_counter = StableLabel("CSV rows recorded: 0")
+        self.lbl_csv_counter.setStyleSheet(f"font-weight: bold; color: {THEME_COLORS['accent']};")
+        layout.addWidget(self.lbl_csv_counter)
 
         btn_row = QHBoxLayout()
         self.btn_start = QPushButton("Start Recording")
@@ -1751,6 +2163,21 @@ class TaskProtocolWidget(QWidget):
         self.btn_start.setEnabled(False)
         self.btn_start.clicked.connect(self.start_clicked.emit)
         btn_row.addWidget(self.btn_start)
+
+        self.btn_pause = QPushButton("Pause")
+        self.btn_pause.setStyleSheet(themed_button_style("danger"))
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setToolTip("Emergency / interruption: stops the timer and recording. "
+                                  "Resume restarts the current cycle from Prepare.")
+        self.btn_pause.clicked.connect(self.toggle_pause)
+        btn_row.addWidget(self.btn_pause)
+
+        self.btn_skip_break = QPushButton("Skip Break")
+        self.btn_skip_break.setStyleSheet(themed_button_style("muted"))
+        self.btn_skip_break.setEnabled(False)
+        self.btn_skip_break.setToolTip("End the current break early (participant is ready).")
+        self.btn_skip_break.clicked.connect(self.skip_break)
+        btn_row.addWidget(self.btn_skip_break)
 
         self.btn_cancel = QPushButton("Cancel Session")
         self.btn_cancel.setStyleSheet(themed_button_style("muted"))
@@ -1760,8 +2187,11 @@ class TaskProtocolWidget(QWidget):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
+    # -- configuration -----------------------------------------------------------
     def configure(self, labels, repeats, prep_s, hold_s, rest_s, record_rest=True,
-                  settle_s=DEFAULT_TASK_SETTLE_S, randomize_order=True):
+                  settle_s=DEFAULT_TASK_SETTLE_S, randomize_order=True, hand_order=DEFAULT_HAND_ORDER,
+                  session_day=DEFAULT_SESSION_DAY, max_cycles_per_block=DEFAULT_MAX_CYCLES_PER_BLOCK,
+                  block_break_s=DEFAULT_BLOCK_BREAK_S, hand_switch_s=DEFAULT_HAND_SWITCH_BREAK_S):
         self.labels = [str(x).strip() for x in (labels or []) if str(x).strip()]
         self.repeats = max(1, int(repeats))
         self.prep_ms = int(max(0.2, prep_s) * 1000)
@@ -1770,19 +2200,37 @@ class TaskProtocolWidget(QWidget):
         self.settle_ms = int(max(0.0, settle_s) * 1000)
         self.record_rest = bool(record_rest)
         self.randomize_order = bool(randomize_order)
+        self.hand_order = str(hand_order)
+        self.session_day = int(session_day)
+        self.max_cycles_per_block = max(1, int(max_cycles_per_block))
+        self.block_break_ms = int(max(0.0, block_break_s) * 1000)
+        self.hand_switch_ms = int(max(0.0, hand_switch_s) * 1000)
         self.steps = self.build_steps()
+        self.session_total_ms = max(1, sum(int(st["duration_ms"]) for st in self.steps))
+        self.session_done_ms = 0
+        self._preload_gesture_images()
         self.step_idx = -1
         self.remaining_ms = 0
         self.current_step_total_ms = 1
         self.is_ready = True
         self.progress.setValue(0)
+        self.progress_session.setValue(0)
         self.btn_start.setEnabled(False)
         self.btn_cancel.setEnabled(False)
+        self.btn_skip_break.setEnabled(False)
         self.lbl_phase.setText("Ready")
         self.lbl_instruction.setText("Session configured. Press Start Recording to begin.")
+        self._set_gesture_image(None)
         self.phase_box.set_state("activity")
-        self.lbl_meta_info.setText("Trial: -/- | Label: -")
-        self.lbl_count.setText("Remaining: --.- s")
+        self.lbl_meta_info.setText(
+            f"Day {self.session_day} | {' + '.join(hands_for_order(self.hand_order))} hand | "
+            f"{self.cycles_total} cycles | about {format_duration(self.session_total_ms, False)} incl. breaks"
+        )
+        self.lbl_count.setText(f"Phase: --.- s | Session: {format_duration(self.session_total_ms, False)} left")
+
+    @property
+    def cycles_total(self):
+        return sum(1 for st in self.steps if st["phase"] == "Prepare")
 
     def set_start_enabled(self, enabled):
         self.btn_start.setEnabled(bool(enabled) and self.is_ready and (not self.is_running))
@@ -1791,60 +2239,68 @@ class TaskProtocolWidget(QWidget):
         if not self.is_running:
             self.btn_cancel.setEnabled(bool(enabled) and self.is_ready)
 
+    def set_csv_counter(self, text, kind="accent"):
+        color = {"accent": THEME_COLORS["accent"], "warn": "#f57c00", "danger": "#f44336"}.get(kind, THEME_COLORS["accent"])
+        self.lbl_csv_counter.setText(text)
+        self.lbl_csv_counter.setStyleSheet(f"font-weight: bold; color: {color};")
+
     def build_steps(self):
+        """Flatten the study design into timed steps.
+
+        Per hand: `repeats` repetitions of every class (order shuffled per repetition so
+        fatigue is spread across classes), split into blocks of at most
+        `max_cycles_per_block` cycles with a break in between; a longer break separates
+        the hands (the armband moves to the other forearm). Trial ids keep counting up
+        across hands so (label, trial) stays unique in the CSV.
+        """
         steps = []
-        for trial in range(1, self.repeats + 1):
-            # Randomizing per repeat stops fatigue from always degrading the
-            # same class - a fixed order means whichever gesture lands last
-            # in the cycle is systematically the most fatigued every time.
-            trial_labels = list(self.labels)
-            if self.randomize_order:
-                random.shuffle(trial_labels)
-            for label in trial_labels:
-                steps.append(
-                    {
-                        "trial_id": trial,
-                        "phase": "Prepare",
-                        "label": label,
-                        "duration_ms": self.prep_ms,
-                        "record": False,
-                        "instruction": "Prepare and keep still until countdown ends.",
+        hands = hands_for_order(self.hand_order)
+        cycles_total = len(self.labels) * self.repeats * len(hands)
+        cycle_no = 0
+        trial_offset = 0
+        for hand_idx, hand in enumerate(hands):
+            cycles = []
+            for rep in range(1, self.repeats + 1):
+                trial_labels = list(self.labels)
+                if self.randomize_order:
+                    random.shuffle(trial_labels)
+                cycles.extend((trial_offset + rep, label) for label in trial_labels)
+            blocks = [cycles[i:i + self.max_cycles_per_block] for i in range(0, len(cycles), self.max_cycles_per_block)]
+            for block_idx, block in enumerate(blocks):
+                for trial, label in block:
+                    cycle_no += 1
+                    common = {
+                        "trial_id": trial, "hand": hand, "block": block_idx + 1, "blocks": len(blocks),
+                        "cycle_no": cycle_no, "cycles_total": cycles_total,
                     }
-                )
-                steps.append(
-                    {
-                        "trial_id": trial,
-                        "phase": "Perform",
-                        "label": label,
-                        "duration_ms": self.hold_ms,
-                        "record": True,
-                        "instruction": "Perform and hold the target activity.",
-                    }
-                )
-                if self.settle_ms > 0:
-                    # Not recorded: EMG doesn't drop to baseline the instant a
-                    # contraction ends, so without this gap the start of every
-                    # "Rest" window is really relaxation decay, not true rest.
-                    steps.append(
-                        {
-                            "trial_id": trial,
-                            "phase": "Settle",
-                            "label": "Rest",
-                            "duration_ms": self.settle_ms,
-                            "record": False,
-                            "instruction": "Relax. (Not recorded - settling before Rest capture.)",
-                        }
-                    )
-                steps.append(
-                    {
-                        "trial_id": trial,
-                        "phase": "Rest",
-                        "label": "Rest",
-                        "duration_ms": self.rest_ms,
-                        "record": self.record_rest,
-                        "instruction": "Rest arm fully. Relax muscles.",
-                    }
-                )
+                    steps.append({**common, "phase": "Prepare", "label": label, "duration_ms": self.prep_ms,
+                                  "record": False, "instruction": "Prepare and keep still until countdown ends."})
+                    steps.append({**common, "phase": "Perform", "label": label, "duration_ms": self.hold_ms,
+                                  "record": True, "instruction": "Perform and hold the target activity."})
+                    if self.settle_ms > 0:
+                        # Not recorded: EMG doesn't drop to baseline the instant a
+                        # contraction ends, so without this gap the start of every
+                        # "Rest" window is really relaxation decay, not true rest.
+                        steps.append({**common, "phase": "Settle", "label": "Rest", "duration_ms": self.settle_ms,
+                                      "record": False,
+                                      "instruction": "Relax. (Not recorded - settling before Rest capture.)"})
+                    steps.append({**common, "phase": "Rest", "label": "Rest", "duration_ms": self.rest_ms,
+                                  "record": self.record_rest, "instruction": "Rest arm fully. Relax muscles."})
+                is_last_block = block_idx == len(blocks) - 1
+                is_last_hand = hand_idx == len(hands) - 1
+                common = {"trial_id": cycles[-1][0] if is_last_block else block[-1][0], "hand": hand,
+                          "block": block_idx + 1, "blocks": len(blocks), "cycle_no": cycle_no,
+                          "cycles_total": cycles_total, "label": "Rest", "record": False}
+                if not is_last_block and self.block_break_ms > 0:
+                    steps.append({**common, "phase": "Break", "duration_ms": self.block_break_ms,
+                                  "instruction": f"Block {block_idx + 1}/{len(blocks)} done. Relax and shake out your "
+                                                 "arm. The next block starts when the countdown ends."})
+                elif is_last_block and not is_last_hand and self.hand_switch_ms > 0:
+                    next_hand = hands[hand_idx + 1]
+                    steps.append({**common, "phase": "Switch Hand", "duration_ms": self.hand_switch_ms,
+                                  "instruction": f"{hand} hand finished. Move the armband to the {next_hand.lower()} "
+                                                 "forearm (re-run Channel Calibration if needed)."})
+            trial_offset += self.repeats
         return steps
 
     def start_protocol(self):
@@ -1853,9 +2309,13 @@ class TaskProtocolWidget(QWidget):
         if (not self.is_ready) or len(self.steps) == 0:
             return False
         self.is_running = True
+        self.paused = False
+        self.btn_pause.setText("Pause")
+        self.btn_pause.setEnabled(True)
         self.btn_start.setEnabled(False)
         self.btn_cancel.setEnabled(True)
         self.step_idx = -1
+        self.session_done_ms = 0
         self.next_step()
         return True
 
@@ -1866,43 +2326,68 @@ class TaskProtocolWidget(QWidget):
             return "rest"
         if p == "prepare":
             return "prepare"
+        if p == "perform":
+            return "perform"
+        if p in ("break", "switch hand"):
+            return "break"
         return "activity"
 
-    def next_step(self):
-        self.step_idx += 1
+    def next_step(self, advance_done=True):
+        if advance_done:
+            if 0 <= self.step_idx < len(self.steps):
+                self.session_done_ms += int(self.steps[self.step_idx]["duration_ms"])
+            self.step_idx += 1
+        # else: re-enter the current step (resume after a pause)
         if self.step_idx >= len(self.steps):
             self.timer.stop()
             self.is_running = False
             self.is_ready = False
             self.btn_cancel.setEnabled(False)
+            self.btn_skip_break.setEnabled(False)
+            self.btn_pause.setEnabled(False)
             self.progress.setValue(100)
+            self.progress_session.setValue(1000)
             self.lbl_phase.setText("Complete")
-            self.lbl_instruction.setText("Protocol complete.")
+            self.lbl_instruction.setText("Protocol complete. Saving the recording...")
+            self._set_gesture_image(None)
             self.phase_box.set_state("activity")
-            self.lbl_meta_info.setText("Trial: -/- | Label: -")
-            self.lbl_count.setText("Remaining: 0.0 s")
+            self.lbl_meta_info.setText("Session complete.")
+            self.lbl_count.setText("Phase: 0.0 s | Session: 0:00 left")
             self.protocol_finished.emit()
             return
 
         st = self.steps[self.step_idx]
         self.remaining_ms = int(st["duration_ms"])
         self.current_step_total_ms = max(1, int(st["duration_ms"]))
+        self.step_deadline = time.monotonic() + self.remaining_ms / 1000.0
         phase_name = str(st["phase"]).strip().lower()
+        pretty_label = str(st["label"]).replace("_", " ")
+        is_break = phase_name in ("break", "switch hand")
         if phase_name == "perform":
-            phase_display = f"Perform: {st['label']}"
+            phase_display = f"Perform: {pretty_label}"
         elif phase_name == "prepare":
-            phase_display = f"Prepare for {st['label']}"
+            phase_display = f"Prepare for {pretty_label}"
         elif phase_name == "rest":
             phase_display = "Rest"
         elif phase_name == "settle":
             phase_display = "Settling..."
+        elif phase_name == "break":
+            phase_display = "Break"
+        elif phase_name == "switch hand":
+            phase_display = "Switch Hand"
         else:
             phase_display = str(st["phase"])
         self.lbl_phase.setText(phase_display)
         self.lbl_instruction.setText(st["instruction"])
         self.phase_box.set_state(self._state_for_phase(st["phase"]))
-        self.lbl_meta_info.setText(f"Trial: {st['trial_id']}/{self.repeats} | Label: {st['label']}")
-        self.lbl_count.setText(f"Remaining: {self.remaining_ms / 1000.0:.1f} s")
+        self._set_gesture_image(None if is_break else st["label"])
+        self.btn_skip_break.setEnabled(is_break)
+        self.lbl_meta_info.setText(
+            f"Day {self.session_day} | {st['hand']} hand | Block {st['block']}/{st['blocks']} | "
+            f"Cycle {st['cycle_no']}/{st['cycles_total']} | Trial {st['trial_id']}"
+            + ("" if is_break else f" | Label: {st['label']}")
+        )
+        self._update_countdown_labels(self.remaining_ms)
         self.progress.setValue(0)
 
         self.phase_started.emit(
@@ -1910,40 +2395,123 @@ class TaskProtocolWidget(QWidget):
             int(st["trial_id"]),
             str(st["phase"]),
             bool(st["record"]),
+            str(st["hand"]),
         )
-        self.timer.start(100)
+        self.timer.start(50 if not is_break else 200)
+
+    def toggle_pause(self):
+        if self.paused:
+            self.resume_protocol()
+        else:
+            self.pause_protocol()
+
+    def pause_protocol(self):
+        if not self.is_running or self.paused:
+            return
+        self.paused = True
+        self._pause_remaining_ms = max(0, int(round((self.step_deadline - time.monotonic()) * 1000.0)))
+        self.timer.stop()
+        self._pause_saved = (self.lbl_phase.text(), self.lbl_instruction.text(), self.phase_box._state)
+        self.lbl_phase.setText("Paused")
+        self.lbl_instruction.setText("Session paused - recording is stopped. Press Resume when ready.")
+        self.phase_box.set_state("break")
+        self.btn_pause.setText("Resume")
+        self.btn_skip_break.setEnabled(False)
+        self.paused_changed.emit(True)
+
+    def resume_protocol(self):
+        if not self.paused:
+            return
+        self.paused = False
+        self.btn_pause.setText("Pause")
+        st = self.steps[self.step_idx]
+        if str(st["phase"]).strip().lower() in ("break", "switch hand"):
+            self.step_deadline = time.monotonic() + self._pause_remaining_ms / 1000.0
+            if self._pause_saved:
+                self.lbl_phase.setText(self._pause_saved[0])
+                self.lbl_instruction.setText(self._pause_saved[1])
+                self.phase_box.set_state(self._pause_saved[2])
+            self.btn_skip_break.setEnabled(True)
+            self.paused_changed.emit(False)
+            self.timer.start(200)
+            return
+        # Mid-cycle: restart the cycle from its Prepare step so every recorded trial is complete.
+        j = self.step_idx
+        while j > 0 and self.steps[j]["phase"] != "Prepare":
+            j -= 1
+        self.session_done_ms = sum(int(x["duration_ms"]) for x in self.steps[:j])
+        self.step_idx = j
+        self.paused_changed.emit(False)
+        self.rewind_requested.emit()
+        self.next_step(advance_done=False)
+
+    def skip_break(self):
+        if not self.is_running or not (0 <= self.step_idx < len(self.steps)):
+            return
+        if str(self.steps[self.step_idx]["phase"]).strip().lower() in ("break", "switch hand"):
+            self.timer.stop()
+            self.next_step()
+
+    def _preload_gesture_images(self):
+        dpr = self.devicePixelRatioF()
+        for label in set(self.labels) | {"Rest"}:
+            get_gesture_pixmap(label, dpr=dpr)
+
+    def _set_gesture_image(self, label):
+        if label == self._gesture_image_label:
+            return  # same gesture as the previous step (e.g. Settle -> Rest): nothing to redraw
+        self._gesture_image_label = label
+        pix = get_gesture_pixmap(label, dpr=self.devicePixelRatioF()) if label else None
+        if pix is None:
+            self.lbl_gesture_image.clear()
+            self.lbl_gesture_image.hide()
+            return
+        self.lbl_gesture_image.setPixmap(pix)
+        self.lbl_gesture_image.show()
+
+    def _update_countdown_labels(self, remaining_ms):
+        elapsed_in_step = self.current_step_total_ms - remaining_ms
+        session_left = max(0, self.session_total_ms - self.session_done_ms - elapsed_in_step)
+        self.lbl_count.setText(
+            f"Phase: {format_duration(remaining_ms)} left | Session: {format_duration(session_left, False)} left"
+        )
+        self.progress_session.setValue(int(1000 * min(1.0, (self.session_done_ms + elapsed_in_step) / self.session_total_ms)))
 
     def on_tick(self):
-        self.remaining_ms -= 100
-        if self.remaining_ms < 0:
-            self.remaining_ms = 0
-        self.lbl_count.setText(f"Remaining: {self.remaining_ms / 1000.0:.1f} s")
+        self.remaining_ms = max(0, int(round((self.step_deadline - time.monotonic()) * 1000.0)))
+        self._update_countdown_labels(self.remaining_ms)
         elapsed = self.current_step_total_ms - self.remaining_ms
-        pct = int(np.clip((elapsed / self.current_step_total_ms) * 100.0, 0.0, 100.0))
-        self.progress.setValue(pct)
+        self.progress.setValue(int(np.clip((elapsed / self.current_step_total_ms) * 100.0, 0.0, 100.0)))
 
         if self.remaining_ms <= 0:
             self.timer.stop()
             self.next_step()
 
     def cancel_protocol(self, emit_signal=False):
-        was_running = self.is_running or self.timer.isActive()
+        was_running = self.is_running or self.timer.isActive() or self.paused
         was_prepared = self.is_ready
         self.timer.stop()
+        self.paused = False
+        self.btn_pause.setText("Pause")
+        self.btn_pause.setEnabled(False)
         self.is_running = False
         self.is_ready = False
         self.btn_cancel.setEnabled(False)
         self.btn_start.setEnabled(False)
+        self.btn_skip_break.setEnabled(False)
         self.progress.setValue(0)
+        self.progress_session.setValue(0)
         self.lbl_phase.setText("Canceled" if was_running else "Waiting")
+        self._set_gesture_image(None)
         self.lbl_instruction.setText(
             "Protocol canceled. Press Proceed to prepare again." if was_running else "Press Proceed to prepare."
         )
         self.phase_box.set_state("activity")
-        self.lbl_meta_info.setText("Trial: -/- | Label: -")
-        self.lbl_count.setText("Remaining: --.- s")
+        self.lbl_meta_info.setText("Day - | Hand - | Block -/- | Cycle -/- | Label: -")
+        self.lbl_count.setText("Phase: --.- s | Session: --:-- left")
         if emit_signal and (was_running or was_prepared):
             self.protocol_canceled.emit()
+
 
 
 class PortConfigDialog(QDialog):
@@ -2808,12 +3376,87 @@ class ClassLabelEditorDialog(QDialog):
         self.accept()
 
 
+STUDY_PROCEDURE_HTML = """
+<h2>Duration and Procedures of the Study</h2>
+<p>If you agree to participate, the researcher will first explain the study procedure and answer any
+questions you may have. After you give consent, an <b>8-channel OYMotion Gravity surface EMG armband</b>
+will be placed on your forearm. The device uses <b>dry electrodes</b> and is <b>non-invasive</b>.</p>
+<p>You will be asked to perform repeated trials of the gesture classes. Each <b>task cycle lasts 10 seconds</b>:</p>
+<ul>
+<li><b>Preparation:</b> 4 seconds</li>
+<li><b>Task / activity:</b> 3 seconds - perform and hold the assigned gesture</li>
+<li><b>Rest:</b> 3 seconds - relax your hand and forearm</li>
+</ul>
+<p>The rest period is also recorded as a class for machine-learning purposes.</p>
+<h3>Sessions</h3>
+<ul>
+<li>The study runs over <b>two sessions on two separate days</b>, normally 1-7 days apart and at about the
+same time of day.</li>
+<li>Each day you complete <b>18 repetitions of each gesture class</b>: 9 with the left hand and 9 with the
+right hand.</li>
+<li>Across both days: <b>36 repetitions x 10 classes = about 360 task cycles</b>.</li>
+<li>Estimated active task time: 36 x 10 x 10 s = 3600 s, i.e. about <b>60 minutes</b> in total, or about
+<b>30 minutes of active recording on each day</b>.</li>
+</ul>
+<h3>Breaks and fatigue</h3>
+<ul>
+<li>No more than <b>30 task cycles (about 5 minutes)</b> without a break.</li>
+<li>After each block: a <b>3-4 minute break</b>.</li>
+<li>When the armband moves to your other arm: a further break of about <b>5 minutes</b>.</li>
+<li>You may ask for an additional break at any time.</li>
+<li>Room temperature and humidity are noted at the start and end of each session.</li>
+</ul>
+<p>Including breaks, hand changeover, consent, device fitting and initial instructions, each session is
+expected to take about <b>60 to 70 minutes</b>.</p>
+"""
+
+
+class StudyProcedureDialog(QDialog):
+    """Read-only summary of the study duration and procedure (replaces the old T&C popup)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        apply_app_icon(self)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setWindowTitle("Study Procedure")
+        self.resize(720, 640)
+        apply_dark_title_bar(self)
+        layout = QVBoxLayout(self)
+        view = QTextBrowser()
+        view.setOpenExternalLinks(False)
+        view.setHtml(STUDY_PROCEDURE_HTML)
+        layout.addWidget(view, 1)
+        btn_close = QPushButton("Close")
+        btn_close.setStyleSheet(themed_button_style("accent"))
+        btn_close.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(btn_close)
+        layout.addLayout(row)
+
+
+def _section_title(text, hint=""):
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    title = QLabel(text)
+    title.setStyleSheet(f"font-weight: bold; font-size: 16px; color: {THEME_COLORS['text']};")
+    row.addWidget(title)
+    if hint:
+        lbl = QLabel(hint)
+        lbl.setStyleSheet(themed_label_style("muted"))
+        row.addWidget(lbl)
+    row.addStretch()
+    return row
+
+
 class DataCollectionDialog(QDialog):
     start_requested = pyqtSignal(dict)
     settings_changed = pyqtSignal(dict)
-    protocol_phase_started = pyqtSignal(str, int, str, bool)
+    protocol_phase_started = pyqtSignal(str, int, str, bool, str)
     protocol_finished = pyqtSignal()
     protocol_canceled = pyqtSignal()
+    protocol_paused = pyqtSignal(bool)
+    protocol_rewind = pyqtSignal()
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -2821,7 +3464,14 @@ class DataCollectionDialog(QDialog):
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
         self.setWindowTitle("Data Collection")
         self.setModal(False)
-        self.resize(940, 680)
+        # Content scrolls inside the dialog, so any screen size can reach every control.
+        target_w, target_h = 1020, 860
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            target_w = min(target_w, max(640, int(avail.width() * 0.92)))
+            target_h = min(target_h, max(520, int(avail.height() * 0.92)))
+        self.resize(target_w, target_h)
         apply_dark_title_bar(self)
 
         settings = dict(settings or {})
@@ -2833,9 +3483,24 @@ class DataCollectionDialog(QDialog):
         self.protocol_running = False
         self.session_prepared = False
 
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+        content = QWidget()
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
         layout.setAlignment(Qt.AlignTop)
+
+        self.lbl_plan = QLabel("")
+        self.lbl_plan.setWordWrap(True)
+        self.lbl_plan.setStyleSheet(f"color: {THEME_COLORS['accent']}; font-weight: bold;")
+        layout.addWidget(self.lbl_plan)
 
         self.consent_section = QWidget(self)
         consent_layout = QVBoxLayout(self.consent_section)
@@ -2845,25 +3510,106 @@ class DataCollectionDialog(QDialog):
         row_contributor = QHBoxLayout()
         row_contributor.addWidget(QLabel("Contributor:"))
         self.input_contributor = QLineEdit(str(settings.get("contributor_name", "")))
-        self.input_contributor.setPlaceholderText("Enter contributor name")
+        self.input_contributor.setPlaceholderText("Enter contributor name / participant ID")
         row_contributor.addWidget(self.input_contributor, stretch=1)
-        self.btn_terms = QPushButton("Read T&C")
+        self.btn_terms = QPushButton("Study Procedure")
         self.btn_terms.setStyleSheet(themed_button_style("accent"))
+        self.btn_terms.setToolTip("Read the duration and procedures of the study.")
         self.btn_terms.clicked.connect(self._show_terms)
         row_contributor.addWidget(self.btn_terms)
-        consent_layout.addLayout(row_contributor)
-
-        row_agree = QHBoxLayout()
-        row_agree.addWidget(QLabel("Agree to contribute?"))
-        self.check_agree_yes = QCheckBox("Yes")
-        self.check_agree_no = QCheckBox("No")
+        self.check_agree_yes = QCheckBox("Agree")
+        self.check_agree_no = QCheckBox("Disagree")
         is_agreed = bool(settings.get("agreed", False))
         self.check_agree_yes.setChecked(is_agreed)
         self.check_agree_no.setChecked(not is_agreed)
-        row_agree.addWidget(self.check_agree_yes)
-        row_agree.addWidget(self.check_agree_no)
-        row_agree.addStretch()
-        consent_layout.addLayout(row_agree)
+        self.check_agree_yes.setToolTip("I have read the study procedure and agree to take part.")
+        row_contributor.addWidget(self.check_agree_yes)
+        row_contributor.addWidget(self.check_agree_no)
+        consent_layout.addLayout(row_contributor)
+
+        # Additional information (participant info + room conditions) is tucked behind a button.
+        self.btn_additional = QPushButton("Additional Information  \u25b8")
+        self.btn_additional.setCheckable(True)
+        self.btn_additional.setStyleSheet(themed_button_style("muted"))
+        self.btn_additional.setToolTip("Participant info and room conditions (all optional).")
+        consent_layout.addWidget(self.btn_additional, 0, Qt.AlignLeft)
+        self.extra_panel = QWidget()
+        extra_layout = QVBoxLayout(self.extra_panel)
+        extra_layout.setContentsMargins(0, 0, 0, 0)
+        extra_layout.setSpacing(8)
+        self.extra_panel.setVisible(False)
+        self.btn_additional.toggled.connect(self._toggle_additional)
+
+        # Participant info (saved to the metadata file with each recording)
+        extra_layout.addLayout(_section_title(
+            "Participant Info", "(all optional - fields left empty are saved as N/A)"))
+
+        def _make_spin(minimum, maximum, step, decimals, suffix, value):
+            sp = QDoubleSpinBox()
+            sp.setRange(minimum, maximum)
+            sp.setDecimals(decimals)
+            sp.setSingleStep(step)
+            sp.setSuffix(suffix)
+            sp.setSpecialValueText("N/A")  # shown while the value is at the minimum (= not provided)
+            try:
+                sp.setValue(float(value))
+            except (TypeError, ValueError):
+                sp.setValue(minimum)
+            return sp
+
+        participant_grid = QGridLayout()
+        participant_grid.setHorizontalSpacing(10)
+        participant_grid.setVerticalSpacing(6)
+        self.combo_blood_group = QComboBox()
+        self.combo_blood_group.addItem("N/A")
+        self.combo_blood_group.addItems(BLOOD_GROUP_OPTIONS)
+        saved_bg = str(settings.get("blood_group", "")).strip().upper()
+        if saved_bg in BLOOD_GROUP_OPTIONS:
+            self.combo_blood_group.setCurrentText(saved_bg)
+        self.spin_height = _make_spin(0.0, 250.0, 0.5, 1, " cm", settings.get("height_cm", 0.0))
+        self.spin_weight = _make_spin(0.0, 300.0, 0.5, 1, " kg", settings.get("weight_kg", 0.0))
+        self.spin_age = QSpinBox()
+        self.spin_age.setRange(0, 120)
+        self.spin_age.setSuffix(" yrs")
+        self.spin_age.setSpecialValueText("N/A")
+        self.spin_age.setValue(int(settings.get("age_years", 0) or 0))
+        # No practical upper cap (Qt spin boxes need a maximum, so it is set very high).
+        circumference = settings.get("forearm_circumference_cm", settings.get("forearm_radius_cm", 0.0))
+        self.spin_forearm_circumference = _make_spin(0.0, 9999.99, 0.1, 2, " cm", circumference)
+        self.spin_forearm_circumference.setToolTip(
+            "Forearm circumference at the armband position, in cm.\n"
+            "Wrap a tape measure once around the forearm where the armband sits."
+        )
+        for col, (text, widget) in enumerate([
+            ("Blood Group:", self.combo_blood_group), ("Height:", self.spin_height),
+            ("Weight:", self.spin_weight), ("Age:", self.spin_age),
+            ("Forearm Circumference:", self.spin_forearm_circumference),
+        ]):
+            row, base = divmod(col, 2)
+            participant_grid.addWidget(QLabel(text), row, base * 2)
+            participant_grid.addWidget(widget, row, base * 2 + 1)
+        participant_grid.setColumnStretch(1, 1)
+        participant_grid.setColumnStretch(3, 1)
+        extra_layout.addLayout(participant_grid)
+
+        extra_layout.addLayout(_section_title(
+            "Room Conditions", "(note at the start of the session; optional)"))
+        env_grid = QGridLayout()
+        env_grid.setHorizontalSpacing(10)
+        env_grid.setVerticalSpacing(6)
+        self.spin_temp_start = _make_spin(0.0, 60.0, 0.5, 1, " °C", settings.get("temp_start_c", 0.0))
+        self.spin_humidity_start = _make_spin(0.0, 100.0, 1.0, 0, " %", settings.get("humidity_start_pct", 0.0))
+        for col, (text, widget) in enumerate([
+            ("Temperature:", self.spin_temp_start), ("Humidity:", self.spin_humidity_start),
+        ]):
+            row, base = divmod(col, 2)
+            env_grid.addWidget(QLabel(text), row, base * 2)
+            env_grid.addWidget(widget, row, base * 2 + 1)
+        env_grid.setColumnStretch(1, 1)
+        env_grid.setColumnStretch(3, 1)
+        extra_layout.addLayout(env_grid)
+
+        consent_layout.addWidget(self.extra_panel)
         layout.addWidget(self.consent_section)
 
         self.session_section = QWidget()
@@ -2880,7 +3626,7 @@ class DataCollectionDialog(QDialog):
 
         row_setup = QHBoxLayout()
         lbl_setup = QLabel("Class Label Setup")
-        lbl_setup.setStyleSheet("font-weight: bold;")
+        lbl_setup.setStyleSheet("font-weight: bold; font-size: 16px;")
         row_setup.addWidget(lbl_setup)
         row_setup.addStretch()
         self.btn_edit_labels = QPushButton("Edit")
@@ -2902,56 +3648,74 @@ class DataCollectionDialog(QDialog):
         self.lbl_labels_state.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         config_layout.addWidget(self.lbl_labels_state)
 
-        row_timing = QHBoxLayout()
-        row_timing.addWidget(QLabel("Repeats:"))
+        config_layout.addLayout(_section_title("Session Plan"))
+        plan_grid = QGridLayout()
+        plan_grid.setHorizontalSpacing(10)
+        plan_grid.setVerticalSpacing(6)
+
+        self.spin_session_day = QSpinBox()
+        self.spin_session_day.setRange(1, 2)
+        self.spin_session_day.setPrefix("Day ")
+        self.spin_session_day.setValue(int(settings.get("session_day", DEFAULT_SESSION_DAY)))
+        self.combo_hand_order = QComboBox()
+        for key, text in HAND_ORDER_OPTIONS:
+            self.combo_hand_order.addItem(text, key)
+        idx = self.combo_hand_order.findData(str(settings.get("hand_order", DEFAULT_HAND_ORDER)))
+        self.combo_hand_order.setCurrentIndex(max(0, idx))
         self.spin_task_repeats = QSpinBox()
         self.spin_task_repeats.setRange(1, 100)
         self.spin_task_repeats.setValue(int(settings.get("repeats", DEFAULT_TASK_REPEATS)))
-        row_timing.addWidget(self.spin_task_repeats)
-        row_timing.addWidget(QLabel("Prep(s):"))
-        self.spin_task_prep = QDoubleSpinBox()
-        self.spin_task_prep.setRange(0.2, 30.0)
-        self.spin_task_prep.setSingleStep(0.2)
-        self.spin_task_prep.setValue(float(settings.get("prep_s", DEFAULT_TASK_PREP_S)))
-        row_timing.addWidget(self.spin_task_prep)
-        row_timing.addWidget(QLabel("Hold(s):"))
-        self.spin_task_hold = QDoubleSpinBox()
-        self.spin_task_hold.setRange(0.2, 30.0)
-        self.spin_task_hold.setSingleStep(0.2)
-        self.spin_task_hold.setValue(float(settings.get("hold_s", DEFAULT_TASK_HOLD_S)))
-        row_timing.addWidget(self.spin_task_hold)
-        row_timing.addWidget(QLabel("Rest(s):"))
-        self.spin_task_rest = QDoubleSpinBox()
-        self.spin_task_rest.setRange(0.2, 30.0)
-        self.spin_task_rest.setSingleStep(0.2)
-        self.spin_task_rest.setValue(float(settings.get("rest_s", DEFAULT_TASK_REST_S)))
-        row_timing.addWidget(self.spin_task_rest)
+        self.spin_task_repeats.setToolTip("Repetitions of every class per hand (study: 9 per hand per day).")
+
+        def _seconds_spin(minimum, maximum, step, value, decimals=1, suffix=" s"):
+            sp = QDoubleSpinBox()
+            sp.setRange(minimum, maximum)
+            sp.setSingleStep(step)
+            sp.setDecimals(decimals)
+            sp.setSuffix(suffix)
+            sp.setValue(float(value))
+            return sp
+
+        self.spin_task_prep = _seconds_spin(0.2, 30.0, 0.5, settings.get("prep_s", DEFAULT_TASK_PREP_S))
+        self.spin_task_hold = _seconds_spin(0.2, 30.0, 0.5, settings.get("hold_s", DEFAULT_TASK_HOLD_S))
+        self.spin_task_rest = _seconds_spin(0.2, 30.0, 0.5, settings.get("rest_s", DEFAULT_TASK_REST_S))
+        # Fixed by the study protocol, so not shown: no settle gap, 30 cycles per block, 3.5 min block break.
+        self._fixed_plan = {
+            "settle_s": float(settings.get("settle_s", DEFAULT_TASK_SETTLE_S)),
+            "max_cycles_per_block": int(settings.get("max_cycles_per_block", DEFAULT_MAX_CYCLES_PER_BLOCK)),
+            "block_break_s": float(settings.get("block_break_s", DEFAULT_BLOCK_BREAK_S)),
+        }
+        self.spin_hand_switch = _seconds_spin(
+            0, 1800, 10, settings.get("hand_switch_s", DEFAULT_HAND_SWITCH_BREAK_S), 0)
+        self.spin_hand_switch.setToolTip("Break while the armband is moved to the other arm (study: about 5 minutes).")
         self.check_record_rest = QCheckBox("Record Rest")
         self.check_record_rest.setChecked(bool(settings.get("record_rest", True)))
-        row_timing.addWidget(self.check_record_rest)
-        row_timing.addStretch()
-        config_layout.addLayout(row_timing)
-
-        row_timing2 = QHBoxLayout()
-        row_timing2.addWidget(QLabel("Settle(s):"))
-        self.spin_task_settle = QDoubleSpinBox()
-        self.spin_task_settle.setRange(0.0, 5.0)
-        self.spin_task_settle.setSingleStep(0.1)
-        self.spin_task_settle.setValue(float(settings.get("settle_s", DEFAULT_TASK_SETTLE_S)))
-        self.spin_task_settle.setToolTip(
-            "Un-recorded gap after each hold, before Rest capture starts. Without this, the "
-            "start of every Rest window is muscle-relaxation decay, not true baseline."
-        )
-        row_timing2.addWidget(self.spin_task_settle)
         self.check_randomize_order = QCheckBox("Randomize Gesture Order")
         self.check_randomize_order.setChecked(bool(settings.get("randomize_order", True)))
         self.check_randomize_order.setToolTip(
             "Shuffle gesture order independently each repeat, so fatigue doesn't always "
             "degrade whichever gesture is fixed last in the cycle."
         )
-        row_timing2.addWidget(self.check_randomize_order)
-        row_timing2.addStretch()
-        config_layout.addLayout(row_timing2)
+
+        plan_fields = [
+            ("Session:", self.spin_session_day), ("Hands:", self.combo_hand_order),
+            ("Repeats per hand:", self.spin_task_repeats),
+            ("Prepare:", self.spin_task_prep), ("Perform:", self.spin_task_hold), ("Rest:", self.spin_task_rest),
+            ("Hand-switch break:", self.spin_hand_switch),
+        ]
+        for i, (text, widget) in enumerate(plan_fields):
+            row, base = divmod(i, 2)
+            plan_grid.addWidget(QLabel(text), row, base * 2)
+            plan_grid.addWidget(widget, row, base * 2 + 1)
+        for col in (1, 3):
+            plan_grid.setColumnStretch(col, 1)
+        config_layout.addLayout(plan_grid)
+
+        row_checks = QHBoxLayout()
+        row_checks.addWidget(self.check_record_rest)
+        row_checks.addWidget(self.check_randomize_order)
+        row_checks.addStretch()
+        config_layout.addLayout(row_checks)
 
         row_csv = QHBoxLayout()
         row_csv.addWidget(QLabel("CSV Save Folder:"))
@@ -2971,7 +3735,7 @@ class DataCollectionDialog(QDialog):
         row_actions.addStretch()
         config_layout.addLayout(row_actions)
 
-        config_layout.addSpacing(14)
+        config_layout.addSpacing(8)
         self.protocol_divider = QFrame()
         self.protocol_divider.setFrameShape(QFrame.HLine)
         self.protocol_divider.setFrameShadow(QFrame.Plain)
@@ -2979,7 +3743,7 @@ class DataCollectionDialog(QDialog):
             f"border: none; background-color: {THEME_COLORS['accent']}; min-height: 1px; max-height: 1px;"
         )
         config_layout.addWidget(self.protocol_divider)
-        config_layout.addSpacing(14)
+        config_layout.addSpacing(8)
 
         session_layout.addWidget(self.session_config_section)
 
@@ -2988,6 +3752,8 @@ class DataCollectionDialog(QDialog):
         self.task_protocol.phase_started.connect(self._on_protocol_phase_started)
         self.task_protocol.protocol_finished.connect(self._on_protocol_finished)
         self.task_protocol.protocol_canceled.connect(self._on_protocol_canceled)
+        self.task_protocol.paused_changed.connect(self.protocol_paused.emit)
+        self.task_protocol.rewind_requested.connect(self.protocol_rewind.emit)
         self.consent_opacity = QGraphicsOpacityEffect(self.consent_section)
         self.consent_section.setGraphicsEffect(self.consent_opacity)
         self.session_config_opacity = QGraphicsOpacityEffect(self.session_config_section)
@@ -2999,20 +3765,36 @@ class DataCollectionDialog(QDialog):
         session_layout.addWidget(self.task_protocol)
         layout.addWidget(self.session_section)
 
-        self.input_contributor.textChanged.connect(self._emit_settings_changed)
+        for sig in (
+            self.input_contributor.textChanged,
+            self.combo_blood_group.currentIndexChanged,
+            self.spin_height.valueChanged, self.spin_weight.valueChanged, self.spin_age.valueChanged,
+            self.spin_forearm_circumference.valueChanged,
+            self.spin_temp_start.valueChanged, self.spin_humidity_start.valueChanged,
+            self.spin_session_day.valueChanged, self.combo_hand_order.currentIndexChanged,
+            self.spin_task_repeats.valueChanged, self.spin_task_prep.valueChanged,
+            self.spin_task_hold.valueChanged, self.spin_task_rest.valueChanged,
+            self.spin_hand_switch.valueChanged,
+            self.check_record_rest.stateChanged, self.check_randomize_order.stateChanged,
+            self.input_record_dir.textChanged,
+        ):
+            sig.connect(self._emit_settings_changed)
         self.check_agree_yes.stateChanged.connect(self._on_agree_yes_changed)
         self.check_agree_no.stateChanged.connect(self._on_agree_no_changed)
-        self.spin_task_repeats.valueChanged.connect(self._emit_settings_changed)
-        self.spin_task_prep.valueChanged.connect(self._emit_settings_changed)
-        self.spin_task_hold.valueChanged.connect(self._emit_settings_changed)
-        self.spin_task_rest.valueChanged.connect(self._emit_settings_changed)
-        self.check_record_rest.stateChanged.connect(self._emit_settings_changed)
-        self.spin_task_settle.valueChanged.connect(self._emit_settings_changed)
-        self.check_randomize_order.stateChanged.connect(self._emit_settings_changed)
-        self.input_record_dir.textChanged.connect(self._emit_settings_changed)
 
         self._refresh_class_labels_display()
         self._update_access_state()
+        self._update_plan_label()
+
+    # -- helpers ---------------------------------------------------------------
+    def _update_plan_label(self):
+        plan = plan_summary(self.settings_payload())
+        hands = " + ".join(plan["hands"])
+        self.lbl_plan.setText(
+            f"This session: {hands} hand | {plan['cycles']} cycles x {plan['cycle_s']:.0f} s = "
+            f"{format_duration(plan['active_s'] * 1000, False)} active | {plan['blocks_per_hand']} block(s) per hand | "
+            f"about {format_duration(plan['total_s'] * 1000, False)} including breaks"
+        )
 
     def _refresh_class_labels_display(self):
         text = ", ".join(self.task_labels)
@@ -3037,15 +3819,25 @@ class DataCollectionDialog(QDialog):
     def settings_payload(self):
         return {
             "contributor_name": self.input_contributor.text().strip(),
+            "blood_group": self.combo_blood_group.currentText() if self.combo_blood_group.currentIndex() > 0 else "",
+            "height_cm": float(self.spin_height.value()),
+            "weight_kg": float(self.spin_weight.value()),
+            "age_years": int(self.spin_age.value()),
+            "forearm_circumference_cm": float(self.spin_forearm_circumference.value()),
+            "temp_start_c": float(self.spin_temp_start.value()),
+            "humidity_start_pct": float(self.spin_humidity_start.value()),
             "agreed": bool(self.check_agree_yes.isChecked() and not self.check_agree_no.isChecked()),
             "task_labels": list(self.task_labels),
             "labels_saved": bool(self.labels_saved),
+            "session_day": int(self.spin_session_day.value()),
+            "hand_order": str(self.combo_hand_order.currentData() or DEFAULT_HAND_ORDER),
             "repeats": int(self.spin_task_repeats.value()),
             "prep_s": float(self.spin_task_prep.value()),
             "hold_s": float(self.spin_task_hold.value()),
             "rest_s": float(self.spin_task_rest.value()),
             "record_rest": bool(self.check_record_rest.isChecked()),
-            "settle_s": float(self.spin_task_settle.value()),
+            **self._fixed_plan,
+            "hand_switch_s": float(self.spin_hand_switch.value()),
             "randomize_order": bool(self.check_randomize_order.isChecked()),
             "csv_dir": self.input_record_dir.text().strip(),
         }
@@ -3053,13 +3845,17 @@ class DataCollectionDialog(QDialog):
     def set_csv_dir(self, path):
         self.input_record_dir.setText(str(path or ""))
 
+    def set_csv_counter(self, text, kind="accent"):
+        self.task_protocol.set_csv_counter(text, kind)
+
+    def _toggle_additional(self, shown):
+        self.extra_panel.setVisible(bool(shown))
+        self.btn_additional.setText("Additional Information  " + ("\u25be" if shown else "\u25b8"))
+
     def _show_terms(self):
-        QMessageBox.information(
-            self,
-            "Terms & Conditions",
-            "By contributing data, you confirm you have permission to share this data and agree that it may be used "
-            "for EMG model development and research/testing purposes.",
-        )
+        dlg = StudyProcedureDialog(self)
+        center_window(dlg, self)
+        dlg.exec_()
 
     def _browse_record_dir(self):
         path = QFileDialog.getExistingDirectory(
@@ -3109,7 +3905,25 @@ class DataCollectionDialog(QDialog):
         self.task_protocol.set_cancel_enabled(self.session_prepared and (not self.protocol_running))
 
     def _emit_settings_changed(self, *_args):
+        self._update_plan_label()
         self.settings_changed.emit(self.settings_payload())
+
+    def _protocol_kwargs(self, settings):
+        return dict(
+            labels=settings["task_labels"],
+            repeats=settings["repeats"],
+            prep_s=settings["prep_s"],
+            hold_s=settings["hold_s"],
+            rest_s=settings["rest_s"],
+            record_rest=settings["record_rest"],
+            settle_s=settings["settle_s"],
+            randomize_order=settings["randomize_order"],
+            hand_order=settings["hand_order"],
+            session_day=settings["session_day"],
+            max_cycles_per_block=settings["max_cycles_per_block"],
+            block_break_s=settings["block_break_s"],
+            hand_switch_s=settings["hand_switch_s"],
+        )
 
     def _emit_start_requested(self):
         if self.protocol_running:
@@ -3124,30 +3938,20 @@ class DataCollectionDialog(QDialog):
         if not self.input_contributor.text().strip():
             QMessageBox.warning(self, "Contributor", "Please provide a contributor name.")
             return
+        # Participant info and room conditions are optional; anything left empty is
+        # written to the metadata file as N/A.
         if not self.labels_saved or len(self.task_labels) == 0:
             QMessageBox.warning(self, "Task Labels", "Click Edit and save class labels before proceeding.")
             return
-        settings = self.settings_payload()
-        self.task_protocol.configure(
-            labels=settings["task_labels"],
-            repeats=settings["repeats"],
-            prep_s=settings["prep_s"],
-            hold_s=settings["hold_s"],
-            rest_s=settings["rest_s"],
-            record_rest=settings["record_rest"],
-            settle_s=settings["settle_s"],
-            randomize_order=settings["randomize_order"],
-        )
+        self.task_protocol.configure(**self._protocol_kwargs(self.settings_payload()))
         self.session_prepared = True
         self._set_protocol_dimmed(False)
         self._update_access_state()
 
-    def start_task_protocol(self, labels, repeats, prep_s, hold_s, rest_s, record_rest=True,
-                             settle_s=DEFAULT_TASK_SETTLE_S, randomize_order=True):
+    def start_task_protocol(self, **kwargs):
         if self.protocol_running or (not self.session_prepared):
             return False
-        self.task_protocol.configure(labels, repeats, prep_s, hold_s, rest_s, record_rest,
-                                      settle_s=settle_s, randomize_order=randomize_order)
+        self.task_protocol.configure(**kwargs)
         started = self.task_protocol.start_protocol()
         if not started:
             return False
@@ -3182,8 +3986,8 @@ class DataCollectionDialog(QDialog):
         if hasattr(self, "protocol_opacity") and self.protocol_opacity is not None:
             self.protocol_opacity.setOpacity(0.42 if dimmed else 1.0)
 
-    def _on_protocol_phase_started(self, label, trial_id, phase_name, record_enabled):
-        self.protocol_phase_started.emit(label, trial_id, phase_name, record_enabled)
+    def _on_protocol_phase_started(self, label, trial_id, phase_name, record_enabled, hand):
+        self.protocol_phase_started.emit(label, trial_id, phase_name, record_enabled, hand)
 
     def _on_protocol_finished(self):
         self.protocol_running = False
@@ -3207,6 +4011,7 @@ class DataCollectionDialog(QDialog):
         if self.protocol_running:
             self.cancel_task_protocol(emit_signal=True)
         super().closeEvent(event)
+
 
 
 class AnalysisWindow(QMainWindow):
@@ -3954,337 +4759,66 @@ class LiveAnalysisWorker(QThread):
             finally:
                 self.analysis_finished.emit()
 
-# =====================================================================
-# GESTURE GAME PATCH
-# Paste these two classes into main.py, immediately BEFORE:
-#     class RoundedClipWidget(QWidget):
-#
-# They only READ from EMGVisualizer (via get_realtime_classification_payload,
-# the same method RealtimeClassificationWindow already uses) - the RF
-# inference pipeline itself is untouched.
-# =====================================================================
 
+class GesturePublisher:
+    """Mirrors each smoothed prediction to localhost UDP for the separate gesture_game_app.py.
 
-class GestureGameWidget(QWidget):
-    """Lightweight 3-lane runner controlled entirely by EMG gesture predictions.
-
-    Left / Right gestures shift the player between 3 lanes, Rest returns
-    control to neutral (arming the next move), and fist_close triggers a
-    'smash' that clears obstacles in the player's lane and grants a brief
-    shield. The confidence gate for accepting a gesture is kept low so the
-    game feels responsive even with a noisy classifier.
+    One ~60-byte datagram at <= 12 Hz; send errors are ignored so it can never slow the
+    EMG pipeline down or raise into the UI.
     """
 
-    score_changed = pyqtSignal(int)
-    lives_changed = pyqtSignal(int)
-    game_over = pyqtSignal(int)
+    def __init__(self, host=GESTURE_BRIDGE_HOST, port=GESTURE_BRIDGE_PORT):
+        self._addr = (host, int(port))
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setblocking(False)
+        except OSError:
+            self._sock = None
 
-    LANE_COUNT = GAME_LANES
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(360, 480)
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setAttribute(Qt.WA_StyledBackground, True)
-
-        self.running = False
-        self.paused = False
-        self.player_lane = 1
-        self.lives = 3
-        self.score = 0
-        self.high_score = 0
-        self.objects = []  # list of dicts: lane, y (0..1 down the track), kind
-        self.spawn_accum_ms = 0.0
-        self.spawn_interval_ms = 950.0
-        self.fall_speed = 0.34  # fraction of track height per second
-        self.elapsed_s = 0.0
-        self.invulnerable_until = 0.0
-        self.smash_flash_until = 0.0
-        self.flash_color = None
-        self.current_gesture_label = "N/A"
-        self.current_gesture_conf = 0.0
-
-        self._last_action_label = None
-        self._last_action_ts = 0.0
-
-        self.loop_timer = QTimer(self)
-        self.loop_timer.timeout.connect(self._tick)
-
-    # --- lifecycle -----------------------------------------------------
-    def start_game(self):
-        self.reset_state()
-        self.running = True
-        self.paused = False
-        self.loop_timer.start(GAME_LOOP_MS)
-        self.setFocus()
-        self.update()
-
-    def pause_game(self, paused):
-        self.paused = bool(paused)
-
-    def stop_game(self):
-        self.running = False
-        self.loop_timer.stop()
-        self.update()
-
-    def reset_state(self):
-        self.player_lane = 1
-        self.lives = 3
-        self.score = 0
-        self.objects = []
-        self.spawn_accum_ms = 0.0
-        self.spawn_interval_ms = 950.0
-        self.fall_speed = 0.34
-        self.elapsed_s = 0.0
-        self.invulnerable_until = 0.0
-        self.smash_flash_until = 0.0
-        self._last_action_label = None
-        self._last_action_ts = 0.0
-        self.lives_changed.emit(self.lives)
-        self.score_changed.emit(self.score)
-        self.update()
-
-    # --- gesture input ---------------------------------------------------
-    def update_gesture(self, label, confidence_pct):
-        self.current_gesture_label = str(label or "N/A")
-        self.current_gesture_conf = float(confidence_pct or 0.0)
-        if not self.running or self.paused:
+    def publish(self, label, conf_pct, model=""):
+        if self._sock is None:
             return
+        try:
+            msg = json.dumps({"label": str(label), "conf_pct": round(float(conf_pct), 1), "model": str(model)})
+            self._sock.sendto(msg.encode("utf-8"), self._addr)
+        except (OSError, ValueError):
+            pass
 
-        norm = self.current_gesture_label.strip().lower()
-        if not norm or norm == "n/a":
-            return
-        if self.current_gesture_conf < GAME_MIN_CONFIDENCE_PCT:
-            return
-
-        now = time.perf_counter()
-        if (now - self._last_action_ts) < GAME_ACTION_COOLDOWN_S:
-            return
-        if norm == self._last_action_label:
-            return  # require the gesture to change (e.g. relax to Rest) before it retriggers
-
-        acted = False
-        if "left" in norm:
-            self._move_player(-1)
-            acted = True
-        elif "right" in norm:
-            self._move_player(1)
-            acted = True
-        elif "fist" in norm or "close" in norm:
-            self._smash()
-            acted = True
-        elif "rest" in norm:
-            acted = True  # arms the next gesture without moving
-
-        if acted:
-            self._last_action_label = norm
-            self._last_action_ts = now
-
-    def handle_key_action(self, key):
-        """Keyboard fallback so the game can be demoed without hardware."""
-        if key == Qt.Key_Left:
-            self._last_action_label = None
-            self.update_gesture("Left", 100.0)
-        elif key == Qt.Key_Right:
-            self._last_action_label = None
-            self.update_gesture("Right", 100.0)
-        elif key == Qt.Key_Space:
-            self._last_action_label = None
-            self.update_gesture("fist_close", 100.0)
-        elif key == Qt.Key_Down:
-            self._last_action_label = None  # manual "Rest" to re-arm
-
-    def keyPressEvent(self, event):
-        self.handle_key_action(event.key())
-        super().keyPressEvent(event)
-
-    # --- game mechanics --------------------------------------------------
-    def _move_player(self, delta):
-        self.player_lane = int(np.clip(self.player_lane + delta, 0, self.LANE_COUNT - 1))
-
-    def _smash(self):
-        now = time.perf_counter()
-        cleared = 0
-        remaining = []
-        for obj in self.objects:
-            if obj["lane"] == self.player_lane and obj["kind"] == "obstacle" and obj["y"] > 0.45:
-                cleared += 1
-            else:
-                remaining.append(obj)
-        self.objects = remaining
-        if cleared > 0:
-            self._add_score(cleared * 15)
-        self.invulnerable_until = now + 0.6
-        self.smash_flash_until = now + 0.25
-        self.flash_color = QColor(THEME_COLORS.get("accent", "#3B9797"))
-
-    def _add_score(self, amount):
-        if amount == 0:
-            return
-        self.score = max(0, int(self.score + amount))
-        self.score_changed.emit(self.score)
-
-    def _tick(self):
-        if not self.running or self.paused:
-            return
-        dt_s = GAME_LOOP_MS / 1000.0
-        self.elapsed_s += dt_s
-
-        # Difficulty ramps smoothly with survival time.
-        self.fall_speed = min(0.75, 0.34 + (self.elapsed_s * 0.012))
-        self.spawn_interval_ms = max(360.0, 950.0 - (self.elapsed_s * 14.0))
-
-        self.spawn_accum_ms += dt_s * 1000.0
-        if self.spawn_accum_ms >= self.spawn_interval_ms:
-            self.spawn_accum_ms = 0.0
-            self._spawn_object()
-
-        now = time.perf_counter()
-        survivors = []
-        for obj in self.objects:
-            obj["y"] += self.fall_speed * dt_s
-            if obj["y"] >= 0.90 and not obj.get("resolved", False):
-                if obj["lane"] == self.player_lane:
-                    obj["resolved"] = True
-                    if obj["kind"] == "coin":
-                        self._add_score(10)
-                        continue
-                    elif obj["kind"] == "obstacle":
-                        if now < self.invulnerable_until:
-                            continue
-                        self._lose_life()
-                        continue
-            if obj["y"] < 1.05:
-                survivors.append(obj)
-            elif obj["kind"] == "obstacle" and not obj.get("resolved", False):
-                self._add_score(2)  # reward for dodging cleanly
-        self.objects = survivors
-
-        self.update()
-
-    def _spawn_object(self):
-        lane = random.randint(0, self.LANE_COUNT - 1)
-        kind = "coin" if random.random() < 0.30 else "obstacle"
-        self.objects.append({"lane": lane, "y": -0.05, "kind": kind, "resolved": False})
-
-    def _lose_life(self):
-        self.lives -= 1
-        self.lives_changed.emit(self.lives)
-        self.invulnerable_until = time.perf_counter() + 1.0
-        if self.lives <= 0:
-            self.running = False
-            self.loop_timer.stop()
-            self.high_score = max(self.high_score, self.score)
-            self.game_over.emit(self.score)
-
-    # --- rendering ---------------------------------------------------
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        rect = self.rect()
-
-        bg = QColor(THEME_COLORS.get("bg", "#0A182C"))
-        painter.fillRect(rect, bg)
-
-        track_margin = 16
-        track_rect = QRectF(
-            track_margin, track_margin + 20,
-            rect.width() - (2 * track_margin), rect.height() - (2 * track_margin) - 44,
-        )
-        panel = QColor(THEME_COLORS.get("panel", "#132440"))
-        painter.setPen(QPen(QColor(THEME_COLORS.get("accent", "#3B9797")), 2))
-        painter.setBrush(QBrush(panel))
-        painter.drawRoundedRect(track_rect, 12, 12)
-
-        lane_w = track_rect.width() / self.LANE_COUNT
-        painter.setPen(QPen(QColor(255, 255, 255, 30), 1, Qt.DashLine))
-        for i in range(1, self.LANE_COUNT):
-            x = track_rect.left() + (lane_w * i)
-            painter.drawLine(QPointF(x, track_rect.top()), QPointF(x, track_rect.bottom()))
-
-        # Falling objects (obstacles + coins)
-        for obj in self.objects:
-            cx = track_rect.left() + (lane_w * (obj["lane"] + 0.5))
-            cy = track_rect.top() + (obj["y"] * track_rect.height())
-            if obj["kind"] == "coin":
-                painter.setPen(QPen(QColor("#FFD166"), 2))
-                painter.setBrush(QBrush(QColor("#FFB703")))
-                r = min(lane_w, track_rect.height()) * 0.09
-                painter.drawEllipse(QPointF(cx, cy), r, r)
-            else:
-                painter.setPen(QPen(QColor("#8C1128"), 2))
-                painter.setBrush(QBrush(QColor("#BF092F")))
-                s = min(lane_w, track_rect.height()) * 0.11
-                painter.drawRect(QRectF(cx - s, cy - s, s * 2, s * 2))
-
-        # Player
-        player_cx = track_rect.left() + (lane_w * (self.player_lane + 0.5))
-        player_cy = track_rect.top() + (track_rect.height() * 0.90)
-        player_r = min(lane_w, track_rect.height()) * 0.10
-        now = time.perf_counter()
-        shielded = now < self.invulnerable_until
-        player_color = QColor(THEME_COLORS.get("success", "#4CAF50")) if shielded else QColor(THEME_COLORS.get("accent", "#3B9797"))
-        painter.setPen(QPen(QColor("#FFFFFF"), 2))
-        painter.setBrush(QBrush(player_color))
-        painter.drawEllipse(QPointF(player_cx, player_cy), player_r, player_r)
-        if shielded:
-            painter.setPen(QPen(QColor(255, 255, 255, 140), 2, Qt.DashLine))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawEllipse(QPointF(player_cx, player_cy), player_r * 1.6, player_r * 1.6)
-
-        if now < self.smash_flash_until and self.flash_color is not None:
-            flash = QColor(self.flash_color)
-            flash.setAlpha(60)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(flash))
-            painter.drawRoundedRect(track_rect, 12, 12)
-
-        # HUD
-        hud_font = QFont()
-        hud_font.setPointSize(11)
-        hud_font.setBold(True)
-        painter.setFont(hud_font)
-        painter.setPen(QColor(THEME_COLORS.get("text", "#E8EEF0")))
-        painter.drawText(
-            QRectF(track_rect.left(), 2, track_rect.width() * 0.6, track_margin + 16),
-            Qt.AlignLeft | Qt.AlignVCenter,
-            f"Score: {self.score}   Best: {self.high_score}",
-        )
-        painter.drawText(
-            QRectF(track_rect.left() + track_rect.width() * 0.4, 2, track_rect.width() * 0.6, track_margin + 16),
-            Qt.AlignRight | Qt.AlignVCenter,
-            ("Lives: " + ("* " * max(0, self.lives))).rstrip(),
-        )
-
-        gesture_font = QFont()
-        gesture_font.setPointSize(10)
-        painter.setFont(gesture_font)
-        painter.setPen(QColor(THEME_COLORS.get("muted", "#A9C2CF")))
-        painter.drawText(
-            QRectF(track_rect.left(), track_rect.bottom() + 4, track_rect.width(), track_margin + 16),
-            Qt.AlignLeft | Qt.AlignVCenter,
-            f"Gesture: {self.current_gesture_label}  ({self.current_gesture_conf:.0f}%)",
-        )
-
-        if not self.running:
-            painter.setPen(QColor(255, 255, 255, 230))
-            title_font = QFont()
-            title_font.setPointSize(18)
-            title_font.setBold(True)
-            painter.setFont(title_font)
-            msg = "Press Start" if self.score == 0 and self.lives == 3 else f"Game Over - Score {self.score}"
-            painter.drawText(track_rect, Qt.AlignCenter, msg)
+    def close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
 
 
-class GestureGameWindow(QMainWindow):
+def packet_health_kind(snapshot):
+    """'ok' / 'warn' / 'bad' for a PacketTracer snapshot (drives label colours)."""
+    if snapshot["received"] == 0:
+        return "idle"
+    if snapshot["loss_pct"] >= 1.0:
+        return "bad"
+    if snapshot["missing"] > 0 or snapshot["invalid"] > 0:
+        return "warn"
+    return "ok"
+
+
+PACKET_KIND_COLORS = {"ok": "#43A047", "warn": "#f57c00", "bad": "#f44336", "idle": THEME_COLORS["muted"]}
+
+
+class PacketTracerWindow(QMainWindow):
+    """Live transport monitor: packets/s, missing packets, loss %, jitter and a rolling plot."""
+
     closed = pyqtSignal()
 
-    def __init__(self, visualizer):
-        super().__init__()
+    def __init__(self, tracer, parent=None):
+        super().__init__(parent)
         apply_app_icon(self)
-        self.visualizer = visualizer
-        self.setWindowTitle("Gesture Game - Lane Dash")
-        fit_window_to_screen(self, 520, 700)
+        self.tracer = tracer
+        self.setWindowTitle("Packet Tracer")
+        fit_window_to_screen(self, 760, 560)
+        clamp_minimum_size(self, 520, 420)
         apply_dark_title_bar(self)
 
         central = QWidget()
@@ -4292,347 +4826,189 @@ class GestureGameWindow(QMainWindow):
         layout = QVBoxLayout(central)
         layout.setSpacing(8)
 
-        intro = QLabel(
-            "Control the runner with your gestures: Left/Right switch lanes, Rest arms the "
-            "next move, and fist_close smashes obstacles in your lane for bonus points. "
-            "Keyboard fallback: Left/Right arrows, Space = fist_close, Down = re-arm."
-        )
-        intro.setWordWrap(True)
-        intro.setStyleSheet(themed_label_style("muted"))
-        layout.addWidget(intro)
+        self.lbl_health = StableLabel("No packets yet")
+        self.lbl_health.setStyleSheet("font-size: 20px; font-weight: bold;")
+        layout.addWidget(self.lbl_health)
 
-        self.lbl_model_status = QLabel("Model: Not loaded")
-        self.lbl_model_status.setStyleSheet(themed_label_style("muted"))
-        layout.addWidget(self.lbl_model_status)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(8)
+        self._value_labels = {}
+        fields = [
+            ("pkt_rate", "Packets / s"), ("sample_rate", "Samples / s"),
+            ("received", "Packets received"), ("missing", "Packets missing"),
+            ("loss", "Packet loss"), ("missing_samples", "Samples lost"),
+            ("out_of_order", "Out of order"), ("invalid", "Invalid / malformed"),
+            ("jitter", "Jitter"), ("max_gap", "Longest gap"),
+            ("throughput", "Throughput"), ("uptime", "Uptime"),
+        ]
+        for i, (key, title) in enumerate(fields):
+            card = QFrame()
+            card.setObjectName("pktCard")
+            card.setStyleSheet(
+                f"QFrame#pktCard {{ background-color: {THEME_COLORS['panel']}; "
+                f"border: 1px solid {THEME_COLORS['accent']}; border-radius: 8px; }} "
+                "QFrame#pktCard QLabel { background: transparent; border: none; }"
+            )
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(10, 6, 10, 6)
+            card_layout.setSpacing(0)
+            cap = QLabel(title)
+            cap.setStyleSheet(themed_label_style("muted"))
+            val = StableLabel("--")
+            val.setStyleSheet("font-size: 20px; font-weight: bold;")
+            card_layout.addWidget(cap)
+            card_layout.addWidget(val)
+            self._value_labels[key] = val
+            grid.addWidget(card, i // 3, i % 3)
+        layout.addLayout(grid)
 
-        self.game_widget = GestureGameWidget()
-        self.game_widget.score_changed.connect(self._on_score_changed)
-        self.game_widget.lives_changed.connect(self._on_lives_changed)
-        self.game_widget.game_over.connect(self._on_game_over)
-        layout.addWidget(self.game_widget, 1)
+        self.lbl_note = QLabel("")
+        self.lbl_note.setWordWrap(True)
+        self.lbl_note.setStyleSheet(themed_label_style("muted"))
+        layout.addWidget(self.lbl_note)
+
+        self.rate_plot = pg.PlotWidget()
+        self.rate_plot.setBackground("k")
+        self.rate_plot.setMinimumHeight(140)
+        self.rate_plot.showGrid(x=False, y=True, alpha=0.3)
+        self.rate_plot.setLabel("left", "packets / s")
+        self.rate_plot.setLabel("bottom", "last 30 s")
+        self.rate_plot.setMouseEnabled(x=False, y=False)
+        self.rate_plot.hideButtons()
+        self.rate_plot.setMenuEnabled(False)
+        self.rate_curve = self.rate_plot.plot(pen=pg.mkPen("#3B9797", width=2))
+        self.missing_plot = pg.ViewBox()
+        self.rate_plot.showAxis("right")
+        self.rate_plot.getAxis("right").setLabel("missing")
+        self.rate_plot.scene().addItem(self.missing_plot)
+        self.rate_plot.getAxis("right").linkToView(self.missing_plot)
+        self.missing_plot.setXLink(self.rate_plot)
+        self.missing_curve = pg.PlotCurveItem(pen=pg.mkPen("#f44336", width=2))
+        self.missing_plot.addItem(self.missing_curve)
+        self.rate_plot.getViewBox().sigResized.connect(self._sync_views)
+        layout.addWidget(self.rate_plot, 1)
 
         btn_row = QHBoxLayout()
-        self.btn_start = QPushButton("Start")
-        self.btn_start.setStyleSheet(themed_button_style("success"))
-        self.btn_start.clicked.connect(self.on_start_clicked)
-        btn_row.addWidget(self.btn_start)
-
-        self.btn_pause = QPushButton("Pause")
-        self.btn_pause.setStyleSheet(themed_button_style("accent"))
-        self.btn_pause.setEnabled(False)
-        self.btn_pause.clicked.connect(self.on_pause_clicked)
-        btn_row.addWidget(self.btn_pause)
-
-        self.btn_reset = QPushButton("Reset")
+        self.btn_reset = QPushButton("Reset Counters")
         self.btn_reset.setStyleSheet(themed_button_style("muted"))
-        self.btn_reset.clicked.connect(self.on_reset_clicked)
+        self.btn_reset.setToolTip("Zero the counters (the stream keeps running).")
+        self.btn_reset.clicked.connect(self._reset_counters)
         btn_row.addWidget(self.btn_reset)
+        btn_row.addStretch()
         layout.addLayout(btn_row)
 
-        self.lbl_status = QLabel("Press Start, then use your gestures (or arrow keys) to play.")
-        self.lbl_status.setWordWrap(True)
-        self.lbl_status.setStyleSheet(themed_label_style("muted"))
-        layout.addWidget(self.lbl_status)
+        self.refresh()
 
-        self.poll_timer = QTimer(self)
-        self.poll_timer.timeout.connect(self.poll_gesture)
-        self.poll_timer.start(GAME_GESTURE_POLL_MS)
+    def _sync_views(self):
+        self.missing_plot.setGeometry(self.rate_plot.getViewBox().sceneBoundingRect())
+        self.missing_plot.linkedViewChanged(self.rate_plot.getViewBox(), self.missing_plot.XAxis)
 
-        self.game_widget.setFocus()
+    def _reset_counters(self):
+        self.tracer.reset(self.tracer.kind, self.tracer.frames_per_packet)
 
-    def on_start_clicked(self):
-        self.game_widget.start_game()
-        self.btn_pause.setEnabled(True)
-        self.btn_pause.setText("Pause")
-        self.lbl_status.setText("Game running - use Left/Right to move, fist_close to smash.")
-        self.game_widget.setFocus()
+    def refresh(self):
+        snap = self.tracer.snapshot()
+        kind = packet_health_kind(snap)
+        color = PACKET_KIND_COLORS[kind]
+        wireless = snap["kind"] == "wireless"
+        headline = {
+            "idle": "Waiting for packets...",
+            "ok": "Link healthy - no packets missing",
+            "warn": "Link degraded - packets missing",
+            "bad": "Link poor - significant packet loss",
+        }[kind]
+        self.lbl_health.setText(headline)
+        self.lbl_health.setStyleSheet(f"font-size: 20px; font-weight: bold; color: {color};")
 
-    def on_pause_clicked(self):
-        is_paused = not self.game_widget.paused
-        self.game_widget.pause_game(is_paused)
-        self.btn_pause.setText("Resume" if is_paused else "Pause")
-        self.lbl_status.setText("Paused." if is_paused else "Game running.")
-        self.game_widget.setFocus()
-
-    def on_reset_clicked(self):
-        self.game_widget.stop_game()
-        self.game_widget.reset_state()
-        self.btn_pause.setEnabled(False)
-        self.btn_pause.setText("Pause")
-        self.lbl_status.setText("Press Start, then use your gestures (or arrow keys) to play.")
-        self.game_widget.setFocus()
-
-    def _on_score_changed(self, score):
-        pass  # score is drawn directly on the widget; hook kept for future HUD use
-
-    def _on_lives_changed(self, lives):
-        if lives <= 0:
-            self.lbl_status.setText("Out of lives! Press Reset to play again.")
-
-    def _on_game_over(self, final_score):
-        self.btn_pause.setEnabled(False)
-        self.lbl_status.setText(f"Game over - final score {final_score}. Press Reset to play again.")
-
-    def poll_gesture(self):
-        if self.visualizer is None:
-            return
-        payload = self.visualizer.get_realtime_classification_payload()
-        model_loaded = bool(payload.get("model_loaded", False))
-        self.lbl_model_status.setText(str(payload.get("model_status_text", "Model: Not loaded")))
-        self.lbl_model_status.setStyleSheet(
-            themed_label_style("success" if model_loaded else "muted")
+        vals = self._value_labels
+        vals["pkt_rate"].setText(f"{snap['pkt_rate']:.1f}  / {snap['expected_pkt_rate']:.0f}")
+        vals["sample_rate"].setText(f"{snap['sample_rate']:.0f}  / {snap['expected_sample_rate']:.0f}")
+        vals["received"].setText(f"{snap['received']:,}")
+        vals["missing"].setText(f"{snap['missing']:,}" if wireless else f"{snap['missing']:,} (bad lines)")
+        vals["loss"].setText(f"{snap['loss_pct']:.3f} %")
+        vals["missing_samples"].setText(f"{snap['missing_samples']:,}")
+        vals["out_of_order"].setText(f"{snap['out_of_order']:,}" if wireless else "n/a")
+        vals["invalid"].setText(f"{snap['invalid']:,}")
+        vals["jitter"].setText(f"{snap['jitter_ms']:.2f} ms" if wireless else "n/a")
+        vals["max_gap"].setText(f"{snap['max_gap_ms']:.0f} ms")
+        vals["throughput"].setText(f"{snap['bytes'] / max(1e-6, snap['uptime_s']) / 1024.0:.1f} KB/s")
+        vals["uptime"].setText(format_duration(snap["uptime_s"] * 1000, False))
+        for key in ("missing", "loss", "missing_samples"):
+            vals[key].setStyleSheet(
+                f"font-size: 20px; font-weight: bold; color: "
+                f"{PACKET_KIND_COLORS['ok'] if snap['missing'] == 0 else PACKET_KIND_COLORS['bad']};"
+            )
+        self.lbl_note.setText(
+            "Wireless: every UDP packet carries a sequence number, so missing and out-of-order packets are exact "
+            f"(each packet holds {snap['missing_samples'] // max(1, snap['missing']) if snap['missing'] else WIRELESS_FRAMES_PER_PACKET} samples)."
+            if wireless else
+            "Wired: the text stream has no sequence numbers, so malformed/truncated lines are counted as lost "
+            "samples and the achieved sample rate is compared with the nominal rate."
         )
-        label = str(payload.get("pred_label", "N/A"))
-        conf_pct = float(payload.get("pred_conf_pct", 0.0))
-        self.game_widget.update_gesture(label, conf_pct)
+        rates = snap["rate_history"]
+        if rates:
+            xs = np.arange(-len(rates) + 1, 1) * (PACKET_TRACER_TICK_MS / 1000.0)
+            self.rate_curve.setData(xs, np.asarray(rates, dtype=np.float32), skipFiniteCheck=True)
+            self.missing_curve.setData(xs, np.asarray(snap["missing_history"], dtype=np.float32), skipFiniteCheck=True)
+            self.rate_plot.setXRange(float(xs[0]), 0.0, padding=0)
+            self.rate_plot.setYRange(0.0, max(snap["expected_pkt_rate"] * 1.2, max(rates) * 1.05), padding=0)
+            self.missing_plot.setYRange(0.0, max(1.0, float(max(snap["missing_history"])) * 1.2), padding=0)
+        self._sync_views()
 
     def closeEvent(self, event):
-        self.poll_timer.stop()
-        self.game_widget.stop_game()
         self.closed.emit()
         super().closeEvent(event)
 
 
-class MouseControlWindow(QMainWindow):
-    """Drive the OS mouse cursor from the app's live gesture predictions.
+class OptionsInfoDialog(QDialog):
+    """One window listing every option of the app: current value and what it does."""
 
-    This mirrors GestureGameWindow's approach: it does NOT open its own
-    serial connection or load its own model. It simply polls the same
-    visualizer.get_realtime_classification_payload() feed that already
-    streams live gesture/class predictions once EMGVisualizer is connected,
-    calibrated, and has an RF model loaded. The window only adds the
-    class-to-mouse-action mapping UI and the pyautogui execution logic.
-    """
-
-    closed = pyqtSignal()
-
-    def __init__(self, visualizer):
-        super().__init__()
+    def __init__(self, sections, parent=None):
+        super().__init__(parent)
         apply_app_icon(self)
-        self.visualizer = visualizer
-        self.setWindowTitle("Mouse Control")
-        fit_window_to_screen(self, 480, 620)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setWindowTitle("Options Info")
+        self.resize(880, 720)
         apply_dark_title_bar(self)
-
-        self.class_action_map = {}   # {class_name: action_string}
-        self.mapping_combos = []
-        self.mouse_control_active = False
-        self.last_click_time = 0.0
-        self._known_classes = []
-
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setSpacing(8)
-
-        intro = QLabel(
-            "Map each gesture class to a mouse action, then enable mouse control. "
-            "This uses the same live model/stream as Real-time Classification, so "
-            "connect, calibrate, and load an RF model first. Move the physical mouse "
-            "to a screen corner at any time to abort (pyautogui fail-safe)."
-        )
+        layout = QVBoxLayout(self)
+        intro = QLabel("Every option in BioWave EMG, grouped by where you find it. "
+                       "'Current value' shows your live setting.")
         intro.setWordWrap(True)
         intro.setStyleSheet(themed_label_style("muted"))
         layout.addWidget(intro)
+        view = QTextBrowser()
+        view.setOpenExternalLinks(False)
+        view.setHtml(self._build_html(sections))
+        layout.addWidget(view, 1)
+        row = QHBoxLayout()
+        row.addStretch()
+        btn = QPushButton("Close")
+        btn.setStyleSheet(themed_button_style("accent"))
+        btn.clicked.connect(self.accept)
+        row.addWidget(btn)
+        layout.addLayout(row)
 
-        self.lbl_model_status = QLabel("Model: Not loaded")
-        self.lbl_model_status.setStyleSheet(themed_label_style("muted"))
-        layout.addWidget(self.lbl_model_status)
-
-        if not HAS_PYAUTOGUI:
-            warn = QLabel("pyautogui not installed - run: pip install pyautogui")
-            warn.setStyleSheet(themed_label_style("danger") if "danger" in THEME_COLORS else "color:#BF092F;")
-            layout.addWidget(warn)
-
-        grp_map = QFrame()
-        map_outer = QVBoxLayout(grp_map)
-        map_outer.addWidget(QLabel("Gesture -> Action mapping:"))
-        self.scroll_map = QScrollArea()
-        self.scroll_map.setWidgetResizable(True)
-        self.map_content = QWidget()
-        self.map_form = QFormLayout(self.map_content)
-        self.scroll_map.setWidget(self.map_content)
-        map_outer.addWidget(self.scroll_map)
-        self.lbl_map_hint = QLabel("Waiting for classes from the loaded model...")
-        self.lbl_map_hint.setStyleSheet(themed_label_style("muted"))
-        self.map_form.addRow(self.lbl_map_hint)
-        layout.addWidget(grp_map, 1)
-
-        settings_form = QFormLayout()
-        self.spin_conf = QDoubleSpinBox()
-        self.spin_conf.setRange(10.0, 99.9)
-        self.spin_conf.setValue(65.0)
-        self.spin_conf.setSuffix("%")
-        settings_form.addRow("Minimum Confidence:", self.spin_conf)
-
-        self.spin_speed = QSpinBox()
-        self.spin_speed.setRange(1, 150)
-        self.spin_speed.setValue(30)
-        self.spin_speed.setSuffix(" px")
-        settings_form.addRow("Mouse Speed (per tick):", self.spin_speed)
-
-        self.spin_cooldown = QDoubleSpinBox()
-        self.spin_cooldown.setRange(0.1, 5.0)
-        self.spin_cooldown.setValue(1.0)
-        self.spin_cooldown.setSuffix(" sec")
-        settings_form.addRow("Click Cooldown:", self.spin_cooldown)
-        layout.addLayout(settings_form)
-
-        self.lbl_prediction = QLabel("REST")
-        self.lbl_prediction.setAlignment(Qt.AlignCenter)
-        pred_font = QFont()
-        pred_font.setPointSize(20)
-        pred_font.setBold(True)
-        self.lbl_prediction.setFont(pred_font)
-        self.lbl_prediction.setStyleSheet(themed_label_style("muted"))
-        layout.addWidget(self.lbl_prediction)
-
-        self.btn_mouse_toggle = QPushButton("ENABLE MOUSE CONTROL")
-        self.btn_mouse_toggle.setStyleSheet(themed_button_style("success"))
-        self.btn_mouse_toggle.setCheckable(True)
-        self.btn_mouse_toggle.setEnabled(HAS_PYAUTOGUI)
-        self.btn_mouse_toggle.toggled.connect(self.toggle_mouse_control)
-        layout.addWidget(self.btn_mouse_toggle)
-
-        lbl_safety = QLabel("Safety: move the physical mouse to a screen corner to abort.")
-        lbl_safety.setAlignment(Qt.AlignCenter)
-        lbl_safety.setStyleSheet(themed_label_style("muted"))
-        layout.addWidget(lbl_safety)
-
-        self.lbl_status = QLabel("Idle.")
-        self.lbl_status.setWordWrap(True)
-        self.lbl_status.setStyleSheet(themed_label_style("muted"))
-        layout.addWidget(self.lbl_status)
-
-        self.poll_timer = QTimer(self)
-        self.poll_timer.timeout.connect(self.poll_gesture)
-        self.poll_timer.start(GAME_GESTURE_POLL_MS)
-
-    # --- mapping UI -----------------------------------------------------
-    def build_mapping_ui(self, class_names):
-        while self.map_form.count():
-            item = self.map_form.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        self.mapping_combos = []
-        self.class_action_map = {}
-
-        if not class_names:
-            self.lbl_map_hint = QLabel("Waiting for classes from the loaded model...")
-            self.lbl_map_hint.setStyleSheet(themed_label_style("muted"))
-            self.map_form.addRow(self.lbl_map_hint)
-            return
-
-        for cls in class_names:
-            combo = QComboBox()
-            combo.addItems(MOUSE_ACTIONS)
-
-            clower = cls.lower()
-            if "up" in clower:
-                combo.setCurrentText("Move Up")
-            elif "down" in clower:
-                combo.setCurrentText("Move Down")
-            elif "left" in clower and "click" not in clower:
-                combo.setCurrentText("Move Left")
-            elif "right" in clower and "click" not in clower:
-                combo.setCurrentText("Move Right")
-            elif "double" in clower:
-                combo.setCurrentText("Double Click")
-            elif "right" in clower and "click" in clower:
-                combo.setCurrentText("Right Click")
-            elif "click" in clower or "fist" in clower:
-                combo.setCurrentText("Left Click")
-            else:
-                combo.setCurrentText("Ignore")
-
-            combo.currentTextChanged.connect(lambda text, c=cls: self.update_map(c, text))
-            self.update_map(cls, combo.currentText())
-
-            self.map_form.addRow(f"Gesture: {cls}", combo)
-            self.mapping_combos.append(combo)
-
-    def update_map(self, cls, action):
-        self.class_action_map[cls] = action
-
-    # --- mouse control ----------------------------------------------------
-    def toggle_mouse_control(self, checked):
-        self.mouse_control_active = bool(checked) and HAS_PYAUTOGUI
-        if checked:
-            self.btn_mouse_toggle.setText("STOP MOUSE CONTROL")
-            self.btn_mouse_toggle.setStyleSheet(themed_button_style("danger") if "danger" in THEME_COLORS else "background-color:#BF092F;color:white;font-weight:bold;padding:8px;")
-            self.lbl_status.setText("Mouse control active - live gestures now move/click the cursor.")
-        else:
-            self.btn_mouse_toggle.setText("ENABLE MOUSE CONTROL")
-            self.btn_mouse_toggle.setStyleSheet(themed_button_style("success"))
-            self.lbl_status.setText("Mouse control disabled.")
-
-    def execute_mouse_action(self, action):
-        if action == "Ignore" or not HAS_PYAUTOGUI:
-            return
-        speed = self.spin_speed.value()
-        now = time.perf_counter()
-        try:
-            if action == "Move Up":
-                pyautogui.move(0, -speed)
-            elif action == "Move Down":
-                pyautogui.move(0, speed)
-            elif action == "Move Left":
-                pyautogui.move(-speed, 0)
-            elif action == "Move Right":
-                pyautogui.move(speed, 0)
-            elif "Click" in action:
-                if now - self.last_click_time > self.spin_cooldown.value():
-                    if action == "Left Click":
-                        pyautogui.click(button="left")
-                    elif action == "Right Click":
-                        pyautogui.click(button="right")
-                    elif action == "Double Click":
-                        pyautogui.doubleClick()
-                    self.last_click_time = now
-        except Exception as e:
-            if HAS_PYAUTOGUI and hasattr(pyautogui, "FailSafeException") and isinstance(e, pyautogui.FailSafeException):
-                self.btn_mouse_toggle.setChecked(False)
-                QMessageBox.critical(self, "Safety Triggered", "Mouse hit a screen corner. Control disabled for safety.")
-            else:
-                self.lbl_status.setText(f"Mouse action error: {e}")
-
-    # --- polling the shared live prediction feed -------------------------
-    def poll_gesture(self):
-        if self.visualizer is None:
-            return
-        payload = self.visualizer.get_realtime_classification_payload()
-        model_loaded = bool(payload.get("model_loaded", False))
-        self.lbl_model_status.setText(str(payload.get("model_status_text", "Model: Not loaded")))
-        self.lbl_model_status.setStyleSheet(
-            themed_label_style("success" if model_loaded else "muted")
-        )
-
-        classes = list(payload.get("classes", []))
-        if classes != self._known_classes:
-            self._known_classes = classes
-            self.build_mapping_ui(classes)
-
-        label = str(payload.get("pred_label", "N/A"))
-        conf_pct = float(payload.get("pred_conf_pct", 0.0))
-
-        self.lbl_prediction.setText(label.upper() if label else "N/A")
-        req_conf = self.spin_conf.value()
-        if not model_loaded or label in ("N/A", "") or conf_pct < req_conf:
-            self.lbl_prediction.setStyleSheet(themed_label_style("muted"))
-            return
-        self.lbl_prediction.setStyleSheet(themed_label_style("success"))
-
-        action = self.class_action_map.get(label, "Ignore")
-        if self.mouse_control_active:
-            self.execute_mouse_action(action)
-
-    def closeEvent(self, event):
-        self.poll_timer.stop()
-        if self.btn_mouse_toggle.isChecked():
-            self.btn_mouse_toggle.setChecked(False)
-        self.closed.emit()
-        super().closeEvent(event)
+    @staticmethod
+    def _build_html(sections):
+        c = THEME_COLORS
+        parts = [
+            f"<style>h2 {{ color: {c['accent']}; margin-top: 18px; }} "
+            f"table {{ border-collapse: collapse; width: 100%; }} "
+            f"th {{ text-align: left; color: {c['muted']}; padding: 4px 8px; }} "
+            f"td {{ padding: 5px 8px; vertical-align: top; border-top: 1px solid {c['panel']}; }} "
+            f"td.v {{ color: {c['accent']}; font-weight: bold; white-space: nowrap; }}</style>"
+        ]
+        for title, rows in sections:
+            parts.append(f"<h2>{html_escape(title)}</h2><table><tr><th>Option</th><th>Current value</th>"
+                         "<th>What it does</th></tr>")
+            for name, value, desc in rows:
+                parts.append(
+                    f"<tr><td><b>{html_escape(name)}</b></td><td class='v'>{html_escape(value)}</td>"
+                    f"<td>{html_escape(desc)}</td></tr>"
+                )
+            parts.append("</table>")
+        return "".join(parts)
 
 
 class EMGVisualizer(QMainWindow):
@@ -4641,8 +5017,10 @@ class EMGVisualizer(QMainWindow):
         apply_app_icon(self)
 
         self.setWindowTitle(APP_NAME)
+        # 3:2 window scaled to the screen it opens on (Mac and Windows differ in usable
+        # height, DPI and aspect), never larger than the desktop and never clipped.
         fit_window_to_screen(self, 1380, 920)
-        self.setMinimumSize(900, 600)
+        clamp_minimum_size(self, 900, 600)
         apply_dark_title_bar(self)
 
         # State variables
@@ -4729,11 +5107,11 @@ class EMGVisualizer(QMainWindow):
         self.rf_worker = RFRealtimeInferenceWorker(sample_rate=SAMPLE_RATE)
         self.rf_worker.prediction_ready.connect(self.on_rf_prediction_ready)
         self.rf_worker.error_occurred.connect(self.on_rf_worker_error)
-        self.rf_worker.start(QThread.HighPriority)
+        self.rf_worker.start(QThread.LowPriority)   # Never compete with packet reception
         self._analysis_worker = LiveAnalysisWorker()
         self._analysis_worker.analysis_ready.connect(self._on_analysis_ready)
         self._analysis_worker.analysis_finished.connect(self._on_analysis_finished)
-        self._analysis_worker.start()
+        self._analysis_worker.start(QThread.LowPriority)
         self.live_analysis_enabled = False
         self.analysis_idle_labels_active = False
         self._analysis_pending = False
@@ -4741,11 +5119,28 @@ class EMGVisualizer(QMainWindow):
         self._last_heavy_analysis_submit_ts = 0.0
         self.realtime_classification_window = None
 
-        self.gesture_game_window = None
-        self.mouse_control_window = None
         self.data_collection_dialog = None
         self.training_dialog = None
         self.contributor_name = ""
+        self.participant_blood_group = ""
+        self.participant_height_cm = 0.0
+        self.participant_weight_kg = 0.0
+        self.participant_age_years = 0
+        self.participant_forearm_circumference_cm = 0.0
+        # Session-plan and room-condition settings coming from the Data Collection dialog.
+        self.study_meta = {
+            "session_day": DEFAULT_SESSION_DAY,
+            "hand_order": DEFAULT_HAND_ORDER,
+            "max_cycles_per_block": DEFAULT_MAX_CYCLES_PER_BLOCK,
+            "block_break_s": float(DEFAULT_BLOCK_BREAK_S),
+            "hand_switch_s": float(DEFAULT_HAND_SWITCH_BREAK_S),
+            **{key: 0.0 for key in STUDY_ENV_KEYS},
+        }
+        self.timed_record_hand = ""
+        self.record_missing_packets = 0
+        self.record_gap_events = 0
+        self._session_csv_path = ""
+        self._cycle_batch_start = 0
         self.contribution_agreed = False
         self.task_labels = [x.strip() for x in DEFAULT_TASK_LABELS.split(",") if x.strip()]
         self.task_labels_locked = False
@@ -4794,6 +5189,14 @@ class EMGVisualizer(QMainWindow):
         self._metrics_color_cache = {}
         self._threshold_line_color_cache = {}
         self._threshold_line_value_cache = None
+
+        # Transport health (packet rate / loss) shared with the receive thread.
+        self.packet_tracer = PacketTracer()
+        self.packet_tracer_window = None
+        self.options_info_dialog = None
+        self._plot_dirty = False
+        self._keepalive_thread = None
+        self.gesture_bridge = GesturePublisher()
 
         self.num_channels = 4
         self.x_axis = (np.arange(WINDOW_SIZE, dtype=np.float32) - (WINDOW_SIZE - 1)) / SAMPLE_RATE
@@ -4856,6 +5259,31 @@ class EMGVisualizer(QMainWindow):
         self.btn_calibrate.clicked.connect(self.open_calibration_dialog)
         controls_layout.addWidget(self.btn_calibrate)
         controls_layout.addStretch(1)
+
+        self.btn_analysis = QPushButton("Live Analysis")
+        self.btn_analysis.setEnabled(False)
+        self.btn_analysis.setStyleSheet(themed_button_style("accent"))
+        self.btn_analysis.clicked.connect(self.open_analysis_window)
+        controls_layout.addWidget(self.btn_analysis)
+
+        self.btn_packet_tracer = QPushButton("Packet Tracer")
+        self.btn_packet_tracer.setStyleSheet(themed_button_style("accent"))
+        self.btn_packet_tracer.setToolTip("Live packet rate, missing packets and loss.")
+        self.btn_packet_tracer.clicked.connect(self.open_packet_tracer_window)
+        controls_layout.addWidget(self.btn_packet_tracer)
+
+        self.btn_options_info = QPushButton("Options Info")
+        self.btn_options_info.setStyleSheet(themed_button_style("accent"))
+        self.btn_options_info.setToolTip("Every option in the app with its current value and what it does.")
+        self.btn_options_info.clicked.connect(self.open_options_info_dialog)
+        controls_layout.addWidget(self.btn_options_info)
+        self.main_layout.addLayout(controls_layout)
+        self.main_layout.addSpacing(4)
+
+        # Second row: analysis parameters and display switches.
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(12)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
 
         # Selected channel count is configured via the Channel Calibration dialog.
         self.channel_count = 4
@@ -4965,13 +5393,8 @@ class EMGVisualizer(QMainWindow):
         controls_layout.addWidget(self.check_graph_stream)
         controls_layout.addStretch(1)
 
-        self.btn_analysis = QPushButton("Live Analysis")
-        self.btn_analysis.setEnabled(False)
-        self.btn_analysis.setStyleSheet(themed_button_style("accent"))
-        self.btn_analysis.clicked.connect(self.open_analysis_window)
-        controls_layout.addWidget(self.btn_analysis)
         self.main_layout.addLayout(controls_layout)
-        self.main_layout.addSpacing(10)
+        self.main_layout.addSpacing(6)
 
         info_actions_layout = QHBoxLayout()
         info_actions_layout.setSpacing(12)
@@ -4980,11 +5403,11 @@ class EMGVisualizer(QMainWindow):
         info_text_layout = QVBoxLayout()
         info_text_layout.setContentsMargins(0, 0, 0, 0)
         info_text_layout.setSpacing(2)
-        self.lbl_status = QLabel("Status: Disconnected")
+        self.lbl_status = StableLabel("Status: Disconnected")
         self.lbl_status.setStyleSheet(themed_label_style("muted"))
         info_text_layout.addWidget(self.lbl_status)
 
-        self.lbl_rf = QLabel("RF Model: Not loaded")
+        self.lbl_rf = StableLabel("RF Model: Not loaded")
         self.lbl_rf.setStyleSheet(themed_label_style("muted"))
         info_text_layout.addWidget(self.lbl_rf)
         info_actions_layout.addLayout(info_text_layout, 0)
@@ -5013,14 +5436,6 @@ class EMGVisualizer(QMainWindow):
         self.btn_realtime_classification.setStyleSheet(themed_button_style("accent"))
         self.btn_realtime_classification.clicked.connect(self.open_realtime_classification_window)
         buttons_layout.addWidget(self.btn_realtime_classification)
-        self.btn_gesture_game = QPushButton("Gesture Game")
-        self.btn_gesture_game.setStyleSheet(themed_button_style("accent"))
-        self.btn_gesture_game.clicked.connect(self.open_gesture_game_window)
-        buttons_layout.addWidget(self.btn_gesture_game)
-        self.btn_mouse_control = QPushButton("Mouse Control")
-        self.btn_mouse_control.setStyleSheet(themed_button_style("accent"))
-        self.btn_mouse_control.clicked.connect(self.open_mouse_control_window)
-        buttons_layout.addWidget(self.btn_mouse_control)
         info_actions_layout.addLayout(buttons_layout, 0)
         self.main_layout.addLayout(info_actions_layout)
         self.main_layout.addSpacing(8)
@@ -5104,13 +5519,27 @@ class EMGVisualizer(QMainWindow):
         self.lbl_perf_title.setStyleSheet(f"font-weight: bold; color: {THEME_COLORS['text']};")
         fps_layout.addWidget(self.lbl_perf_title)
 
-        self.lbl_ui_fps = QLabel("UI FPS: --")
-        self.lbl_ui_fps.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-family: Consolas;")
+        mono_style = f"color: {THEME_COLORS['muted']}; font-family: {MONO_FONT_CSS};"
+        self.lbl_ui_fps = StableLabel("UI FPS: --")
+        self.lbl_ui_fps.setStyleSheet(mono_style)
         fps_layout.addWidget(self.lbl_ui_fps)
 
-        self.lbl_data_fps = QLabel("Data FPS: --")
-        self.lbl_data_fps.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-family: Consolas;")
+        self.lbl_data_fps = StableLabel("Data FPS: --")
+        self.lbl_data_fps.setStyleSheet(mono_style)
         fps_layout.addWidget(self.lbl_data_fps)
+
+        self.lbl_link_title = QLabel("Link")
+        self.lbl_link_title.setStyleSheet(f"font-weight: bold; color: {THEME_COLORS['text']};")
+        fps_layout.addWidget(self.lbl_link_title)
+        self.lbl_pkt_rate = StableLabel("Packets: -- /s")
+        self.lbl_pkt_rate.setStyleSheet(mono_style)
+        fps_layout.addWidget(self.lbl_pkt_rate)
+        self.lbl_pkt_loss = StableLabel("Missing: -- (--%)")
+        self.lbl_pkt_loss.setStyleSheet(mono_style)
+        fps_layout.addWidget(self.lbl_pkt_loss)
+        self.lbl_csv_rows = StableLabel("CSV rows: 0")
+        self.lbl_csv_rows.setStyleSheet(mono_style)
+        fps_layout.addWidget(self.lbl_csv_rows)
 
         self.status_panel_layout.addWidget(self.fps_panel, 0)
 
@@ -5123,6 +5552,9 @@ class EMGVisualizer(QMainWindow):
         self.keepalive_timer = QTimer(self)
         self.keepalive_timer.timeout.connect(self.send_wireless_keepalive)
         self.keepalive_timer.start(KEEPALIVE_INTERVAL_MS)
+        self.packet_timer = QTimer(self)
+        self.packet_timer.timeout.connect(self.on_packet_tick)
+        self.packet_timer.start(PACKET_TRACER_TICK_MS)
 
         self.reset_fps_counters()
         self.refresh_ports()
@@ -5207,13 +5639,23 @@ class EMGVisualizer(QMainWindow):
         if self.current_device is None or not self.wireless_access_key:
             return
 
-        try:
-            ControlProtocol.ping(self.current_device.ip, self.wireless_access_key)
-            self.keepalive_failures = 0
-        except Exception:
-            self.keepalive_failures += 1
-            if self.keepalive_failures >= 3:
-                self.set_status("Wireless keepalive lost", "#f57c00")
+        # The ping blocks for up to CONTROL_TIMEOUT when the device is slow; doing that on the
+        # GUI thread freezes the UI (and the consumer of the stream) - run it in the background.
+        if self.keepalive_failures >= 3:
+            self.set_status("Wireless keepalive lost", "#f57c00")
+        if self._keepalive_thread is not None and self._keepalive_thread.is_alive():
+            return
+        ip, key = self.current_device.ip, self.wireless_access_key
+
+        def _ping():
+            try:
+                ControlProtocol.ping(ip, key)
+                self.keepalive_failures = 0
+            except Exception:
+                self.keepalive_failures += 1
+
+        self._keepalive_thread = threading.Thread(target=_ping, name="biowave-keepalive", daemon=True)
+        self._keepalive_thread.start()
 
     def _refresh_fps_labels(self, active=True):
         if not active:
@@ -5362,10 +5804,11 @@ class EMGVisualizer(QMainWindow):
             self.analysis_window = None
 
         try:
-            self.serial_worker = WirelessStreamWorker(WIFI_STREAM_PORT)
+            self.packet_tracer.reset("wireless", WIRELESS_FRAMES_PER_PACKET)
+            self.serial_worker = WirelessStreamWorker(WIFI_STREAM_PORT, tracer=self.packet_tracer)
             self.serial_worker.batch_received.connect(self.on_serial_batch)
             self.serial_worker.error_occurred.connect(self.on_serial_error)
-            self.serial_worker.start()
+            self.serial_worker.start(QThread.TimeCriticalPriority)
 
             client_ip = get_local_ip_for_target(device.ip)
             ControlProtocol.start_stream(device.ip, self.wireless_access_key, client_ip, WIFI_STREAM_PORT)
@@ -5528,10 +5971,12 @@ class EMGVisualizer(QMainWindow):
             self.analysis_window = None
 
         try:
-            self.serial_worker = SerialWorker(port_name, DEFAULT_BAUD_RATE, self.num_channels)
+            self.packet_tracer.reset("serial", 1)
+            self.serial_worker = SerialWorker(port_name, DEFAULT_BAUD_RATE, self.num_channels,
+                                              tracer=self.packet_tracer)
             self.serial_worker.batch_received.connect(self.on_serial_batch)
             self.serial_worker.error_occurred.connect(self.on_serial_error)
-            self.serial_worker.start()
+            self.serial_worker.start(QThread.HighestPriority)
 
             self.current_port_name = port_name
             self.is_connected = True
@@ -5613,6 +6058,7 @@ class EMGVisualizer(QMainWindow):
         self.btn_calibrate.setEnabled(True)
         self.btn_analysis.setEnabled(False)
         self.set_status("Disconnected", "#999")
+        self.reset_link_labels()
         self.set_waiting_for_calibration_labels()
         if self.rf_model is not None:
             model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
@@ -6038,10 +6484,12 @@ class EMGVisualizer(QMainWindow):
         self.reset_runtime_state_for_channels(self.channel_count)
 
         try:
-            self.serial_worker = SerialWorker(port_name, DEFAULT_BAUD_RATE, self.num_channels)
+            self.packet_tracer.reset("serial", 1)
+            self.serial_worker = SerialWorker(port_name, DEFAULT_BAUD_RATE, self.num_channels,
+                                              tracer=self.packet_tracer)
             self.serial_worker.batch_received.connect(self.on_serial_batch)
             self.serial_worker.error_occurred.connect(self.on_serial_error)
-            self.serial_worker.start()
+            self.serial_worker.start(QThread.HighestPriority)
 
             self.is_connected = True
             self.port_config_applied = True
@@ -6140,37 +6588,6 @@ class EMGVisualizer(QMainWindow):
     def on_realtime_classification_window_closed(self):
         self.realtime_classification_window = None
 
-    def open_gesture_game_window(self):
-        if self.gesture_game_window and self.gesture_game_window.isVisible():
-            self.gesture_game_window.raise_()
-            self.gesture_game_window.activateWindow()
-            return
-        self.gesture_game_window = GestureGameWindow(self)
-        self.gesture_game_window.closed.connect(self.on_gesture_game_window_closed)
-        center_window(self.gesture_game_window, self)
-        self.gesture_game_window.show()
-        self.gesture_game_window.raise_()
-        self.gesture_game_window.activateWindow()
-
-    def on_gesture_game_window_closed(self):
-        self.gesture_game_window = None
-
-    def open_mouse_control_window(self):
-        if self.mouse_control_window and self.mouse_control_window.isVisible():
-            self.mouse_control_window.raise_()
-            self.mouse_control_window.activateWindow()
-            return
-        self.mouse_control_window = MouseControlWindow(self)
-        self.mouse_control_window.closed.connect(self.on_mouse_control_window_closed)
-        center_window(self.mouse_control_window, self)
-        self.mouse_control_window.show()
-        self.mouse_control_window.raise_()
-        self.mouse_control_window.activateWindow()
-
-    def on_mouse_control_window_closed(self):
-        self.mouse_control_window = None
-
-    @staticmethod
     def expected_rf_feature_count(num_channels):
         n_ch = int(max(1, num_channels))
         per_channel_features = 15
@@ -6288,6 +6705,10 @@ class EMGVisualizer(QMainWindow):
         else:
             self.rf_prediction_rate_hz = 0.0
         self.rf_last_prediction_ts = now_ts
+        self.gesture_bridge.publish(
+            self.rf_last_pred_label, self.rf_last_pred_conf * 100.0,
+            os.path.basename(self.rf_model_path) if self.rf_model_path else "",
+        )
 
         if self.rf_model is not None:
             model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
@@ -6511,6 +6932,17 @@ class EMGVisualizer(QMainWindow):
     def data_collection_settings_payload(self):
         return {
             "contributor_name": self.contributor_name,
+            "blood_group": self.participant_blood_group,
+            "height_cm": float(self.participant_height_cm),
+            "weight_kg": float(self.participant_weight_kg),
+            "age_years": int(self.participant_age_years),
+            "forearm_circumference_cm": float(self.participant_forearm_circumference_cm),
+            **{key: float(self.study_meta.get(key, 0.0)) for key in STUDY_ENV_KEYS},
+            "session_day": int(self.study_meta["session_day"]),
+            "hand_order": str(self.study_meta["hand_order"]),
+            "max_cycles_per_block": int(self.study_meta["max_cycles_per_block"]),
+            "block_break_s": float(self.study_meta["block_break_s"]),
+            "hand_switch_s": float(self.study_meta["hand_switch_s"]),
             "agreed": bool(self.contribution_agreed),
             "task_labels": list(self.task_labels),
             "labels_saved": bool(self.task_labels_locked),
@@ -6527,6 +6959,21 @@ class EMGVisualizer(QMainWindow):
     def update_data_collection_settings(self, settings):
         settings = dict(settings or {})
         self.contributor_name = str(settings.get("contributor_name", self.contributor_name)).strip()
+        self.participant_blood_group = str(settings.get("blood_group", self.participant_blood_group)).strip()
+        self.participant_height_cm = float(settings.get("height_cm", self.participant_height_cm) or 0.0)
+        self.participant_weight_kg = float(settings.get("weight_kg", self.participant_weight_kg) or 0.0)
+        self.participant_age_years = int(settings.get("age_years", self.participant_age_years) or 0)
+        self.participant_forearm_circumference_cm = float(
+            settings.get("forearm_circumference_cm", self.participant_forearm_circumference_cm) or 0.0
+        )
+        for key in STUDY_ENV_KEYS:
+            self.study_meta[key] = float(settings.get(key, self.study_meta[key]) or 0.0)
+        self.study_meta["session_day"] = int(settings.get("session_day", self.study_meta["session_day"]))
+        self.study_meta["hand_order"] = str(settings.get("hand_order", self.study_meta["hand_order"]))
+        self.study_meta["max_cycles_per_block"] = int(max(1, settings.get(
+            "max_cycles_per_block", self.study_meta["max_cycles_per_block"])))
+        self.study_meta["block_break_s"] = float(max(0.0, settings.get("block_break_s", self.study_meta["block_break_s"])))
+        self.study_meta["hand_switch_s"] = float(max(0.0, settings.get("hand_switch_s", self.study_meta["hand_switch_s"])))
         self.contribution_agreed = bool(settings.get("agreed", self.contribution_agreed))
         labels_in = settings.get("task_labels", self.task_labels)
         if isinstance(labels_in, list):
@@ -6560,6 +7007,8 @@ class EMGVisualizer(QMainWindow):
         self.data_collection_dialog.protocol_phase_started.connect(self.on_task_phase_started)
         self.data_collection_dialog.protocol_finished.connect(self.on_task_protocol_finished)
         self.data_collection_dialog.protocol_canceled.connect(self.on_task_protocol_canceled)
+        self.data_collection_dialog.protocol_paused.connect(self.on_task_protocol_paused)
+        self.data_collection_dialog.protocol_rewind.connect(self.on_task_protocol_rewind)
         self.data_collection_dialog.finished.connect(lambda _result: setattr(self, "data_collection_dialog", None))
         center_window(self.data_collection_dialog, self)
         self.data_collection_dialog.show()
@@ -6711,9 +7160,22 @@ class EMGVisualizer(QMainWindow):
         except ValueError:
             data_rel = os.path.basename(data_csv_path)
         sample_eval = self.evaluate_recording_sample_coverage(int(sample_count))
+        snap = self.packet_tracer.snapshot()
         return [
             f"created_at={time.strftime('%Y-%m-%d %H:%M:%S')}",
             f"contributor={self.contributor_name}",
+            f"blood_group={self.participant_blood_group or 'N/A'}",
+            f"height_cm={_value_or_na(self.participant_height_cm, '{:.1f}')}",
+            f"weight_kg={_value_or_na(self.participant_weight_kg, '{:.1f}')}",
+            f"age_years={_value_or_na(self.participant_age_years, '{:d}', cast=int)}",
+            f"forearm_circumference_cm={_value_or_na(self.participant_forearm_circumference_cm, '{:.2f}')}",
+            f"session_day={int(self.study_meta['session_day'])}",
+            f"hand_order={'+'.join(hands_for_order(self.study_meta['hand_order'])).lower()}",
+            f"max_cycles_per_block={int(self.study_meta['max_cycles_per_block'])}",
+            f"block_break_s={float(self.study_meta['block_break_s']):.0f}",
+            f"hand_switch_break_s={float(self.study_meta['hand_switch_s']):.0f}",
+            f"temp_start_c={_value_or_na(self.study_meta['temp_start_c'], '{:.1f}')}",
+            f"humidity_start_pct={_value_or_na(self.study_meta['humidity_start_pct'], '{:.0f}')}",
             f"agreement={bool(self.contribution_agreed)}",
             f"labels={','.join(labels)}",
             f"labels_saved={bool(self.task_labels_locked)}",
@@ -6730,8 +7192,17 @@ class EMGVisualizer(QMainWindow):
             f"num_samples={int(sample_count)}",
             f"expected_num_samples={int(self.expected_recorded_samples())}",
             f"sample_coverage_pct={sample_eval['sample_ratio_pct']:.2f}",
+            f"transport={snap['kind']}",
+            f"packets_received={snap['received']}",
+            f"packets_missing={snap['missing']}",
+            f"packets_missing_during_recording={int(self.record_missing_packets)}",
+            f"packet_gap_events_during_recording={int(self.record_gap_events)}",
+            f"packets_out_of_order={snap['out_of_order']}",
+            f"packets_invalid={snap['invalid']}",
+            f"packet_loss_pct={snap['loss_pct']:.3f}",
+            f"max_packet_gap_ms={snap['max_gap_ms']:.1f}",
             f"csv_signal_mode=raw",
-            f"csv_columns=Timestamp_ms,Packet_Number,Trial_ID,{','.join(self._record_channel_columns())},Label",
+            f"csv_columns=Timestamp_ms,Packet_Number,Trial_ID,{','.join(self._record_channel_columns())},Label,Hand",
             f"data_file={os.path.basename(data_csv_path)}",
             f"data_path={data_rel}",
         ]
@@ -6786,6 +7257,11 @@ class EMGVisualizer(QMainWindow):
         worker.deleteLater()
 
         payload = dict(result or {})
+        if context.get("checkpoint"):
+            # Mid-session safety copy: stay silent unless it failed.
+            if not payload.get("ok", False):
+                self.set_status(f"Break checkpoint could not be saved: {payload.get('error', 'unknown error')}", "#f57c00")
+            return
         if not payload.get("ok", False):
             self.set_status("Task finished but CSV save failed.", "#f44336")
             QMessageBox.warning(self, "CSV Save", f"Task finished but CSV save failed:\n{payload.get('error', 'Unknown error')}")
@@ -6829,7 +7305,8 @@ class EMGVisualizer(QMainWindow):
         else:
             self.set_status(summary, "#2e7d32")
 
-    def queue_recorded_csv_save(self, path, batches=None, sample_eval=None, show_saved_dialog=False):
+    def queue_recorded_csv_save(self, path, batches=None, sample_eval=None, show_saved_dialog=False,
+                                checkpoint=False):
         batches_to_save = list(self.recorded_batches if batches is None else batches)
         if self.recorded_sample_count(batches_to_save) <= 0:
             raise ValueError("No recorded samples available.")
@@ -6845,6 +7322,7 @@ class EMGVisualizer(QMainWindow):
             "root_dir": root_dir,
             "sample_eval": sample_eval,
             "show_saved_dialog": bool(show_saved_dialog),
+            "checkpoint": bool(checkpoint),
         }
         worker.save_completed.connect(
             lambda result, w=worker, ctx=context: self._on_record_save_completed(w, ctx, result)
@@ -6886,6 +7364,10 @@ class EMGVisualizer(QMainWindow):
         self.timed_record_label = ""
         self.timed_record_phase = ""
         self.timed_record_trial_id = 0
+        self.timed_record_hand = ""
+        self.record_missing_packets = 0
+        self.record_gap_events = 0
+        self._session_csv_path = self.build_auto_record_csv_path()
 
         started = self.data_collection_dialog.start_task_protocol(
             labels=labels,
@@ -6896,6 +7378,11 @@ class EMGVisualizer(QMainWindow):
             record_rest=self.task_record_rest,
             settle_s=self.task_settle_s,
             randomize_order=self.task_randomize_order,
+            hand_order=self.study_meta["hand_order"],
+            session_day=self.study_meta["session_day"],
+            max_cycles_per_block=self.study_meta["max_cycles_per_block"],
+            block_break_s=self.study_meta["block_break_s"],
+            hand_switch_s=self.study_meta["hand_switch_s"],
         )
         if not started:
             QMessageBox.warning(self, "Task Timer", "Unable to start task session.")
@@ -6903,14 +7390,24 @@ class EMGVisualizer(QMainWindow):
         self._set_task_collection_mode(True)
         self.set_status("Task Timer: session started | live graph paused for stable capture", "#00897b")
 
-    def on_task_phase_started(self, label, trial_id, phase_name, record_enabled):
+    def on_task_phase_started(self, label, trial_id, phase_name, record_enabled, hand=""):
         self.timed_record_label = str(label)
         self.timed_record_trial_id = int(trial_id)
         self.timed_record_phase = str(phase_name)
+        self.timed_record_hand = str(hand)
         self.timed_record_enabled = bool(record_enabled)
+        if str(phase_name).strip().lower() == "prepare":
+            self._cycle_batch_start = len(self.recorded_batches)
+        if str(phase_name).strip().lower() in ("break", "switch hand") and self.recorded_sample_count() > 0:
+            # Protect the data collected so far: a 60-minute session should not hinge on one final save.
+            try:
+                self.queue_recorded_csv_save(
+                    self._session_csv_path or self.build_auto_record_csv_path(), checkpoint=True)
+            except Exception:
+                pass
         mode = "RECORDING" if self.timed_record_enabled else "GUIDE"
         self.set_status(
-            f"Task Timer: Trial {trial_id} | {phase_name} | Label={label} | {mode}",
+            f"Task Timer: {hand} hand | Trial {trial_id} | {phase_name} | Label={label} | {mode}",
             "#00897b" if self.timed_record_enabled else "#607d8b",
         )
 
@@ -6919,22 +7416,51 @@ class EMGVisualizer(QMainWindow):
         self.timed_record_label = ""
         self.timed_record_phase = ""
         self.timed_record_trial_id = 0
+        self.timed_record_hand = ""
+        self.refresh_csv_counter()
 
         sample_count = self.recorded_sample_count()
         sample_eval = self.evaluate_recording_sample_coverage(sample_count)
-        save_path = self.build_auto_record_csv_path()
+        save_path = self._session_csv_path or self.build_auto_record_csv_path()
+        for worker in list(self.record_save_workers):
+            worker.wait()   # let an in-flight break checkpoint finish before the final write
         try:
             self.queue_recorded_csv_save(save_path, sample_eval=sample_eval)
             self.set_status("Task complete - saving CSV in background...", "#00897b")
         except Exception as e:
             QMessageBox.warning(self, "CSV Save", f"Task finished but CSV save failed:\n{e}")
 
+    def on_task_protocol_paused(self, paused):
+        if paused:
+            self.timed_record_enabled = False
+            self.set_status("Task Timer: PAUSED - recording stopped", "#f57c00")
+
+    def on_task_protocol_rewind(self):
+        """Resume after a pause: discard the interrupted cycle's samples; it restarts from Prepare."""
+        keep = min(self._cycle_batch_start, len(self.recorded_batches))
+        del self.recorded_batches[keep:]
+        self._recorded_total_samples = self.recorded_sample_count()
+
     def on_task_protocol_canceled(self):
         self._set_task_collection_mode(False)
         self.timed_record_label = ""
         self.timed_record_phase = ""
         self.timed_record_trial_id = 0
+        self.timed_record_hand = ""
         self.set_status("Task timer canceled.", "#f57c00")
+        rows = self.recorded_sample_count()
+        if rows > 0 and self.is_connected:
+            answer = QMessageBox.question(
+                self, "Save Partial Recording",
+                f"The session was cancelled after {rows:,} rows were recorded.\nSave them as a partial CSV?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Yes:
+                try:
+                    self.queue_recorded_csv_save(
+                        self._session_csv_path or self.build_auto_record_csv_path(), show_saved_dialog=True)
+                except Exception as e:
+                    QMessageBox.warning(self, "CSV Save", f"Partial CSV save failed:\n{e}")
 
     def expected_recorded_samples(self):
         labels = [str(x).strip() for x in self.task_labels if str(x).strip()]
@@ -6943,7 +7469,8 @@ class EMGVisualizer(QMainWindow):
         repeats = int(max(1, self.task_repeats))
         hold_s = float(max(0.0, self.task_hold_s))
         rest_s = float(max(0.0, self.task_rest_s)) if bool(self.task_record_rest) else 0.0
-        recorded_sec = repeats * len(labels) * (hold_s + rest_s)
+        hands = len(hands_for_order(self.study_meta["hand_order"]))
+        recorded_sec = repeats * hands * len(labels) * (hold_s + rest_s)
         return int(round(recorded_sec * float(SAMPLE_RATE)))
 
     def evaluate_recording_sample_coverage(self, actual_samples):
@@ -6994,6 +7521,7 @@ class EMGVisualizer(QMainWindow):
                 trial_id=int(self.timed_record_trial_id),
                 label=str(self.timed_record_label),
                 data=np.ascontiguousarray(arr, dtype=np.float32),
+                hand=str(self.timed_record_hand),
             )
         )
         self._recorded_total_samples += n
@@ -7969,9 +8497,13 @@ class EMGVisualizer(QMainWindow):
         self.last_transport_metadata = transport_metadata
         # Packet gaps are not silently treated as continuous EMG. Require a
         # fresh full model window before classification resumes.
-        if int(transport_metadata.get("packet_gap") or 0) > 0:
+        packet_gap = int(transport_metadata.get("packet_gap") or 0)
+        if packet_gap > 0:
             self.rf_valid_sample_count = 0
             self.rf_samples_since_submit = 0
+            if self.timed_record_enabled:
+                self.record_missing_packets += packet_gap
+                self.record_gap_events += 1
 
         self._tick_data_fps(batch.shape[0])
 
@@ -8012,6 +8544,7 @@ class EMGVisualizer(QMainWindow):
                 self.data_buffer[:, :-num_new] = self.data_buffer[:, num_new:]
                 self.data_buffer[:, -num_new:] = new_data
 
+        self._plot_dirty = True
         self.rf_valid_sample_count = int(min(WINDOW_SIZE, self.rf_valid_sample_count + raw_num_new))
         self.schedule_realtime_prediction(num_new)
 
@@ -8572,7 +9105,8 @@ class EMGVisualizer(QMainWindow):
         if not self.is_connected or not self.is_calibrated or self.data_buffer is None:
             return
 
-        if self.check_graph_stream.isChecked():
+        if self.check_graph_stream.isChecked() and (self._plot_dirty or self._plot_ranges_dirty):
+            self._plot_dirty = False
             with self._buffer_lock:
                 plot_snapshots = []
                 plot_values_by_channel = {}
@@ -8588,10 +9122,10 @@ class EMGVisualizer(QMainWindow):
             for kind, row, data in plot_snapshots:
                 if kind == "single":
                     if data is not None:
-                        row["curve"].setData(self.x_axis, data)
+                        row["curve"].setData(self.x_axis, data, skipFiniteCheck=True)
                 elif kind == "imu":
                     for curve, ch in zip(row["curves"], row["channels"]):
-                        curve.setData(self.x_axis, data[ch])
+                        curve.setData(self.x_axis, data[ch], skipFiniteCheck=True)
             now = time.perf_counter()
             range_elapsed_ms = (now - self._last_plot_range_refresh_ts) * 1000.0
             if self._plot_ranges_dirty or range_elapsed_ms >= PLOT_RANGE_REFRESH_MS:
@@ -8626,6 +9160,121 @@ class EMGVisualizer(QMainWindow):
                 self.update_realtime_classification_state()
         self._tick_ui_fps()
 
+    # ------------------------------------------------------------------ link / counters
+    def reset_link_labels(self):
+        self.lbl_pkt_rate.setText("Packets: -- /s")
+        self.lbl_pkt_loss.setText("Missing: -- (--%)")
+        for lbl in (self.lbl_pkt_rate, self.lbl_pkt_loss):
+            lbl.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-family: {MONO_FONT_CSS};")
+
+    def on_packet_tick(self):
+        """4 Hz: update packet statistics, the tracer window and the live CSV counter."""
+        if self.is_connected:
+            self.packet_tracer.tick()
+            snap = self.packet_tracer.snapshot()
+            color = PACKET_KIND_COLORS[packet_health_kind(snap)]
+            self.lbl_pkt_rate.setText(f"Packets: {snap['pkt_rate']:.0f}/{snap['expected_pkt_rate']:.0f} /s")
+            self.lbl_pkt_loss.setText(f"Missing: {snap['missing']:,} ({snap['loss_pct']:.2f}%)")
+            style = f"color: {color}; font-family: {MONO_FONT_CSS};"
+            self.lbl_pkt_rate.setStyleSheet(style)
+            self.lbl_pkt_loss.setStyleSheet(style)
+            if self.packet_tracer_window is not None and self.packet_tracer_window.isVisible():
+                self.packet_tracer_window.refresh()
+        self.refresh_csv_counter()
+
+    def refresh_csv_counter(self):
+        rows = int(self._recorded_total_samples)
+        expected = int(self.expected_recorded_samples())
+        self.lbl_csv_rows.setText(f"CSV rows: {rows:,}")
+        if self.data_collection_dialog is None:
+            return
+        pct = (100.0 * rows / expected) if expected > 0 else 0.0
+        text = f"CSV rows recorded: {rows:,} / {expected:,} expected ({pct:.1f}%)"
+        kind = "accent"
+        if self.record_missing_packets > 0:
+            text += f" | lost packets: {self.record_missing_packets:,}"
+            kind = "warn"
+        self.data_collection_dialog.set_csv_counter(text, kind)
+
+    def open_packet_tracer_window(self):
+        if self.packet_tracer_window is not None and self.packet_tracer_window.isVisible():
+            self.packet_tracer_window.raise_()
+            self.packet_tracer_window.activateWindow()
+            return
+        self.packet_tracer_window = PacketTracerWindow(self.packet_tracer, self)
+        self.packet_tracer_window.closed.connect(lambda: setattr(self, "packet_tracer_window", None))
+        center_window(self.packet_tracer_window, self)
+        self.packet_tracer_window.show()
+
+    def build_options_info_sections(self):
+        on_off = lambda flag: "On" if flag else "Off"
+        hands = " + ".join(hands_for_order(self.study_meta["hand_order"]))
+        link = "Disconnected"
+        if self.is_connected:
+            link = f"{self.connection_medium.title()} | {self.current_port_name}"
+        model = os.path.basename(self.rf_model_path) if self.rf_model_path else "Not loaded"
+        return [
+            ("Connection & calibration", [
+                ("Port Configuration", link, "Choose wired (USB serial / simulator socket) or wireless (Wi-Fi) transport, "
+                 "scan for devices, provision Wi-Fi over USB and connect."),
+                ("Disconnect", "Enabled" if self.is_connected else "Disabled", "Stops the stream and releases the port."),
+                ("Channel Calibration", "Done" if self.is_calibrated else "Required",
+                 f"Captures REST then FLEX ({self.cal_rest_seconds} s / {self.cal_flex_seconds} s) to set baselines "
+                 "and thresholds. Graph, analysis, recording and classification stay locked until it is done."),
+                ("Channels", str(self.num_channels), "Wired: 2-9 channels (set in the calibration dialog). "
+                 "Wireless: 8 EMG + 3 IMU channels."),
+            ]),
+            ("Toolbar", [
+                ("Analysis (ms)", f"{self.analysis_ms_spin.value()} ms", "Window length used for MAV / RMS and the live-analysis metrics."),
+                ("RMS Threshold", f"{self.threshold_spin.value():.1f}", "Amplitude level above which a channel counts as active (dashed lines on the graph)."),
+                ("Hz Threshold", f"{self.hz_threshold_spin.value():.1f} Hz", "Minimum dominant frequency for a channel to count as a real contraction."),
+                ("Use Hz Gate", on_off(self.check_use_hz_gate.isChecked()), "Require both RMS and frequency thresholds before a channel is 'active'."),
+                ("Auto Scale Y", on_off(self.check_autoscale.isChecked()), "Fit each channel's vertical range to its live signal; off uses a fixed range."),
+                ("Graph Stream", on_off(self.check_graph_stream.isChecked()), "Draw the live traces. It pauses itself during a recording session for stable capture."),
+                ("Live Analysis", "Available" if self.is_calibrated else "Locked", "Opens the metrics window: time/frequency features, correlation, coherence, fatigue and quality."),
+            ]),
+            ("Monitoring", [
+                ("Packet Tracer", "Open" if self.packet_tracer_window else "Closed", "Real-time packets per second, missing and out-of-order packets, loss %, jitter and a 30 s plot."),
+                ("Link panel (right side)", "Live", "Compact packets/s, missing packets and CSV row counter beside the graph."),
+                ("UI FPS / Data FPS", f"{self.ui_fps:.0f} / {self.data_fps:.0f}", "Screen refresh rate and the sample rate actually arriving."),
+                ("Options Info", "This window", "Lists every option with its live value."),
+            ]),
+            ("Data Collection", [
+                ("Contributor", self.contributor_name or "-", "Participant name / ID; used in the output folder name."),
+                ("Agreement", "Yes" if self.contribution_agreed else "No", "Consent to take part; required before a session can start."),
+                ("Participant info", f"BG {self.participant_blood_group or 'N/A'}, {_value_or_na(self.participant_height_cm, '{:.1f}')} cm, "
+                 f"{_value_or_na(self.participant_weight_kg, '{:.1f}')} kg, age {_value_or_na(self.participant_age_years, '{:d}', cast=int)}",
+                 "Optional; saved to the metadata file (N/A when empty)."),
+                ("Forearm circumference", f"{_value_or_na(self.participant_forearm_circumference_cm, '{:.2f}')} cm", "Measured around the forearm where the armband sits."),
+                ("Session day", str(self.study_meta["session_day"]), "Study session 1 or 2 (two days, 1-7 days apart)."),
+                ("Hands", hands, "Order of the left/right hand blocks; the armband is moved between them."),
+                ("Class labels", ", ".join(self.task_labels), "Gesture classes recorded; the rest period is its own class."),
+                ("Repeats per hand", str(self.task_repeats), "Repetitions of every class per hand (study: 9)."),
+                ("Prepare / Perform / Rest", f"{self.task_prep_s:g} / {self.task_hold_s:g} / {self.task_rest_s:g} s", "One task cycle (study: 4 + 3 + 3 = 10 s)."),
+                ("Settle", f"{self.task_settle_s:g} s", "Optional un-recorded gap after each hold."),
+                ("Max cycles per block", str(self.study_meta["max_cycles_per_block"]), "Longest run without a break (study: 30 cycles, ~5 min)."),
+                ("Block break / hand-switch break", f"{self.study_meta['block_break_s']:.0f} / {self.study_meta['hand_switch_s']:.0f} s", "Rest between blocks (3-4 min) and when the armband changes arm (~5 min). 'Skip Break' ends one early."),
+                ("Record Rest / Randomize order", f"{on_off(self.task_record_rest)} / {on_off(self.task_randomize_order)}", "Record the rest period as a class; shuffle gesture order each repetition."),
+                ("CSV save folder", self.record_save_dir, "Where the session CSV and metadata are written; a checkpoint is saved at every break."),
+                ("Live CSV counter", f"{self._recorded_total_samples:,} rows", "Rows captured so far versus the number the protocol should produce."),
+            ]),
+            ("Models", [
+                ("Train Model", "-", "Train a Random Forest from recorded CSV files and review accuracy and the confusion matrix."),
+                ("Load Trained Model", model, "Load a saved model for real-time prediction."),
+                ("Real-time Classification", "Open" if self.realtime_classification_window else "Closed", "Shows the live predicted gesture, confidence and per-class scores."),
+                ("Gesture game", "Separate app", f"Run gesture_game_app.py; it listens to this app on UDP {GESTURE_BRIDGE_PORT} (keyboard works without it)."),
+            ]),
+        ]
+
+    def open_options_info_dialog(self):
+        if self.options_info_dialog is not None and self.options_info_dialog.isVisible():
+            self.options_info_dialog.raise_()
+            self.options_info_dialog.activateWindow()
+            return
+        self.options_info_dialog = OptionsInfoDialog(self.build_options_info_sections(), self)
+        center_window(self.options_info_dialog, self)
+        self.options_info_dialog.show()
+
     def on_serial_error(self, message):
         QMessageBox.critical(self, "Stream Error", message)
         self.disconnect_serial()
@@ -8637,24 +9286,22 @@ class EMGVisualizer(QMainWindow):
             except Exception:
                 pass
         self.record_save_workers = []
+        for attr in ("packet_tracer_window", "options_info_dialog"):
+            win = getattr(self, attr, None)
+            if win is not None:
+                try:
+                    win.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self.packet_timer.stop()
+        self.gesture_bridge.close()
         if self.realtime_classification_window is not None:
             try:
                 self.realtime_classification_window.close()
             except Exception:
                 pass
             self.realtime_classification_window = None
-        if self.gesture_game_window is not None:
-            try:
-                self.gesture_game_window.close()
-            except Exception:
-                pass
-            self.gesture_game_window = None
-        if self.mouse_control_window is not None:
-            try:
-                self.mouse_control_window.close()
-            except Exception:
-                pass
-            self.mouse_control_window = None
         if self.rf_worker is not None:
             try:
                 self.rf_worker.stop()
@@ -8697,7 +9344,9 @@ if __name__ == "__main__":
     app_icon = get_app_icon()
     if app_icon is not None and not app_icon.isNull():
         app.setWindowIcon(app_icon)
-    apply_dark_theme(app, font_size=18)
+    # Font scales with the screen (13" MacBook vs 1080p/4K Windows) so layouts keep their proportions.
+    apply_dark_theme(app, font_size=recommended_font_px())
+    install_screen_fit_filter(app)
     window = EMGVisualizer()
     window.show()
     sys.exit(app.exec_())

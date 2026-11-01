@@ -89,9 +89,39 @@ def apply_dark_title_bar(window):
     return enabled_dark
 
 
+def default_font_family():
+    """Native UI font for the running OS (Segoe UI on Windows, SF on macOS)."""
+    if os.name == "nt":
+        return "Bahnschrift"
+    try:
+        from PyQt5.QtGui import QFontDatabase
+
+        return QFontDatabase.systemFont(QFontDatabase.GeneralFont).family() or "Sans Serif"
+    except Exception:
+        return "Sans Serif"
+
+
+def recommended_font_px(default=16, lo=12, hi=18):
+    """Base font size (logical px) scaled to the primary screen's usable height.
+
+    A fixed 18 px font fills a 13" MacBook (about 775 logical px of usable height)
+    and a Windows laptop at 150 % scaling, but is fine on a 1080p desktop. Scaling
+    with the screen keeps the layout's proportions the same on every device.
+    """
+    try:
+        from PyQt5.QtWidgets import QApplication
+
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return default
+        return int(max(lo, min(hi, round(screen.availableGeometry().height() / 58.0))))
+    except Exception:
+        return default
+
+
 def app_stylesheet(font_size=16):
     c = THEME_COLORS
-    default_font = "Bahnschrift" if os.name == "nt" else "Sans Serif"
+    default_font = default_font_family()
     return f"""
 QWidget {{
     background-color: {c['bg']};
@@ -252,19 +282,23 @@ def configure_high_dpi():
 
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+        # Windows 125 % / 150 % scaling: use the exact factor instead of rounding it
+        # to 100 % / 200 %, which is what makes windows look too big or too small there.
+        if hasattr(QApplication, "setHighDpiScaleFactorRoundingPolicy"):
+            QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     except Exception:
         pass
 
 
-def fit_window_to_screen(window, desired_width, desired_height, margin_ratio=0.92):
-    """Resize+center ``window`` to fit the available screen.
+def fit_window_to_screen(window, desired_width, desired_height, margin_ratio=0.92, max_upscale=1.15):
+    """Resize+center ``window`` for the screen it opens on, keeping its aspect ratio.
 
-    A window is only ever made smaller than requested, never larger, and it
-    stays user-resizable afterwards. This is the actual fix for "buttons
-    aren't visible on my MacBook" bugs: those happen when a window is coded
-    for a bigger screen than the one it's opened on (e.g. a 1380x920 window
-    on a 13" MacBook Air's 1280x800 logical desktop) and macOS clips it
-    instead of shrinking it.
+    The requested size defines the window's aspect ratio. It is scaled by one common
+    factor so it fits inside ``margin_ratio`` of the usable screen area (menu bar /
+    dock / taskbar excluded) - shrinking on a 13" MacBook, and growing slightly (up
+    to ``max_upscale``) on large Windows monitors - so the proportions are the same
+    on every device instead of being cut off or stretched in one direction. The
+    window stays freely resizable afterwards.
     """
     try:
         from PyQt5.QtWidgets import QApplication
@@ -276,13 +310,62 @@ def fit_window_to_screen(window, desired_width, desired_height, margin_ratio=0.9
         avail = None
 
     width, height = int(desired_width), int(desired_height)
-    if avail is not None:
-        width = min(width, int(avail.width() * margin_ratio))
-        height = min(height, int(avail.height() * margin_ratio))
+    if avail is not None and width > 0 and height > 0:
+        scale = min(avail.width() * margin_ratio / width, avail.height() * margin_ratio / height)
+        scale = min(scale, float(max_upscale))
+        width, height = int(width * scale), int(height * scale)
     window.resize(width, height)
     if avail is not None:
         window.move(max(avail.x(), avail.center().x() - width // 2),
                     max(avail.y(), avail.center().y() - height // 2))
+
+
+def clamp_minimum_size(window, min_width, min_height, margin_ratio=0.9):
+    """setMinimumSize that never exceeds the usable screen (small laptops)."""
+    try:
+        from PyQt5.QtWidgets import QApplication
+
+        screen = window.screen() if hasattr(window, "screen") else None
+        screen = screen or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        min_width = min(int(min_width), int(avail.width() * margin_ratio))
+        min_height = min(int(min_height), int(avail.height() * margin_ratio))
+    except Exception:
+        pass
+    window.setMinimumSize(int(min_width), int(min_height))
+
+
+def install_screen_fit_filter(app, margin_ratio=0.94):
+    """Keep every top-level window/dialog inside the usable screen when first shown.
+
+    Many dialogs are laid out for a fixed size; on a small display they would open
+    partly off-screen. This clamps size and position once per window, device-agnostic.
+    """
+    from PyQt5.QtCore import QEvent, QObject
+    from PyQt5.QtWidgets import QWidget
+
+    class _ScreenFitFilter(QObject):
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Show and isinstance(obj, QWidget) and obj.isWindow():
+                if not obj.property("_screen_fit_done"):
+                    obj.setProperty("_screen_fit_done", True)
+                    try:
+                        screen = obj.screen() or app.primaryScreen()
+                        avail = screen.availableGeometry()
+                        w = min(obj.width(), int(avail.width() * margin_ratio))
+                        h = min(obj.height(), int(avail.height() * margin_ratio))
+                        if (w, h) != (obj.width(), obj.height()):
+                            obj.resize(w, h)
+                        x = min(max(obj.x(), avail.left()), avail.right() - w + 1)
+                        y = min(max(obj.y(), avail.top()), avail.bottom() - h + 1)
+                        obj.move(x, y)
+                    except Exception:
+                        pass
+            return False
+
+    flt = _ScreenFitFilter(app)
+    app.installEventFilter(flt)
+    return flt
 
 
 def wrap_in_scroll_area(window, central_widget):
@@ -314,7 +397,7 @@ def apply_dark_theme(app, font_size=16):
         if QFontInfo(font).family().lower() != "bahnschrift":
             font.setFamily("Segoe UI")
     else:
-        font.setFamily("Sans Serif")
+        font.setFamily(default_font_family())
     app.setFont(font)
     app.setStyleSheet(app_stylesheet(font_size=font_size))
 

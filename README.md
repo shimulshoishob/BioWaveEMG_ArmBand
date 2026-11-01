@@ -231,6 +231,16 @@ source .venv/bin/activate    # macOS / Linux
 python code/main.py
 ```
 
+`main.py` includes a **Packet Tracer** (live packets/s, missing packets, loss %, jitter), a live **CSV row counter**, an **Options Info** window that lists every option with its current value, and a Data Collection window that follows the study protocol (4 s prepare / 3 s perform / 3 s rest cycles, 9 repetitions per class per hand, blocks of at most 30 cycles with timed breaks, and a hand-switch break). A checkpoint CSV is written at every break.
+
+**Gesture Game (separate app).** The Lane Dash game no longer lives inside `main.py`:
+
+```bash
+python code/gesture_game_app.py
+```
+
+`main.py` mirrors each smoothed prediction to `127.0.0.1:5005` (UDP); the game listens there. Load a model and calibrate in `main.py` first. Without it the keyboard fallback (arrows / Space / Down) still works.
+
 ---
 
 ### 2. Standalone Adaptive Mouse Controller (`mouse_controller.py`)
