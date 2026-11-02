@@ -382,7 +382,11 @@ SERIAL_BOOT_WAIT_S = 3.5
 SERIAL_RESPONSE_TIMEOUT_S = 15.0
 WIFI_STREAM_PORT = 5000
 WIFI_CONTROL_PORT = 5001
-DEFAULT_DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"
+PLACEHOLDER_DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"
+MIN_DEVICE_ACCESS_KEY_LEN = 16
+DEVICE_SECRET_PATH = os.path.join(SCRIPT_DIR, "device_secret.json")   # gitignored; see device_secret.example.json
+CONTROL_RETRY_BACKOFF_S = (0.2, 0.5, 1.0)   # waits before retry 1..3 of a control command
+KEEPALIVE_RESTART_AFTER = 2                 # consecutive failed pings before START is re-issued
 DISCOVERY_ADDRESS = "255.255.255.255"
 DISCOVERY_TIMEOUT = 1.2
 CONTROL_TIMEOUT = 2.0
@@ -815,6 +819,27 @@ class SerialDeviceInfo:
     sample_rate_hz: Optional[float] = None
 
 
+def access_key_problem(key):
+    """Why ``key`` must not be used to talk to a device, or "" when it is acceptable."""
+    key = str(key or "").strip()
+    if not key:
+        return "No device access key is set. Put it in code/device_secret.json (see device_secret.example.json)."
+    if key == PLACEHOLDER_DEVICE_ACCESS_KEY:
+        return "The device access key is still the placeholder. Set a real key in secrets.h (firmware) and code/device_secret.json."
+    if len(key) < MIN_DEVICE_ACCESS_KEY_LEN:
+        return f"The device access key is too short (minimum {MIN_DEVICE_ACCESS_KEY_LEN} characters)."
+    return ""
+
+
+def load_device_access_key(path=DEVICE_SECRET_PATH):
+    """Key from the gitignored device_secret.json, or "" when it is missing or unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return str(json.load(fh).get("device_access_key", "")).strip()
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
 def sign_message(secret, *parts):
     message = "|".join(str(part) for part in parts)
     return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -921,32 +946,62 @@ class ControlProtocol:
         return list(devices.values())
 
     @staticmethod
-    def get_challenge(target_ip):
-        response, _ = ControlProtocol.send_and_receive("CHALLENGE", target_ip)
+    def get_challenge(target_ip, timeout=None):
+        response, _ = ControlProtocol.send_and_receive("CHALLENGE", target_ip,
+                                                       timeout=CONTROL_TIMEOUT if timeout is None else timeout)
         parts = response.strip().split("|")
         if len(parts) != 2 or parts[0] != "CHALLENGE":
             raise RuntimeError("Device did not return a valid challenge.")
         return parts[1]
 
     @staticmethod
-    def authenticated_command(target_ip, secret, command, *payload):
-        if not secret:
-            raise RuntimeError("Device access key is required.")
+    def _authenticated_once(target_ip, secret, command, payload, timeout):
+        # The firmware ties a challenge to the sender's (ip, port), so the CHALLENGE request and the
+        # signed command must leave from the SAME socket.
+        timeout = CONTROL_TIMEOUT if timeout is None else timeout
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            destination = (target_ip, WIFI_CONTROL_PORT)
+            sock.sendto(b"CHALLENGE", destination)
+            parts = sock.recvfrom(2048)[0].decode("utf-8", errors="replace").strip().split("|")
+            if len(parts) != 2 or parts[0] != "CHALLENGE":
+                raise RuntimeError("Device did not return a valid challenge.")
+            challenge = parts[1]
+            auth = sign_message(secret, command, challenge, *payload)
+            sock.sendto("|".join([command, challenge, *payload, auth]).encode("utf-8"), destination)
+            parts = sock.recvfrom(2048)[0].decode("utf-8", errors="replace").strip().split("|")
+        finally:
+            sock.close()
 
-        challenge = ControlProtocol.get_challenge(target_ip)
-        auth = sign_message(secret, command, challenge, *payload)
-        message = "|".join([command, challenge, *payload, auth])
-        response, _ = ControlProtocol.send_and_receive(message, target_ip)
-
-        parts = response.strip().split("|")
-        if not parts:
-            raise RuntimeError("Device returned an empty response.")
         if parts[0] == "ERR":
             detail = parts[1] if len(parts) > 1 else "UNKNOWN"
             raise RuntimeError(f"Device rejected command: {detail}")
         if parts[0] != "ACK":
             raise RuntimeError("Unexpected device acknowledgement.")
         return parts[1:]
+
+    @staticmethod
+    def authenticated_command(target_ip, secret, command, *payload, timeout=None, backoff=CONTROL_RETRY_BACKOFF_S):
+        """Run one signed command, retrying lost datagrams with a fresh challenge each attempt.
+
+        UDP loses packets and a device can answer a challenge for another client, so up to
+        ``len(backoff)`` retries are made (0.2 / 0.5 / 1.0 s by default). Blocking: call it from a
+        worker thread, never from the GUI thread when it can be avoided.
+        """
+        problem = access_key_problem(secret)
+        if problem:
+            raise RuntimeError(problem)
+
+        last_error = None
+        for attempt in range(len(backoff) + 1):
+            if attempt:
+                time.sleep(backoff[attempt - 1])
+            try:
+                return ControlProtocol._authenticated_once(target_ip, secret, command, payload, timeout)
+            except (OSError, RuntimeError) as exc:      # socket.timeout is an OSError
+                last_error = exc
+        raise RuntimeError(f"{command} failed after {len(backoff) + 1} attempts: {last_error}")
 
     @staticmethod
     def start_stream(target_ip, secret, client_ip, client_port):
@@ -5289,8 +5344,10 @@ class EMGVisualizer(QMainWindow):
         self.current_port_name = "socket://127.0.0.1:7000"
         self.current_device = None
         self.discovered_wireless_devices = []
-        self.wireless_access_key = DEFAULT_DEVICE_ACCESS_KEY
+        self.wireless_access_key = load_device_access_key()
         self.keepalive_failures = 0
+        self.keepalive_restarts = []      # every automatic START re-issue, for the quality report
+        self._stream_client_ip = ""
         self.port_config_dialog = None
         self.wireless_config_dialog = None
         self.port_config_applied = False
@@ -5770,12 +5827,25 @@ class EMGVisualizer(QMainWindow):
             return
         ip, key = self.current_device.ip, self.wireless_access_key
 
+        client_ip = self._stream_client_ip
+
         def _ping():
             try:
                 ControlProtocol.ping(ip, key)
                 self.keepalive_failures = 0
-            except Exception:
+            except Exception as exc:
                 self.keepalive_failures += 1
+                if self.keepalive_failures >= KEEPALIVE_RESTART_AFTER and client_ip:
+                    # The device probably lost its stream target (reboot, Wi-Fi drop, timeout):
+                    # re-issue START from this background thread and keep a record of it.
+                    event = {"host_monotonic_s": time.monotonic(), "reason": str(exc), "ok": False}
+                    try:
+                        ControlProtocol.start_stream(ip, key, client_ip, WIFI_STREAM_PORT)
+                        event["ok"] = True
+                        self.keepalive_failures = 0
+                    except Exception as restart_exc:
+                        event["error"] = str(restart_exc)
+                    self.keepalive_restarts.append(event)
 
         self._keepalive_thread = threading.Thread(target=_ping, name="biowave-keepalive", daemon=True)
         self._keepalive_thread.start()
@@ -5919,7 +5989,11 @@ class EMGVisualizer(QMainWindow):
         self.wired_binary = False
         self.current_device = device
         self.wireless_access_key = str(access_key or "").strip()
+        problem = access_key_problem(self.wireless_access_key)
+        if problem:
+            raise RuntimeError(problem)
         self.keepalive_failures = 0
+        self.keepalive_restarts = []
         self.channel_count = WIRELESS_TOTAL_CHANNELS
         self.reset_runtime_state_for_channels(self.channel_count)
 
@@ -5935,6 +6009,7 @@ class EMGVisualizer(QMainWindow):
             self.serial_worker.start(QThread.TimeCriticalPriority)
 
             client_ip = get_local_ip_for_target(device.ip)
+            self._stream_client_ip = client_ip
             ControlProtocol.start_stream(device.ip, self.wireless_access_key, client_ip, WIFI_STREAM_PORT)
 
             self.current_port_name = f"wifi://{device.ip}"
