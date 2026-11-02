@@ -56,3 +56,9 @@ class ProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MainsTests(unittest.TestCase):
+    def test_mains_is_50hz_with_harmonics_inside_the_analysis_band(self):
+        self.assertEqual(app.MAINS_FREQS, [50.0, 100.0, 150.0, 200.0])
+        self.assertTrue(all(f < app.SAMPLE_RATE / 2 for f in app.MAINS_FREQS))

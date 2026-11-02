@@ -361,7 +361,7 @@ DEFAULT_HZ_THRESHOLD = 30.0      # EMG dominant-frequency gate before calibratio
 FFT_MIN_HZ = 20.0                # Typical lower EMG band edge
 FFT_MAX_HZ = 220.0               # Keep below Nyquist (250Hz at 500Hz sample rate)
 BAND_DEFS = [(20.0, 60.0), (60.0, 120.0), (120.0, 220.0)]
-MAINS_FREQS = [50.0, 60.0]
+MAINS_FREQS = [50.0, 100.0, 150.0, 200.0]   # 50 Hz mains and harmonics; analysis displays only, never applied to saved data
 MAINS_BAND_HZ = 2.0
 MAX_LAG_SAMPLES = int(0.10 * SAMPLE_RATE)
 # Dataset label names (see session_recording.LABEL_MAP for the old names and numeric codes).
