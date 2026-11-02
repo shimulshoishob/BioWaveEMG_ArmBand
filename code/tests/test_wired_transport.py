@@ -65,7 +65,8 @@ class WiredTransportTests(unittest.TestCase):
         worker.stop(); fw.join(3)
         self.assertEqual(sum(len(p["batch"]) for p in got), 150)
         self.assertEqual(got[0]["batch"].shape[1], 11)              # EMG + IMU, not limited to 2-9
-        self.assertEqual(fw.commands[0], "USBSTART")
+        self.assertEqual(fw.commands[0], "INFO")                     # device id / firmware for the metadata
+        self.assertEqual(fw.commands[1], "USBSTART")
         self.assertEqual(fw.commands[-1], "USBSTOP")
         ids = np.concatenate([p["frame_ids"] for p in got])
         self.assertTrue(np.array_equal(ids, np.arange(150)))

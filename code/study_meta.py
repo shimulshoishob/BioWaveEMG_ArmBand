@@ -36,3 +36,47 @@ def session_folder_name(pid: str, day: int, hand_order: str, utc: time.struct_ti
     stamp = time.strftime("%Y%m%dT%H%M%SZ", utc or time.gmtime())
     name = f"{pid}_day{int(day):02d}_{str(hand_order).replace('_', '-')}_{stamp}"
     return f"practice_{name}" if practice else name
+
+
+CHANNEL_MAP = ([{"channel": i, "column": f"Ch{i}", "name": f"EMG{i}", "type": "emg",
+                 "unit": "ADC counts (12-bit, raw, 0-4095)"} for i in range(1, 9)]
+               + [{"channel": 9, "column": "IMU_roll", "name": "roll", "type": "imu_orientation", "unit": "degrees"},
+                  {"channel": 10, "column": "IMU_pitch", "name": "pitch", "type": "imu_orientation", "unit": "degrees"},
+                  {"channel": 11, "column": "IMU_yaw", "name": "yaw", "type": "imu_orientation", "unit": "degrees"}])
+
+
+def parse_info_line(line: str) -> dict:
+    """``INFO|id|name|imu|wifi|fw[|rate]`` (USB) -> dict; ``{}`` when it is not an INFO line."""
+    parts = str(line or "").strip().split("|")
+    if len(parts) < 6 or parts[0] != "INFO":
+        return {}
+    info = {"device_id": parts[1], "device_name": parts[2], "imu_ready": parts[3] == "1", "firmware_version": parts[5]}
+    if len(parts) > 6:
+        try:
+            info["sample_rate_hz"] = float(parts[6])
+        except ValueError:
+            pass
+    return info
+
+
+def build_metadata_json(*, session: str, label_map: dict, phase_labels: dict, **sections) -> dict:
+    """Assemble the machine-readable session metadata.
+
+    ``sections`` are the already-collected groups (software, device, protocol, environment, participant,
+    electrode_placement, timing, files, ...). Anything missing stays absent rather than being guessed;
+    empty values are written as null so "not recorded" is distinguishable from "zero".
+    """
+    def clean(value):
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(v) for v in value]
+        if value in ("", None):
+            return None
+        return value
+
+    meta = {"schema_version": 1, "session": session, "signal_mode": "raw",
+            "channel_map": CHANNEL_MAP,
+            "label_map": {"labels": label_map, "phases": phase_labels}}
+    meta.update(sections)
+    return clean(meta)

@@ -90,10 +90,10 @@ from app_theme import (
     themed_label_style,
     themed_status_color,
 )
-from study_meta import (CONSENT_FORM_VERSION, default_hand_order, normalize_participant_id,
-                        session_folder_name, valid_participant_id)
-from session_recording import (ContinuousRecorder, EventLog, LABEL_CODES, MIN_VALID_SAMPLE_RATIO, SIGNAL_COLUMNS,
-                               finalize_session)
+from study_meta import (CONSENT_FORM_VERSION, build_metadata_json, default_hand_order, normalize_participant_id,
+                        parse_info_line, session_folder_name, valid_participant_id)
+from session_recording import (ContinuousRecorder, EventLog, LABEL_CODES, LABEL_MAP, MIN_VALID_SAMPLE_RATIO,
+                               PSEUDO_LABELS, SIGNAL_COLUMNS, finalize_session)
 from emg_v4_core import (StreamAssembler, UsbFrameDecoder, WirelessStats, parse_bwim_packet,
                          segments_to_payload)
 
@@ -265,6 +265,9 @@ class StableLabel(QLabel):
 
 # --- PARTICIPANT INFO (data collection; saved to the metadata file) ---
 BLOOD_GROUP_OPTIONS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+ELECTRODE_LANDMARKS = ["Lateral epicondyle", "Medial epicondyle", "Olecranon", "Ulnar styloid process",
+                       "Radial styloid process", "Other"]
+SKIN_PREPARATIONS = ["None (dry skin)", "Alcohol wipe", "Shaved + alcohol", "Abraded + alcohol"]
 
 
 def _value_or_na(value, fmt, cast=float):
@@ -336,6 +339,7 @@ def center_window(window, parent_widget=None):
 
 # --- DEFAULTS ---
 APP_NAME = "BioWave - EMG"
+APP_VERSION = "2.0.0"
 DEFAULT_BAUD_RATE = 921600   # keep equal to USB_SERIAL_BAUD and the firmware's USB_SERIAL_BAUD
 USB_KEEPALIVE_INTERVAL_S = 2.0
 WINDOW_SIZE = 1000               # Number of samples shown on each channel
@@ -622,6 +626,7 @@ class SerialWorker(QThread):
         self._serial = None
         self._packet_sequence_counter = 0
         self._assembler = StreamAssembler()
+        self.device_info = {}
 
     def _emit_batch(self, batch):
         arr = np.asarray(batch, dtype=np.float32)
@@ -678,6 +683,7 @@ class SerialWorker(QThread):
                     self._serial = self._open_serial()
                     decoder = UsbFrameDecoder()
                     last_command = last_packet = 0.0
+                    self._serial.write(b"INFO\n")        # device id / firmware / sampling rate for the metadata
                 now = time.monotonic()
                 if now - last_command >= USB_KEEPALIVE_INTERVAL_S:
                     # USBSTART (re)starts the stream until packets flow; USBPING keeps it alive after.
@@ -688,6 +694,8 @@ class SerialWorker(QThread):
                 now = time.monotonic()
                 if chunk:
                     packets, bad = decoder.feed(chunk)
+                    if decoder.info_line and not self.device_info:
+                        self.device_info = parse_info_line(decoder.info_line)
                     if self.tracer is not None:
                         for _ in range(bad):
                             self.tracer.observe_invalid_packet()
@@ -777,6 +785,24 @@ class SerialWorker(QThread):
     def stop(self):
         self._running = False
         self.wait()
+
+
+_GIT_INFO_CACHE = {}
+
+
+def app_git_info():
+    """Commit hash (and whether the tree is dirty) of the running code; cached, never raises."""
+    if not _GIT_INFO_CACHE:
+        info = {"commit": None, "dirty": None}
+        try:
+            run = lambda *args: subprocess.run(["git", *args], cwd=SCRIPT_DIR, capture_output=True, text=True,
+                                               timeout=3, check=True).stdout.strip()
+            info["commit"] = run("rev-parse", "HEAD")
+            info["dirty"] = bool(run("status", "--porcelain", "--untracked-files=no"))
+        except Exception:
+            pass
+        _GIT_INFO_CACHE.update(info)
+    return dict(_GIT_INFO_CACHE)
 
 
 def _parse_rate_field(text):
@@ -1683,10 +1709,11 @@ class SessionFinalizeWorker(QThread):
     save_completed = pyqtSignal(object)
 
     def __init__(self, recorder, events, out_dir, session, fs, transport, keepalive_restarts, host_origin_s,
-                 metadata_path, metadata_builder, close_recorder, parent=None):
+                 metadata_path, metadata_builder, close_recorder, json_builder=None, parent=None):
         super().__init__(parent)
         self._args = (recorder, events, out_dir, session, fs, transport, keepalive_restarts, host_origin_s)
         self._metadata_path, self._metadata_builder, self._close = metadata_path, metadata_builder, bool(close_recorder)
+        self._json_builder = json_builder
 
     def run(self):
         recorder, events, out_dir, session, fs, transport, restarts, origin = self._args
@@ -1701,6 +1728,9 @@ class SessionFinalizeWorker(QThread):
                                       keepalive_restarts=restarts, host_origin_s=origin)
             with open(self._metadata_path, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(self._metadata_builder(rows, result["quality"])) + "\n")
+            if self._json_builder is not None:
+                with open(os.path.splitext(self._metadata_path)[0] + ".json", "w", encoding="utf-8") as fh:
+                    json.dump(self._json_builder(rows, result["quality"]), fh, indent=2, default=str)
             self.save_completed.emit({"ok": True, "data_csv_path": result["signals_path"],
                                       "metadata_path": self._metadata_path, "quality": result["quality"],
                                       "events_path": result["events_path"], "quality_path": result["quality_path"]})
@@ -3693,7 +3723,41 @@ class DataCollectionDialog(QDialog):
         extra_layout.addLayout(participant_grid)
 
         extra_layout.addLayout(_section_title(
-            "Room Conditions", "(note at the start of the session; optional)"))
+            "Electrode Placement", "(saved to the metadata; fields left empty are saved as N/A)"))
+        electrode = dict(settings.get("electrode", {}) or {})
+        electrode_grid = QGridLayout()
+        electrode_grid.setHorizontalSpacing(10)
+        electrode_grid.setVerticalSpacing(6)
+        self.combo_landmark = QComboBox()
+        self.combo_landmark.addItems(["N/A"] + ELECTRODE_LANDMARKS)
+        if electrode.get("landmark") in ELECTRODE_LANDMARKS:
+            self.combo_landmark.setCurrentText(electrode["landmark"])
+        self.spin_landmark_distance = _make_spin(0.0, 60.0, 0.5, 1, " cm", electrode.get("landmark_distance_cm", 0.0))
+        self.spin_landmark_distance.setToolTip("Distance from the landmark to the centre of the armband, along the forearm.")
+        self.input_ch1_muscle = QLineEdit(str(electrode.get("channel1_muscle", "") or ""))
+        self.input_ch1_muscle.setPlaceholderText("muscle under channel 1")
+        self.combo_skin_prep = QComboBox()
+        self.combo_skin_prep.addItems(["N/A"] + SKIN_PREPARATIONS)
+        if electrode.get("skin_preparation") in SKIN_PREPARATIONS:
+            self.combo_skin_prep.setCurrentText(electrode["skin_preparation"])
+        self.input_electrode_type = QLineEdit(str(electrode.get("electrode_type", "") or ""))
+        self.input_electrode_type.setPlaceholderText("e.g. dry electrodes, OYMotion armband")
+        self.input_photo = QLineEdit(str(electrode.get("photo_filename", "") or ""))
+        self.input_photo.setPlaceholderText("placement photo file name")
+        for col, (text, widget) in enumerate([
+            ("Landmark:", self.combo_landmark), ("Distance:", self.spin_landmark_distance),
+            ("Channel 1 muscle:", self.input_ch1_muscle), ("Skin preparation:", self.combo_skin_prep),
+            ("Electrode type:", self.input_electrode_type), ("Photo file:", self.input_photo),
+        ]):
+            row, base = divmod(col, 2)
+            electrode_grid.addWidget(QLabel(text), row, base * 2)
+            electrode_grid.addWidget(widget, row, base * 2 + 1)
+        electrode_grid.setColumnStretch(1, 1)
+        electrode_grid.setColumnStretch(3, 1)
+        extra_layout.addLayout(electrode_grid)
+
+        extra_layout.addLayout(_section_title(
+            "Room Conditions", "(REQUIRED - note temperature and humidity at the start of the session)"))
         env_grid = QGridLayout()
         env_grid.setHorizontalSpacing(10)
         env_grid.setVerticalSpacing(6)
@@ -3878,6 +3942,9 @@ class DataCollectionDialog(QDialog):
             self.spin_height.valueChanged, self.spin_weight.valueChanged, self.spin_age.valueChanged,
             self.spin_forearm_circumference.valueChanged,
             self.spin_temp_start.valueChanged, self.spin_humidity_start.valueChanged,
+            self.combo_landmark.currentIndexChanged, self.spin_landmark_distance.valueChanged,
+            self.input_ch1_muscle.textChanged, self.combo_skin_prep.currentIndexChanged,
+            self.input_electrode_type.textChanged, self.input_photo.textChanged,
             self.spin_session_day.valueChanged, self.combo_hand_order.currentIndexChanged,
             self.spin_task_repeats.valueChanged, self.spin_task_prep.valueChanged,
             self.spin_task_hold.valueChanged, self.spin_task_rest.valueChanged,
@@ -3939,6 +4006,14 @@ class DataCollectionDialog(QDialog):
             "forearm_circumference_cm": float(self.spin_forearm_circumference.value()),
             "temp_start_c": float(self.spin_temp_start.value()),
             "humidity_start_pct": float(self.spin_humidity_start.value()),
+            "electrode": {
+                "landmark": self.combo_landmark.currentText() if self.combo_landmark.currentIndex() > 0 else "",
+                "landmark_distance_cm": float(self.spin_landmark_distance.value()),
+                "channel1_muscle": self.input_ch1_muscle.text().strip(),
+                "skin_preparation": self.combo_skin_prep.currentText() if self.combo_skin_prep.currentIndex() > 0 else "",
+                "electrode_type": self.input_electrode_type.text().strip(),
+                "photo_filename": os.path.basename(self.input_photo.text().strip()),
+            },
             "agreed": bool(self.check_agree_yes.isChecked() and not self.check_agree_no.isChecked()),
             "seed": int(self.session_seed),
             "practice_mode": bool(self.check_practice.isChecked()),
@@ -4083,7 +4158,12 @@ class DataCollectionDialog(QDialog):
             QMessageBox.warning(self, "Participant ID", "The participant ID must be the letter S followed by 2-3 digits "
                                 "(for example S01). Do not enter a name.")
             return
-        # Participant info and room conditions are optional; anything left empty is
+        if self.spin_temp_start.value() <= 0.0 or self.spin_humidity_start.value() <= 0.0:
+            self.btn_additional.setChecked(True)      # show the fields that are missing
+            QMessageBox.warning(self, "Room Conditions", "Temperature and humidity are required: enter the values "
+                                "under Additional Information > Room Conditions.")
+            return
+        # Participant info and electrode placement are optional; anything left empty is
         # written to the metadata file as N/A.
         if not self.labels_saved or len(self.task_labels) == 0:
             QMessageBox.warning(self, "Task Labels", "Click Edit and save class labels before proceeding.")
@@ -5283,6 +5363,7 @@ class EMGVisualizer(QMainWindow):
             "hand_switch_s": float(DEFAULT_HAND_SWITCH_BREAK_S),
             **{key: 0.0 for key in STUDY_ENV_KEYS},
             "seed": 0, "practice_mode": False, "hand_order_source": "auto", "hand_order_default": "",
+            "electrode": {},
         }
         self.record_missing_packets = 0
         self.record_gap_events = 0
@@ -7127,6 +7208,7 @@ class EMGVisualizer(QMainWindow):
             "max_cycles_per_block": int(self.study_meta["max_cycles_per_block"]),
             "block_break_s": float(self.study_meta["block_break_s"]),
             "hand_switch_s": float(self.study_meta["hand_switch_s"]),
+            "electrode": dict(self.study_meta["electrode"]),
             "seed": int(self.study_meta["seed"]),
             "practice_mode": bool(self.study_meta["practice_mode"]),
             "hand_order_source": str(self.study_meta["hand_order_source"]),
@@ -7162,6 +7244,7 @@ class EMGVisualizer(QMainWindow):
             "max_cycles_per_block", self.study_meta["max_cycles_per_block"])))
         self.study_meta["block_break_s"] = float(max(0.0, settings.get("block_break_s", self.study_meta["block_break_s"])))
         self.study_meta["hand_switch_s"] = float(max(0.0, settings.get("hand_switch_s", self.study_meta["hand_switch_s"])))
+        self.study_meta["electrode"] = dict(settings.get("electrode", self.study_meta["electrode"]) or {})
         for key, cast in (("seed", int), ("practice_mode", bool), ("hand_order_source", str), ("hand_order_default", str)):
             self.study_meta[key] = cast(settings.get(key, self.study_meta[key]))
         self.contribution_agreed = bool(settings.get("agreed", self.contribution_agreed))
@@ -7354,6 +7437,14 @@ class EMGVisualizer(QMainWindow):
             f"weight_kg={_value_or_na(self.participant_weight_kg, '{:.1f}')}",
             f"age_years={_value_or_na(self.participant_age_years, '{:d}', cast=int)}",
             f"forearm_circumference_cm={_value_or_na(self.participant_forearm_circumference_cm, '{:.2f}')}",
+            f"electrode_landmark={self.study_meta['electrode'].get('landmark') or 'N/A'}",
+            f"electrode_landmark_distance_cm={_value_or_na(self.study_meta['electrode'].get('landmark_distance_cm'), '{:.1f}')}",
+            f"channel1_muscle={self.study_meta['electrode'].get('channel1_muscle') or 'N/A'}",
+            f"skin_preparation={self.study_meta['electrode'].get('skin_preparation') or 'N/A'}",
+            f"electrode_type={self.study_meta['electrode'].get('electrode_type') or 'N/A'}",
+            f"electrode_photo={self.study_meta['electrode'].get('photo_filename') or 'N/A'}",
+            f"app_version={APP_VERSION}",
+            f"git_commit={app_git_info()['commit'] or 'N/A'}",
             f"session_day={int(self.study_meta['session_day'])}",
             f"hand_order={'+'.join(hands_for_order(self.study_meta['hand_order'])).lower()}",
             f"max_cycles_per_block={int(self.study_meta['max_cycles_per_block'])}",
@@ -7504,7 +7595,8 @@ class EMGVisualizer(QMainWindow):
         builder = lambda rows, quality, d=data_csv_path, r=root_dir: self.build_recorded_metadata_lines(d, r, rows, quality)
         worker = SessionFinalizeWorker(
             rec, events, self._session_dir, self._session_name, SAMPLE_RATE, self._transport_summary(),
-            list(self.keepalive_restarts), self._session_host_origin, metadata_path, builder, close_recorder, self)
+            list(self.keepalive_restarts), self._session_host_origin, metadata_path, builder, close_recorder,
+            json_builder=self.make_metadata_json_builder(data_csv_path), parent=self)
         context = {"root_dir": root_dir, "checkpoint": bool(checkpoint), "show_saved_dialog": bool(show_saved_dialog)}
         worker.save_completed.connect(lambda result, w=worker, ctx=context: self._on_record_save_completed(w, ctx, result))
         self.record_save_workers.append(worker)
@@ -7513,6 +7605,71 @@ class EMGVisualizer(QMainWindow):
             self.session_recorder = None       # nothing more is appended; the worker drains and closes it
         worker.start(QThread.LowPriority)
         return data_csv_path, metadata_path
+
+    def make_metadata_json_builder(self, data_csv_path):
+        """Snapshot everything that goes into metadata_<session>.json now (GUI thread); the worker adds the results."""
+        session = os.path.basename(os.path.dirname(data_csv_path))
+        git = app_git_info()
+        info = {}
+        if self.connection_medium == "wireless" and self.current_device is not None:
+            d = self.current_device
+            info = {"firmware_version": d.firmware, "device_id": d.device_id, "device_name": d.device_name,
+                    "sampling_rate_hz": d.sample_rate_hz, "imu_ready": d.imu_ready}
+        elif self.serial_worker is not None and getattr(self.serial_worker, "device_info", None):
+            info = dict(self.serial_worker.device_info)
+        medium = ("wifi" if self.connection_medium == "wireless"
+                  else "usb_binary" if self.wired_binary else "usb_csv_simulator")
+        device = {**info, "connection_medium": medium,
+                  "configured_sampling_rate_hz": SAMPLE_RATE,
+                  "sampling_rate_hz": info.get("sample_rate_hz") or info.get("sampling_rate_hz") or SAMPLE_RATE,
+                  "sampling_rate_source": "device" if (info.get("sample_rate_hz") or info.get("sampling_rate_hz"))
+                  else "app_default (firmware did not report it)"}
+        device.pop("sample_rate_hz", None)
+        sm = self.study_meta
+        labels = [str(x).strip() for x in self.task_labels if str(x).strip()]
+        sections = dict(
+            mode="practice" if sm["practice_mode"] else "study",
+            participant_id=self.participant_id,
+            consent_form_version=CONSENT_FORM_VERSION if self.contribution_agreed else None,
+            software={"app_version": APP_VERSION, "git_commit": git["commit"], "git_dirty": git["dirty"],
+                      "python": sys.version.split()[0], "platform": sys.platform},
+            device=device,
+            session_info={"session_day": int(sm["session_day"]), "hand_order": sm["hand_order"],
+                     "hand_order_source": sm["hand_order_source"],
+                     "hand_order_counterbalanced_default": sm["hand_order_default"],
+                     "start_utc": self._session_start_utc, "host_clock": "time.monotonic (seconds)",
+                     "random_seed": int(sm["seed"])},
+            protocol={"labels": labels, "repeats_per_class_per_hand": int(self.task_repeats),
+                      "prepare_s": float(self.task_prep_s), "perform_s": float(self.task_hold_s),
+                      "rest_s": float(self.task_rest_s), "settle_s": float(self.task_settle_s),
+                      "record_rest": bool(self.task_record_rest),
+                      "randomize_order": bool(self.task_randomize_order or not sm["practice_mode"]),
+                      "max_cycles_per_block": int(sm["max_cycles_per_block"]),
+                      "block_break_s": float(sm["block_break_s"]), "hand_switch_break_s": float(sm["hand_switch_s"]),
+                      "recording": "continuous (all phases), labelled afterwards by device frame ID"},
+            environment={"temperature_c": float(sm["temp_start_c"]), "humidity_pct": float(sm["humidity_start_pct"])},
+            participant={"blood_group": self.participant_blood_group, "height_cm": self.participant_height_cm or None,
+                         "weight_kg": self.participant_weight_kg or None, "age_years": self.participant_age_years or None},
+            electrode_placement={
+                "landmark": sm["electrode"].get("landmark"),
+                "distance_from_landmark_cm": sm["electrode"].get("landmark_distance_cm") or None,
+                "channel_1_muscle": sm["electrode"].get("channel1_muscle"),
+                "forearm_circumference_cm": self.participant_forearm_circumference_cm or None,
+                "skin_preparation": sm["electrode"].get("skin_preparation"),
+                "electrode_type": sm["electrode"].get("electrode_type"),
+                "photo_filename": sm["electrode"].get("photo_filename")},
+            files={"signals": f"signals_{session}.csv", "events": f"events_{session}.csv",
+                   "quality": f"quality_{session}.json", "metadata_text": f"metadata_{session}.txt",
+                   "raw_frames": f"raw_{session}.bin"},
+        )
+        label_map = [{"old_name": old, "name": new, "code": code} for old, (new, code) in LABEL_MAP.items()]
+        phase_labels = {"paused": PSEUDO_LABELS["paused"], "aborted": PSEUDO_LABELS["aborted"]}
+
+        def build(rows, quality):
+            return build_metadata_json(session=session, label_map=label_map, phase_labels=phase_labels, **sections,
+                                       result={"rows": int(rows), "valid_sample_ratio": quality.get("valid_sample_ratio"),
+                                               "meets_valid_sample_threshold": quality.get("meets_valid_sample_threshold")})
+        return build
 
     def start_task_timer_recording(self):
         if not self.data_collection_dialog or not self.data_collection_dialog.isVisible():
@@ -7530,6 +7687,9 @@ class EMGVisualizer(QMainWindow):
             return
         if not valid_participant_id(self.participant_id):
             QMessageBox.warning(self, "Participant ID", "Provide a pseudonymous participant ID (S01, S02, ...) in Data Collection before starting.")
+            return
+        if self.study_meta["temp_start_c"] <= 0.0 or self.study_meta["humidity_start_pct"] <= 0.0:
+            QMessageBox.warning(self, "Room Conditions", "Temperature and humidity are required before a session can start.")
             return
         if not self.task_labels_locked:
             QMessageBox.warning(self, "Task Labels", "Save task labels in Data Collection before starting.")

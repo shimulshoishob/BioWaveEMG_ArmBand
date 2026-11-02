@@ -463,6 +463,7 @@ class UsbFrameDecoder:
     def __init__(self) -> None:
         self._tail = bytearray()
         self._overflow = False
+        self.info_line = ""           # most recent "INFO|..." reply seen on the stream
 
     def feed(self, chunk: bytes):
         packets, bad = [], 0
@@ -484,6 +485,8 @@ class UsbFrameDecoder:
                         packets.append(parsed)
                         continue
             if self._looks_like_text(frame):
+                if frame.lstrip().startswith(b"INFO|"):
+                    self.info_line = frame.decode("ascii", errors="replace").strip()
                 continue
             bad += 1
         return packets, bad

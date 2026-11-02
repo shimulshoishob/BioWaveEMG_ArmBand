@@ -35,3 +35,29 @@ class StudyMetaTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from study_meta import CHANNEL_MAP, build_metadata_json, parse_info_line
+
+
+class MetadataJsonTests(unittest.TestCase):
+    def test_parse_info_line(self):
+        self.assertEqual(parse_info_line("INFO|ABC|BioWave|1|0|emg-imu-2.0.0|500"),
+                         {"device_id": "ABC", "device_name": "BioWave", "imu_ready": True,
+                          "firmware_version": "emg-imu-2.0.0", "sample_rate_hz": 500.0})
+        self.assertNotIn("sample_rate_hz", parse_info_line("INFO|ABC|BioWave|0|0|emg-imu-1.6.0"))
+        self.assertEqual(parse_info_line("HELLO|x"), {})
+
+    def test_channel_map_matches_signal_columns(self):
+        from session_recording import SIGNAL_COLUMNS
+        self.assertEqual([c["column"] for c in CHANNEL_MAP], [c for c in SIGNAL_COLUMNS if c.startswith(("Ch", "IMU_roll", "IMU_pitch", "IMU_yaw"))])
+        self.assertEqual([c["type"] for c in CHANNEL_MAP].count("emg"), 8)
+
+    def test_missing_values_become_null_not_zero(self):
+        meta = build_metadata_json(session="S01_x", label_map=[{"name": "rest", "code": 0}], phase_labels={"prepare": 99},
+                                   device={"firmware_version": "", "sampling_rate_hz": 500},
+                                   electrode_placement={"landmark": None, "distance_cm": 0})
+        self.assertIsNone(meta["device"]["firmware_version"]); self.assertEqual(meta["device"]["sampling_rate_hz"], 500)
+        self.assertEqual(meta["electrode_placement"]["distance_cm"], 0)
+        self.assertIsNone(meta["electrode_placement"]["landmark"])
+        self.assertEqual(meta["label_map"]["labels"][0]["code"], 0)
