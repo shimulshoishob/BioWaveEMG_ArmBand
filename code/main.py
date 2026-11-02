@@ -89,7 +89,8 @@ from app_theme import (
     themed_label_style,
     themed_status_color,
 )
-from emg_v4_core import (WirelessStats, TimestampUnwrapper, UsbFrameDecoder, parse_bwim_packet)
+from emg_v4_core import (StreamAssembler, UsbFrameDecoder, WirelessStats, parse_bwim_packet,
+                         segments_to_payload)
 
 try:
     import pywt  # Optional for wavelet-energy features
@@ -461,31 +462,6 @@ _WIRELESS_FRAME_DTYPE = np.dtype([
 assert _WIRELESS_FRAME_DTYPE.itemsize == WIRELESS_FRAME_SIZE, "wireless frame layout mismatch"
 
 
-def build_packet_payload(packets, arrival, source, packet_gap=0):
-    """Concatenate decoded BwimPackets (in order) into one batch payload for the GUI.
-
-    Every per-sample array has one entry per frame: the recorder relies on frame_ids and the
-    64-bit device timestamps to place labels and to see gaps, so none of them may be dropped.
-    """
-    frames = packets[0].frames if len(packets) == 1 else np.concatenate([p.frames for p in packets])
-    n = len(frames)
-    batch = np.empty((n, WIRELESS_TOTAL_CHANNELS), dtype=np.float32)
-    batch[:, :WIRELESS_EMG_CHANNELS] = frames["emg"]
-    batch[:, WIRELESS_EMG_CHANNELS:] = frames["imu"]
-    sequences = np.repeat(np.array([p.sequence for p in packets], dtype=np.int64),
-                          [len(p.frames) for p in packets])
-    return {"batch": batch, "packet_numbers": sequences, "source": source,
-            "frame_ids": frames["frame_id"].astype(np.int64),
-            "emg_timestamps": frames["frame_ts"].astype(np.int64),
-            "imu_ids": frames["imu_id"].astype(np.int64),
-            "imu_timestamps": frames["imu_ts"].astype(np.int64),
-            "imu_fresh": frames["fresh"].astype(np.uint8),
-            "late_flags": (frames["flags"] & 1).astype(np.uint8),
-            "valid": np.ones(n, dtype=np.uint8),
-            "host_received_monotonic": arrival, "packet_gap": int(packet_gap),
-            "device_counters": dict(packets[-1].device_counters)}
-
-
 class PacketTracer:
     """Transport health counters: the receive thread writes, the UI thread reads.
 
@@ -508,6 +484,7 @@ class PacketTracer:
             self.kind = str(kind)
             self.frames_per_packet = max(1, int(frames_per_packet))
             self.stats = WirelessStats()
+            self.asm = {}
             self.invalid_lines = 0
             self.samples = 0
             self.bytes = 0
@@ -522,16 +499,26 @@ class PacketTracer:
             self.missing_history = deque(maxlen=self.HISTORY)
 
     # -- writers (receive thread) ------------------------------------------------
-    def observe_wireless(self, sequence, n_samples, n_bytes, arrival):
-        """Record one datagram; returns how many packets were missing before it."""
+    def observe_packet(self, n_samples, n_bytes, arrival):
+        """Record one received datagram/USB frame (arrival order; loss accounting comes from the assembler)."""
         with self._lock:
-            gap = self.stats.observe(sequence, arrival)
+            self.stats.packets_received += 1
+            if self.stats.last_arrival is not None:
+                self.stats.arrival_intervals.append(arrival - self.stats.last_arrival)
+            self.stats.last_arrival = arrival
             self.samples += int(n_samples)
             self.bytes += int(n_bytes)
             if self.last_arrival:
                 self.max_gap_s = max(self.max_gap_s, arrival - self.last_arrival)
             self.last_arrival = arrival
-            return gap
+
+    def sync_assembler(self, asm_stats):
+        """Copy the sequencer's loss / late / duplicate counters (called by the receive thread)."""
+        with self._lock:
+            self.stats.packets_missing = int(asm_stats["packets_missing"])
+            self.stats.packets_out_of_order = int(asm_stats["packets_reordered"] + asm_stats["packets_late"]
+                                                  + asm_stats["packets_duplicate"])
+            self.asm = dict(asm_stats)
 
     def observe_invalid_packet(self):
         with self._lock:
@@ -580,6 +567,10 @@ class PacketTracer:
                 "missing": missing,
                 "missing_samples": missing * (self.frames_per_packet if self.kind == "wireless" else 1),
                 "out_of_order": int(self.stats.packets_out_of_order),
+                "late": int(self.asm.get("packets_late", 0)),
+                "duplicate": int(self.asm.get("packets_duplicate", 0)),
+                "frames_missing": int(self.asm.get("frames_missing", 0)),
+                "device_counters": dict(self.asm.get("device_counters", {})),
                 "invalid": int(self.stats.invalid_packets) + int(self.invalid_lines),
                 "loss_pct": (100.0 * missing / total) if total else 0.0,
                 "pkt_rate": float(self.pkt_rate),
@@ -623,7 +614,7 @@ class SerialWorker(QThread):
         self._running = True
         self._serial = None
         self._packet_sequence_counter = 0
-        self._unwrapper = TimestampUnwrapper()
+        self._assembler = StreamAssembler()
 
     def _emit_batch(self, batch):
         arr = np.asarray(batch, dtype=np.float32)
@@ -669,18 +660,9 @@ class SerialWorker(QThread):
         return ser
 
     # -- binary (BWIM v2 over COBS) ------------------------------------------------------
-    def _ingest_packets(self, packets, arrival):
-        """Hook for the sequencing layer; returns payloads ready for the GUI."""
-        for pkt in packets:
-            if pkt.version == 1:
-                pkt.frames["frame_ts"] = self._unwrapper.unwrap(pkt.frames["frame_ts"])
-        gap = 0
-        for pkt in packets:
-            gap += self.tracer.observe_wireless(pkt.sequence, len(pkt.frames), 0, arrival) if self.tracer else 0
-        return [build_packet_payload(packets, arrival, "wired_binary", gap)]
-
     def _run_binary(self):
         decoder = UsbFrameDecoder()
+        asm = self._assembler = StreamAssembler()
         pending, last_flush = [], time.monotonic()
         last_command, last_packet = 0.0, 0.0
         while self._running:
@@ -702,12 +684,16 @@ class SerialWorker(QThread):
                     if self.tracer is not None:
                         for _ in range(bad):
                             self.tracer.observe_invalid_packet()
-                    if packets:
+                    for pkt in packets:
                         last_packet = now
-                        pending.extend(self._ingest_packets(packets, now))
+                        if self.tracer is not None:
+                            self.tracer.observe_packet(len(pkt.frames), 0, now)
+                        pending.extend(asm.push(pkt, now))
+                pending.extend(asm.poll(now))
                 if pending and (now - last_flush) >= STREAM_EMIT_INTERVAL_S:
-                    for payload in pending:
-                        self.batch_received.emit(payload)
+                    self.batch_received.emit(segments_to_payload(pending, now, "wired_binary"))
+                    if self.tracer is not None:
+                        self.tracer.sync_assembler(asm.stats())
                     pending, last_flush = [], now
             except Exception as e:
                 if not self._running:
@@ -715,8 +701,11 @@ class SerialWorker(QThread):
                 self._close_serial()
                 self.error_occurred.emit(str(e))
                 break
-        for payload in pending:
-            self.batch_received.emit(payload)
+        pending.extend(asm.flush())
+        if pending:
+            self.batch_received.emit(segments_to_payload(pending, time.monotonic(), "wired_binary"))
+            if self.tracer is not None:
+                self.tracer.sync_assembler(asm.stats())
 
     # -- legacy CSV text -------------------------------------------------------------------
     def _run_csv(self):
@@ -1093,14 +1082,17 @@ class WiFiSerialProvisionProtocol:
 
 
 class WirelessStreamWorker(QThread):
-    """UDP receiver. Its only jobs are to drain the socket quickly and parse packets.
+    """UDP receiver. Its only jobs are to drain the socket quickly and sequence packets.
 
     * A 4 MB kernel receive buffer rides out UI stalls (a UDP datagram that arrives while
       the buffer is full is lost for good, so the buffer is the first line of defence).
     * Runs at time-critical thread priority and does no per-sample Python work: a packet
       is decoded with one numpy view instead of a struct.unpack per frame.
-    * Packets are merged for ~20 ms before being handed to the UI, so the main thread
-      does ~50 updates/s instead of one per datagram. Nothing is discarded or reordered.
+    * A small reorder buffer (5 packets / 50 ms) releases packets in sequence order; lost
+      packets become explicit NaN frames with the correct frame IDs and Valid=0, and late or
+      duplicate packets are counted but never inserted.
+    * Segments are merged for ~20 ms before being handed to the UI, so the main thread
+      does ~50 updates/s instead of one per datagram.
     """
     batch_received = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
@@ -1113,6 +1105,7 @@ class WirelessStreamWorker(QThread):
         self._fallback_packet_sequence = 0
         self.tracer = tracer if tracer is not None else PacketTracer()
         self.stats = self.tracer.stats
+        self.assembler = StreamAssembler()
 
     @staticmethod
     def _frames_to_batch(frames):
@@ -1128,66 +1121,28 @@ class WirelessStreamWorker(QThread):
         return {"batch": batch, "packet_numbers": np.full(batch.shape[0], packet_no, dtype=np.int64),
                 "source": source}
 
-    def _parse_datagram(self, data):
+    def _handle_datagram(self, data, arrival):
+        """Returns (segments, legacy_payload); at most one of them is non-empty."""
         size = len(data)
-        if size == WIRELESS_PACKET_SIZE:
-            magic, version, frame_count, frame_size, packet_sequence = struct.unpack_from(
-                WIFI_PACKET_HEADER_FORMAT, data, 0
-            )
-            if (magic != b"BWIM" or version != 1 or frame_size != WIRELESS_FRAME_SIZE
-                    or frame_count * frame_size != size - WIFI_PACKET_HEADER_SIZE):
-                self.tracer.observe_invalid_packet()
-                return None
-            frames = np.frombuffer(data, dtype=_WIRELESS_FRAME_DTYPE, count=frame_count,
-                                   offset=WIFI_PACKET_HEADER_SIZE)
-            batch = self._frames_to_batch(frames)
-            arrival = time.monotonic()
-            gap = self.tracer.observe_wireless(packet_sequence, frame_count, size, arrival)
-            return {"batch": batch,
-                    "packet_numbers": np.full(frame_count, int(packet_sequence), dtype=np.int64),
-                    "source": "wireless",
-                    "frame_ids": frames["frame_id"].astype(np.int64),
-                    "emg_timestamps": frames["frame_ts"].astype(np.int64),
-                    "imu_ids": frames["imu_id"].astype(np.int64),
-                    "imu_timestamps": frames["imu_ts"].astype(np.int64),
-                    "host_received_monotonic": arrival, "packet_gap": gap}
+        pkt = parse_bwim_packet(data)
+        if pkt is not None:
+            self.tracer.observe_packet(len(pkt.frames), size, arrival)
+            return self.assembler.push(pkt, arrival), None
 
         if size == WIRELESS_FRAME_SIZE * WIRELESS_FRAMES_PER_PACKET:
             frames = np.frombuffer(data, dtype=_WIRELESS_FRAME_DTYPE, count=WIRELESS_FRAMES_PER_PACKET)
-            return self._legacy_payload(frames, "wireless_legacy")
-
+            return [], self._legacy_payload(frames, "wireless_legacy")
         if size == WIRELESS_FRAME_SIZE:
             frames = np.frombuffer(data, dtype=_WIRELESS_FRAME_DTYPE, count=1)
-            return self._legacy_payload(frames, "wireless_single")
+            return [], self._legacy_payload(frames, "wireless_single")
 
         self.tracer.observe_invalid_packet()
-        return None
+        return [], None
 
-    @staticmethod
-    def _merge(payloads):
-        """Concatenate consecutive wireless payloads into one (order preserved)."""
-        if len(payloads) == 1:
-            return payloads[0]
-        merged = {"source": payloads[0]["source"]}
-        for key in ("batch", "packet_numbers", "frame_ids", "emg_timestamps", "imu_ids", "imu_timestamps"):
-            merged[key] = np.concatenate([p[key] for p in payloads], axis=0)
-        merged["host_received_monotonic"] = payloads[-1]["host_received_monotonic"]
-        merged["packet_gap"] = int(sum(int(p.get("packet_gap") or 0) for p in payloads))
-        return merged
-
-    def _flush(self, pending):
-        """Emit pending payloads; legacy/odd payloads are never merged with full packets."""
-        group = []
-        for payload in pending:
-            if payload["source"] != "wireless":
-                if group:
-                    self.batch_received.emit(self._merge(group))
-                    group = []
-                self.batch_received.emit(payload)
-            else:
-                group.append(payload)
-        if group:
-            self.batch_received.emit(self._merge(group))
+    def _emit_segments(self, segments, now):
+        if segments:
+            self.batch_received.emit(segments_to_payload(segments, now, "wireless"))
+        self.tracer.sync_assembler(self.assembler.stats())
 
     def run(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1210,18 +1165,21 @@ class WirelessStreamWorker(QThread):
                 except OSError:
                     break
 
-                if data is not None:
-                    payload = self._parse_datagram(data)
-                    if payload is not None and payload["batch"].size > 0:
-                        pending.append(payload)
-
                 now = time.monotonic()
+                if data is not None:
+                    segments, legacy = self._handle_datagram(data, now)
+                    pending.extend(segments)
+                    if legacy is not None:
+                        self._emit_segments(pending, now); pending = []
+                        self.batch_received.emit(legacy)
+                pending.extend(self.assembler.poll(now))
+
                 if pending and (data is None or (now - last_emit) >= STREAM_EMIT_INTERVAL_S):
-                    self._flush(pending)
+                    self._emit_segments(pending, now)
                     pending = []
                     last_emit = now
-            if pending:
-                self._flush(pending)
+            pending.extend(self.assembler.flush())
+            self._emit_segments(pending, time.monotonic())
         except Exception as exc:
             if self._running:
                 self.error_occurred.emit(f"Wireless stream error: {exc}")
@@ -8690,7 +8648,8 @@ class EMGVisualizer(QMainWindow):
             packet_numbers = np.asarray(payload.get("packet_numbers", []), dtype=np.int64).reshape(-1)
             metadata = {key: payload.get(key) for key in (
                 "source", "frame_ids", "emg_timestamps", "imu_ids", "imu_timestamps",
-                "host_received_monotonic", "packet_gap")}
+                "host_received_monotonic", "packet_gap", "gap_frames", "valid", "late_flags",
+                "imu_fresh", "host_received_s", "device_counters", "restart")}
             return batch, packet_numbers, metadata
 
         batch = np.asarray(payload, dtype=np.float32)
@@ -8708,6 +8667,20 @@ class EMGVisualizer(QMainWindow):
         # Packet gaps are not silently treated as continuous EMG. Require a
         # fresh full model window before classification resumes.
         packet_gap = int(transport_metadata.get("packet_gap") or 0)
+        if int(transport_metadata.get("gap_frames") or 0) > 0:
+            packet_gap = max(packet_gap, 1)
+        valid = transport_metadata.get("valid")
+        if valid is not None and not np.all(valid):
+            # NaN gap rows exist for the recording; the live filters/plots must only see real samples.
+            keep = np.asarray(valid, dtype=bool)
+            batch = batch[keep]
+            if packet_numbers.shape[0] == keep.shape[0]:
+                packet_numbers = packet_numbers[keep]
+            if batch.shape[0] == 0:
+                if packet_gap > 0:
+                    self.rf_valid_sample_count = 0
+                    self.rf_samples_since_submit = 0
+                return
         if packet_gap > 0:
             self.rf_valid_sample_count = 0
             self.rf_samples_since_submit = 0

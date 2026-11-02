@@ -366,6 +366,7 @@ class BwimPacket:
     sequence: int
     frames: np.ndarray
     device_counters: dict = field(default_factory=dict)   # empty for v1
+    arrival: float = float("nan")                          # host time.monotonic() when it was received
 
 
 def parse_bwim_packet(data: bytes) -> Optional[BwimPacket]:
@@ -511,3 +512,227 @@ class TimestampUnwrapper:
         out = self._last_out + np.cumsum(deltas)
         self._last_raw, self._last_out = int(raw[-1]), int(out[-1])
         return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Sequencing: reorder buffer, explicit gaps, late/duplicate accounting
+# ---------------------------------------------------------------------------------------------
+SEQ_MASK = 0xFFFFFFFF
+SEQ_HALF = 0x80000000
+LATE_WINDOW_PACKETS = 1000          # a packet this far behind the stream is a device restart, not a late arrival
+MAX_FILL_FRAMES = 5_000_000         # sanity cap (~2.8 h at 500 Hz) on one NaN-filled gap
+
+
+@dataclass
+class GapSegment:
+    """Frames the device produced but the host never received; filled with NaN, Valid=0."""
+    first_frame_id: int
+    frame_count: int
+    first_sequence: int = -1        # -1 when the missing packets are not identifiable
+    packet_count: int = 0
+
+
+class PacketSequencer:
+    """Releases packets in sequence order and reports what never arrived.
+
+    Out-of-order packets wait up to ``max_pending`` packets or ``max_wait_s`` seconds for the
+    missing predecessors; after that the predecessors are declared lost (a gap). A packet that shows
+    up after its gap was declared is *late*; a repeated one is a *duplicate*. Neither is inserted.
+    Sequence numbers are uint32 and wrap.
+    """
+    def __init__(self, max_pending: int = 5, max_wait_s: float = 0.050) -> None:
+        self.max_pending, self.max_wait_s = int(max_pending), float(max_wait_s)
+        self._next: Optional[int] = None
+        self._pending: dict = {}                       # seq -> (packet, arrival)
+        self._recent: deque = deque(maxlen=256)
+        self._recent_set: set = set()
+        self.received = self.duplicates = self.late = self.missing = self.reordered = self.restarts = 0
+
+    def _remember(self, seq: int) -> None:
+        if len(self._recent) == self._recent.maxlen:
+            self._recent_set.discard(self._recent[0])
+        self._recent.append(seq)
+        self._recent_set.add(seq)
+
+    def _drain(self, out: list) -> None:
+        while self._next in self._pending:
+            pkt, _ = self._pending.pop(self._next)
+            out.append(("packet", pkt)); self._remember(self._next)
+            self._next = (self._next + 1) & SEQ_MASK
+
+    def _advance_over_gap(self, out: list) -> None:
+        nearest = min(self._pending, key=lambda s: (s - self._next) & SEQ_MASK)
+        missing = (nearest - self._next) & SEQ_MASK
+        out.append(("gap", (self._next, missing)))
+        self.missing += missing
+        self._next = nearest
+        self._drain(out)
+
+    def push(self, packet: BwimPacket, now: float) -> list:
+        out: list = []
+        seq = int(packet.sequence) & SEQ_MASK
+        self.received += 1
+        if self._next is None:
+            self._next = seq
+        delta = (seq - self._next) & SEQ_MASK
+        if delta >= SEQ_HALF:                          # behind the release point
+            behind = SEQ_MASK + 1 - delta
+            if seq in self._recent_set:
+                self.duplicates += 1
+            elif behind <= LATE_WINDOW_PACKETS:
+                self.late += 1
+            else:                                      # device rebooted: sequence restarted
+                self.restarts += 1
+                out.extend(self.flush())
+                out.append(("restart", None))
+                self._next = seq
+                self._pending[seq] = (packet, now)
+                self._drain(out)
+            return out
+        if seq in self._pending:
+            self.duplicates += 1
+            return out
+        if delta:
+            self.reordered += 1
+        self._pending[seq] = (packet, now)
+        self._drain(out)
+        while len(self._pending) > self.max_pending:
+            self._advance_over_gap(out)
+        return out
+
+    def poll(self, now: float) -> list:
+        out: list = []
+        while self._pending and now - min(a for _, a in self._pending.values()) >= self.max_wait_s:
+            self._advance_over_gap(out)
+        return out
+
+    def flush(self) -> list:
+        out: list = []
+        while self._pending:
+            self._advance_over_gap(out)
+        return out
+
+
+class StreamAssembler:
+    """PacketSequencer + frame-ID continuity + NaN gap filling, producing ordered segments.
+
+    Segments are ``BwimPacket`` objects or ``GapSegment`` objects, in device order. Gaps are detected
+    both from missing packet sequence numbers and from jumps in the frame ID (the device does not
+    packetise while Wi-Fi is down, so the packet sequence alone would hide that outage).
+    """
+    def __init__(self, max_pending: int = 5, max_wait_s: float = 0.050) -> None:
+        self.sequencer = PacketSequencer(max_pending, max_wait_s)
+        self._unwrapper = TimestampUnwrapper()
+        self._last_frame_id: Optional[int] = None
+        self._seq_gap: Optional[tuple] = None
+        self.gaps: list = []                           # GapSegment history for the quality report
+        self.missing_frames = 0
+        self.device_restarts = 0
+        self.last_counters: dict = {}
+
+    @property
+    def missing_packets(self) -> int:
+        return self.sequencer.missing
+
+    def _consume(self, released: list) -> list:
+        segments: list = []
+        for kind, item in released:
+            if kind == "gap":
+                self._seq_gap = item            # (first missing sequence, packets missing)
+                continue
+            if kind == "restart":
+                self.device_restarts += 1
+                self._last_frame_id = None
+                self._seq_gap = None
+                segments.append(("restart", None))
+                continue
+            pkt = item
+            if pkt.version == 1:
+                pkt.frames["frame_ts"] = self._unwrapper.unwrap(pkt.frames["frame_ts"])
+            first = int(pkt.frames["frame_id"][0])
+            if self._last_frame_id is not None:
+                expected = (self._last_frame_id + 1) & SEQ_MASK
+                jump = (first - expected) & SEQ_MASK
+                if 0 < jump < SEQ_HALF:
+                    seq_first, seq_count = self._seq_gap if self._seq_gap else (-1, 0)
+                    gap = GapSegment(expected, min(jump, MAX_FILL_FRAMES), seq_first, seq_count)
+                    self.gaps.append(gap); self.missing_frames += gap.frame_count
+                    segments.append(gap)
+                elif jump >= SEQ_HALF:                 # frame counter went backwards: device restart
+                    self.device_restarts += 1
+                    segments.append(("restart", None))
+            self._seq_gap = None
+            self._last_frame_id = int(pkt.frames["frame_id"][-1])
+            if pkt.device_counters:
+                self.last_counters = pkt.device_counters
+            segments.append(pkt)
+        return segments
+
+    def push(self, packet: BwimPacket, now: float) -> list:
+        packet.arrival = now
+        return self._consume(self.sequencer.push(packet, now))
+
+    def poll(self, now: float) -> list:
+        return self._consume(self.sequencer.poll(now))
+
+    def flush(self) -> list:
+        return self._consume(self.sequencer.flush())
+
+    def stats(self) -> dict:
+        seq = self.sequencer
+        return {"packets_received": seq.received, "packets_missing": seq.missing, "packets_late": seq.late,
+                "packets_duplicate": seq.duplicates, "packets_reordered": seq.reordered,
+                "frames_missing": self.missing_frames, "device_restarts": self.device_restarts,
+                "device_counters": dict(self.last_counters)}
+
+
+def segments_to_payload(segments: list, arrival: float, source: str) -> dict:
+    """Flatten ordered segments (packets and gaps) into the per-sample arrays the GUI consumes.
+
+    Gap rows are NaN with ``valid == 0``, the correct frame IDs, and no invented timestamps (-1).
+    """
+    cols = {k: [] for k in ("batch", "packet_numbers", "frame_ids", "emg_timestamps", "imu_ids",
+                            "imu_timestamps", "imu_fresh", "late_flags", "valid", "host_received_s")}
+    packet_gap = gap_frames = 0
+    restart, counters = False, {}
+    width = EMG_CHANNELS + IMU_CHANNELS
+    for seg in segments:
+        if isinstance(seg, GapSegment):
+            n = seg.frame_count
+            cols["batch"].append(np.full((n, width), np.nan, dtype=np.float32))
+            ids = (seg.first_frame_id + np.arange(n, dtype=np.int64)) & SEQ_MASK
+            cols["frame_ids"].append(ids)
+            per_packet = n // seg.packet_count if seg.packet_count and n % seg.packet_count == 0 else 0
+            seqs = (np.full(n, -1, dtype=np.int64) if not per_packet else
+                    ((seg.first_sequence + np.arange(n) // per_packet) & SEQ_MASK).astype(np.int64))
+            cols["packet_numbers"].append(seqs)
+            cols["emg_timestamps"].append(np.full(n, -1, dtype=np.int64))
+            cols["imu_ids"].append(np.full(n, -1, dtype=np.int64))
+            cols["imu_timestamps"].append(np.full(n, -1, dtype=np.int64))
+            for key in ("imu_fresh", "late_flags", "valid"):
+                cols[key].append(np.zeros(n, dtype=np.uint8))
+            cols["host_received_s"].append(np.full(n, np.nan, dtype=np.float64))
+            packet_gap += seg.packet_count; gap_frames += n
+        elif isinstance(seg, tuple):
+            restart = True
+        else:
+            f = seg.frames; n = len(f)
+            batch = np.empty((n, width), dtype=np.float32)
+            batch[:, :EMG_CHANNELS] = f["emg"]; batch[:, EMG_CHANNELS:] = f["imu"]
+            cols["batch"].append(batch)
+            cols["packet_numbers"].append(np.full(n, seg.sequence, dtype=np.int64))
+            cols["frame_ids"].append(f["frame_id"].astype(np.int64))
+            cols["emg_timestamps"].append(f["frame_ts"].astype(np.int64))
+            cols["imu_ids"].append(f["imu_id"].astype(np.int64))
+            cols["imu_timestamps"].append(f["imu_ts"].astype(np.int64))
+            cols["imu_fresh"].append(f["fresh"].astype(np.uint8))
+            cols["late_flags"].append((f["flags"] & FRAME_FLAG_LATE).astype(np.uint8))
+            cols["valid"].append(np.ones(n, dtype=np.uint8))
+            cols["host_received_s"].append(np.full(n, seg.arrival, dtype=np.float64))
+            if seg.device_counters:
+                counters = dict(seg.device_counters)
+    payload = {k: (np.concatenate(v) if len(v) > 1 else v[0]) if v else np.zeros((0,) if k != "batch" else (0, width))
+               for k, v in cols.items()}
+    payload.update(source=source, host_received_monotonic=arrival, packet_gap=packet_gap,
+                   gap_frames=gap_frames, device_counters=counters, restart=restart)
+    return payload
