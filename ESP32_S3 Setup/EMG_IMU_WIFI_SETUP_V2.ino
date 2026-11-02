@@ -79,6 +79,12 @@
 #include <freertos/semphr.h>
 #include "SparkFun_BNO08x_Arduino_Library.h"
 
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#error "secrets.h is missing: copy secrets.example.h to secrets.h and set a long random DEVICE_ACCESS_KEY_VALUE."
+#endif
+
 // ---------- NETWORK / CONTROL ----------
 static const uint16_t STREAM_PORT = 5000;
 static const uint16_t CONTROL_PORT = 5001;
@@ -95,8 +101,9 @@ static const unsigned long USB_STREAM_TIMEOUT_MS = 5000;
 static const uint8_t BWIM_VERSION = 2;
 static const char *FW_VERSION = "emg-imu-2.0.0";
 
-// Change this before flashing.
-static const char *DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY";
+// The access key lives in the gitignored secrets.h (see secrets.example.h).
+static const char *DEVICE_ACCESS_KEY = DEVICE_ACCESS_KEY_VALUE;
+
 
 // ---------- EMG ----------
 static const uint8_t EMG_CHANNELS = 8;
@@ -216,6 +223,19 @@ struct __attribute__((packed)) EmgImuPacket {
   PacketHeader header;
   EmgImuFrame frames[EMG_FRAMES_PER_PACKET];
 };
+
+// Compile-time key checks. They sit after the type definitions on purpose: the Arduino
+// prototype generator inserts prototypes before the first function it sees.
+constexpr bool sameText(const char *a, const char *b) {
+  return (*a == *b) && (*a == '\0' || sameText(a + 1, b + 1));
+}
+constexpr size_t textLength(const char *a) {
+  return *a == '\0' ? 0 : 1 + textLength(a + 1);
+}
+static_assert(!sameText(DEVICE_ACCESS_KEY_VALUE, "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"),
+              "DEVICE_ACCESS_KEY_VALUE in secrets.h is still the placeholder: set a long random key before flashing.");
+static_assert(textLength(DEVICE_ACCESS_KEY_VALUE) >= 16,
+              "DEVICE_ACCESS_KEY_VALUE must be at least 16 characters.");
 
 LatestImuState latestImu = {0.0f, 0.0f, 0.0f, 0, 0};
 uint32_t packetSequenceCounter = 0;
