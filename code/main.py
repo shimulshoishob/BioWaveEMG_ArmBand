@@ -89,6 +89,8 @@ from app_theme import (
     themed_label_style,
     themed_status_color,
 )
+from study_meta import (CONSENT_FORM_VERSION, normalize_participant_id, session_folder_name,
+                        valid_participant_id)
 from session_recording import (ContinuousRecorder, EventLog, LABEL_CODES, MIN_VALID_SAMPLE_RATIO, SIGNAL_COLUMNS,
                                finalize_session)
 from emg_v4_core import (StreamAssembler, UsbFrameDecoder, WirelessStats, parse_bwim_packet,
@@ -3599,9 +3601,12 @@ class DataCollectionDialog(QDialog):
         consent_layout.setSpacing(8)
 
         row_contributor = QHBoxLayout()
-        row_contributor.addWidget(QLabel("Contributor:"))
-        self.input_contributor = QLineEdit(str(settings.get("contributor_name", "")))
-        self.input_contributor.setPlaceholderText("Enter contributor name / participant ID")
+        row_contributor.addWidget(QLabel("Participant ID:"))
+        self.input_contributor = QLineEdit(str(settings.get("participant_id", "")))
+        self.input_contributor.setPlaceholderText("S01  (pseudonymous ID - never a name)")
+        self.input_contributor.setMaxLength(4)
+        self.input_contributor.setToolTip("Pseudonymous participant ID: the letter S followed by 2-3 digits (S01, S02, ... S101).\n"
+                                          "Names are never stored in the dataset.")
         row_contributor.addWidget(self.input_contributor, stretch=1)
         self.btn_terms = QPushButton("Study Procedure")
         self.btn_terms.setStyleSheet(themed_button_style("accent"))
@@ -3909,7 +3914,7 @@ class DataCollectionDialog(QDialog):
 
     def settings_payload(self):
         return {
-            "contributor_name": self.input_contributor.text().strip(),
+            "participant_id": normalize_participant_id(self.input_contributor.text()),
             "blood_group": self.combo_blood_group.currentText() if self.combo_blood_group.currentIndex() > 0 else "",
             "height_cm": float(self.spin_height.value()),
             "weight_kg": float(self.spin_weight.value()),
@@ -4026,8 +4031,9 @@ class DataCollectionDialog(QDialog):
         if not self.check_agree_yes.isChecked() or self.check_agree_no.isChecked():
             QMessageBox.warning(self, "Agreement Required", "You must agree to contribute before proceeding.")
             return
-        if not self.input_contributor.text().strip():
-            QMessageBox.warning(self, "Contributor", "Please provide a contributor name.")
+        if not valid_participant_id(self.input_contributor.text()):
+            QMessageBox.warning(self, "Participant ID", "The participant ID must be the letter S followed by 2-3 digits "
+                                "(for example S01). Do not enter a name.")
             return
         # Participant info and room conditions are optional; anything left empty is
         # written to the metadata file as N/A.
@@ -5212,7 +5218,7 @@ class EMGVisualizer(QMainWindow):
 
         self.data_collection_dialog = None
         self.training_dialog = None
-        self.contributor_name = ""
+        self.participant_id = ""
         self.participant_blood_group = ""
         self.participant_height_cm = 0.0
         self.participant_weight_kg = 0.0
@@ -7058,7 +7064,7 @@ class EMGVisualizer(QMainWindow):
 
     def data_collection_settings_payload(self):
         return {
-            "contributor_name": self.contributor_name,
+            "participant_id": self.participant_id,
             "blood_group": self.participant_blood_group,
             "height_cm": float(self.participant_height_cm),
             "weight_kg": float(self.participant_weight_kg),
@@ -7085,7 +7091,7 @@ class EMGVisualizer(QMainWindow):
 
     def update_data_collection_settings(self, settings):
         settings = dict(settings or {})
-        self.contributor_name = str(settings.get("contributor_name", self.contributor_name)).strip()
+        self.participant_id = normalize_participant_id(settings.get("participant_id", self.participant_id))
         self.participant_blood_group = str(settings.get("blood_group", self.participant_blood_group)).strip()
         self.participant_height_cm = float(settings.get("height_cm", self.participant_height_cm) or 0.0)
         self.participant_weight_kg = float(settings.get("weight_kg", self.participant_weight_kg) or 0.0)
@@ -7164,11 +7170,9 @@ class EMGVisualizer(QMainWindow):
 
     def build_auto_record_csv_path(self):
         save_dir = (self.record_save_dir or DATASET_DIR).strip() or DATASET_DIR
-        contributor = self._sanitize_filename_token(self.contributor_name)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        bundle_name = f"{contributor}_{timestamp}"
-        bundle_dir = os.path.join(save_dir, bundle_name)
-        return os.path.join(bundle_dir, f"signals_{bundle_name}.csv")
+        bundle_name = session_folder_name(self.participant_id, self.study_meta["session_day"],
+                                          self.study_meta["hand_order"])
+        return os.path.join(save_dir, bundle_name, f"signals_{bundle_name}.csv")
 
     @staticmethod
     def _resolve_record_output_paths(path):
@@ -7287,7 +7291,7 @@ class EMGVisualizer(QMainWindow):
         snap = self.packet_tracer.snapshot()
         return [
             f"created_at={time.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"contributor={self.contributor_name}",
+            f"participant_id={self.participant_id}",
             f"blood_group={self.participant_blood_group or 'N/A'}",
             f"height_cm={_value_or_na(self.participant_height_cm, '{:.1f}')}",
             f"weight_kg={_value_or_na(self.participant_weight_kg, '{:.1f}')}",
@@ -7300,7 +7304,7 @@ class EMGVisualizer(QMainWindow):
             f"hand_switch_break_s={float(self.study_meta['hand_switch_s']):.0f}",
             f"temp_start_c={_value_or_na(self.study_meta['temp_start_c'], '{:.1f}')}",
             f"humidity_start_pct={_value_or_na(self.study_meta['humidity_start_pct'], '{:.0f}')}",
-            f"agreement={bool(self.contribution_agreed)}",
+            f"consent_form_version={CONSENT_FORM_VERSION if self.contribution_agreed else 'NOT_CONSENTED'}",
             f"labels={','.join(labels)}",
             "label_codes=" + ",".join(f"{name}:{code}" for name, code in sorted(LABEL_CODES.items(), key=lambda kv: kv[1])),
             f"labels_saved={bool(self.task_labels_locked)}",
@@ -7463,8 +7467,8 @@ class EMGVisualizer(QMainWindow):
         if not self.contribution_agreed:
             QMessageBox.warning(self, "Agreement Required", "Open Data Collection and agree to contribute first.")
             return
-        if not self.contributor_name.strip():
-            QMessageBox.warning(self, "Contributor", "Provide contributor name in Data Collection before starting.")
+        if not valid_participant_id(self.participant_id):
+            QMessageBox.warning(self, "Participant ID", "Provide a pseudonymous participant ID (S01, S02, ...) in Data Collection before starting.")
             return
         if not self.task_labels_locked:
             QMessageBox.warning(self, "Task Labels", "Save task labels in Data Collection before starting.")
@@ -9286,7 +9290,7 @@ class EMGVisualizer(QMainWindow):
                 ("Options Info", "This window", "Lists every option with its live value."),
             ]),
             ("Data Collection", [
-                ("Contributor", self.contributor_name or "-", "Participant name / ID; used in the output folder name."),
+                ("Participant ID", self.participant_id or "-", "Pseudonymous ID (S01...); used in the output folder name. Names are never stored."),
                 ("Agreement", "Yes" if self.contribution_agreed else "No", "Consent to take part; required before a session can start."),
                 ("Participant info", f"BG {self.participant_blood_group or 'N/A'}, {_value_or_na(self.participant_height_cm, '{:.1f}')} cm, "
                  f"{_value_or_na(self.participant_weight_kg, '{:.1f}')} kg, age {_value_or_na(self.participant_age_years, '{:d}', cast=int)}",
