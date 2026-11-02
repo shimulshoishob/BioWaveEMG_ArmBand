@@ -89,7 +89,7 @@ from app_theme import (
     themed_label_style,
     themed_status_color,
 )
-from emg_v4_core import WirelessStats
+from emg_v4_core import (WirelessStats, TimestampUnwrapper, UsbFrameDecoder, parse_bwim_packet)
 
 try:
     import pywt  # Optional for wavelet-energy features
@@ -329,7 +329,8 @@ def center_window(window, parent_widget=None):
 
 # --- DEFAULTS ---
 APP_NAME = "BioWave - EMG"
-DEFAULT_BAUD_RATE = 921600
+DEFAULT_BAUD_RATE = 921600   # keep equal to USB_SERIAL_BAUD and the firmware's USB_SERIAL_BAUD
+USB_KEEPALIVE_INTERVAL_S = 2.0
 WINDOW_SIZE = 1000               # Number of samples shown on each channel
 SAMPLE_RATE = 500                # Hz (matching ESP32 sketch)
 PLOT_REFRESH_MS = 33             # ~30 FPS UI refresh (EMG does not need 50 FPS)
@@ -376,7 +377,7 @@ STUDY_ENV_KEYS = ("temp_start_c", "humidity_start_pct")
 DEFAULT_RECORD_CSV = "realtime_collected_emg.csv"
 DEFAULT_RF_MODEL_ARTIFACT = "rf_realtime_model.joblib"
 MIN_RECORD_SAMPLE_RATIO = 0.80
-USB_SERIAL_BAUD = 115200
+USB_SERIAL_BAUD = 921600
 SERIAL_BOOT_WAIT_S = 3.5
 SERIAL_RESPONSE_TIMEOUT_S = 15.0
 WIFI_STREAM_PORT = 5000
@@ -454,6 +455,31 @@ _WIRELESS_FRAME_DTYPE = np.dtype([
     ("fresh", "u1"), ("pad", "V3"),
 ])
 assert _WIRELESS_FRAME_DTYPE.itemsize == WIRELESS_FRAME_SIZE, "wireless frame layout mismatch"
+
+
+def build_packet_payload(packets, arrival, source, packet_gap=0):
+    """Concatenate decoded BwimPackets (in order) into one batch payload for the GUI.
+
+    Every per-sample array has one entry per frame: the recorder relies on frame_ids and the
+    64-bit device timestamps to place labels and to see gaps, so none of them may be dropped.
+    """
+    frames = packets[0].frames if len(packets) == 1 else np.concatenate([p.frames for p in packets])
+    n = len(frames)
+    batch = np.empty((n, WIRELESS_TOTAL_CHANNELS), dtype=np.float32)
+    batch[:, :WIRELESS_EMG_CHANNELS] = frames["emg"]
+    batch[:, WIRELESS_EMG_CHANNELS:] = frames["imu"]
+    sequences = np.repeat(np.array([p.sequence for p in packets], dtype=np.int64),
+                          [len(p.frames) for p in packets])
+    return {"batch": batch, "packet_numbers": sequences, "source": source,
+            "frame_ids": frames["frame_id"].astype(np.int64),
+            "emg_timestamps": frames["frame_ts"].astype(np.int64),
+            "imu_ids": frames["imu_id"].astype(np.int64),
+            "imu_timestamps": frames["imu_ts"].astype(np.int64),
+            "imu_fresh": frames["fresh"].astype(np.uint8),
+            "late_flags": (frames["flags"] & 1).astype(np.uint8),
+            "valid": np.ones(n, dtype=np.uint8),
+            "host_received_monotonic": arrival, "packet_gap": int(packet_gap),
+            "device_counters": dict(packets[-1].device_counters)}
 
 
 class PacketTracer:
@@ -568,12 +594,20 @@ class PacketTracer:
 
 
 class SerialWorker(QThread):
+    """Wired receiver.
+
+    A real COM port carries the same BWIM v2 packets as Wi-Fi, COBS-framed with a CRC-16, so the
+    wired stream has packet sequence numbers, 64-bit device timestamps and all 11 channels. The
+    app sends USBSTART after opening the port (repeated until data flows), USBPING every 2 s as a
+    keepalive and USBSTOP on shutdown. ``socket://`` URLs (the simulator) keep the legacy CSV text.
+    """
     batch_received = pyqtSignal(object)  # dict: batch (n, channels), packet_numbers, source
     error_occurred = pyqtSignal(str)
 
     FLUSH_INTERVAL_S = 0.040
 
-    def __init__(self, port_name, baud_rate, num_channels, batch_size=SERIAL_BATCH_SIZE, tracer=None):
+    def __init__(self, port_name, baud_rate, num_channels, batch_size=SERIAL_BATCH_SIZE, tracer=None,
+                 binary=None):
         super().__init__()
         self.port_name = port_name
         self.baud_rate = baud_rate
@@ -581,9 +615,11 @@ class SerialWorker(QThread):
         self.batch_size = batch_size
         self.tracer = tracer
         self.is_socket_url = str(port_name).strip().lower().startswith("socket://")
+        self.binary = (not self.is_socket_url) if binary is None else bool(binary)
         self._running = True
         self._serial = None
         self._packet_sequence_counter = 0
+        self._unwrapper = TimestampUnwrapper()
 
     def _emit_batch(self, batch):
         arr = np.asarray(batch, dtype=np.float32)
@@ -594,9 +630,15 @@ class SerialWorker(QThread):
         packet_numbers = np.full(arr.shape[0], packet_no, dtype=np.int64)
         self.batch_received.emit({"batch": arr, "packet_numbers": packet_numbers, "source": "serial"})
 
-    def _close_serial(self):
+    def _close_serial(self, send_stop=False):
         try:
             if self._serial and self._serial.is_open:
+                if send_stop and self.binary:
+                    try:
+                        self._serial.write(b"USBSTOP\n")
+                        self._serial.flush()
+                    except Exception:
+                        pass
                 self._serial.close()
         except Exception:
             pass
@@ -604,7 +646,14 @@ class SerialWorker(QThread):
 
     def _open_serial(self):
         # Supports both COM ports (e.g. COM3) and URL handlers (e.g. socket://127.0.0.1:7000).
-        ser = serial.serial_for_url(self.port_name, self.baud_rate, timeout=0.02)
+        ser = serial.serial_for_url(self.port_name, self.baud_rate, timeout=0.02, write_timeout=1.0, do_not_open=True)
+        if self.binary:
+            try:
+                ser.dtr = False   # do not reset the ESP32 when the port opens
+                ser.rts = False
+            except Exception:
+                pass
+        ser.open()
         try:
             ser.set_buffer_size(rx_size=262144)   # Windows only; headroom against UI stalls
         except Exception:
@@ -615,60 +664,115 @@ class SerialWorker(QThread):
             pass
         return ser
 
-    def run(self):
+    # -- binary (BWIM v2 over COBS) ------------------------------------------------------
+    def _ingest_packets(self, packets, arrival):
+        """Hook for the sequencing layer; returns payloads ready for the GUI."""
+        for pkt in packets:
+            if pkt.version == 1:
+                pkt.frames["frame_ts"] = self._unwrapper.unwrap(pkt.frames["frame_ts"])
+        gap = 0
+        for pkt in packets:
+            gap += self.tracer.observe_wireless(pkt.sequence, len(pkt.frames), 0, arrival) if self.tracer else 0
+        return [build_packet_payload(packets, arrival, "wired_binary", gap)]
+
+    def _run_binary(self):
+        decoder = UsbFrameDecoder()
+        pending, last_flush = [], time.monotonic()
+        last_command, last_packet = 0.0, 0.0
+        while self._running:
+            try:
+                if self._serial is None or not self._serial.is_open:
+                    self._serial = self._open_serial()
+                    decoder = UsbFrameDecoder()
+                    last_command = last_packet = 0.0
+                now = time.monotonic()
+                if now - last_command >= USB_KEEPALIVE_INTERVAL_S:
+                    # USBSTART (re)starts the stream until packets flow; USBPING keeps it alive after.
+                    streaming = last_packet and (now - last_packet) < USB_KEEPALIVE_INTERVAL_S
+                    self._serial.write(b"USBPING\n" if streaming else b"USBSTART\n")
+                    last_command = now
+                chunk = self._serial.read(max(1, self._serial.in_waiting))
+                now = time.monotonic()
+                if chunk:
+                    packets, bad = decoder.feed(chunk)
+                    if self.tracer is not None:
+                        for _ in range(bad):
+                            self.tracer.observe_invalid_packet()
+                    if packets:
+                        last_packet = now
+                        pending.extend(self._ingest_packets(packets, now))
+                if pending and (now - last_flush) >= STREAM_EMIT_INTERVAL_S:
+                    for payload in pending:
+                        self.batch_received.emit(payload)
+                    pending, last_flush = [], now
+            except Exception as e:
+                if not self._running:
+                    break
+                self._close_serial()
+                self.error_occurred.emit(str(e))
+                break
+        for payload in pending:
+            self.batch_received.emit(payload)
+
+    # -- legacy CSV text -------------------------------------------------------------------
+    def _run_csv(self):
         nch = int(self.num_channels)
         tail = b""
         batch = []
         last_flush = time.monotonic()
-        try:
-            while self._running:
-                try:
-                    if self._serial is None or not self._serial.is_open:
-                        self._serial = self._open_serial()
-                        tail = b""
-
-                    chunk = self._serial.read(max(1, self._serial.in_waiting))
-                    now = time.monotonic()
-                    if chunk:
-                        lines = (tail + chunk).split(b"\n")
-                        tail = lines.pop()  # Keep incomplete tail for next read.
-                        good = bad = 0
-                        for raw_line in lines:
-                            parts = raw_line.replace(b",", b" ").split()
-                            if not parts:
-                                continue
-                            if len(parts) < nch:
-                                bad += 1
-                                continue
-                            try:
-                                batch.append([float(x) for x in parts[:nch]])
-                                good += 1
-                            except ValueError:
-                                bad += 1
-                        if self.tracer is not None and (good or bad):
-                            self.tracer.observe_serial(good, bad, len(chunk), now)
-
-                    if batch and (len(batch) >= self.batch_size or (now - last_flush) >= self.FLUSH_INTERVAL_S):
-                        self._emit_batch(batch)
-                        batch = []
-                        last_flush = now
-                except Exception as e:
-                    if not self._running:
-                        break
-                    self._close_serial()
+        while self._running:
+            try:
+                if self._serial is None or not self._serial.is_open:
+                    self._serial = self._open_serial()
                     tail = b""
-                    if self.is_socket_url:
-                        # Auto-recover TCP socket disconnects without hard-failing the app.
-                        time.sleep(0.3)
-                        continue
-                    self.error_occurred.emit(str(e))
+
+                chunk = self._serial.read(max(1, self._serial.in_waiting))
+                now = time.monotonic()
+                if chunk:
+                    lines = (tail + chunk).split(b"\n")
+                    tail = lines.pop()  # Keep incomplete tail for next read.
+                    good = bad = 0
+                    for raw_line in lines:
+                        parts = raw_line.replace(b",", b" ").split()
+                        if not parts:
+                            continue
+                        if len(parts) < nch:
+                            bad += 1
+                            continue
+                        try:
+                            batch.append([float(x) for x in parts[:nch]])
+                            good += 1
+                        except ValueError:
+                            bad += 1
+                    if self.tracer is not None and (good or bad):
+                        self.tracer.observe_serial(good, bad, len(chunk), now)
+
+                if batch and (len(batch) >= self.batch_size or (now - last_flush) >= self.FLUSH_INTERVAL_S):
+                    self._emit_batch(batch)
+                    batch = []
+                    last_flush = now
+            except Exception as e:
+                if not self._running:
                     break
+                self._close_serial()
+                tail = b""
+                if self.is_socket_url:
+                    # Auto-recover TCP socket disconnects without hard-failing the app.
+                    time.sleep(0.3)
+                    continue
+                self.error_occurred.emit(str(e))
+                break
+        if batch:
+            self._emit_batch(batch)
 
-            if batch:
-                self._emit_batch(batch)
-
+    def run(self):
+        try:
+            if self.binary:
+                self._run_binary()
+            else:
+                self._run_csv()
         finally:
-            self._close_serial()
+            self._close_serial(send_stop=True)
 
     def stop(self):
         self._running = False
@@ -5180,6 +5284,7 @@ class EMGVisualizer(QMainWindow):
         self._record_live_analysis_prev_enabled = False
         self.record_save_workers = []
         self.connection_medium = "wired"
+        self.wired_binary = False
         self.wired_channel_count = 4
         self.current_port_name = "socket://127.0.0.1:7000"
         self.current_device = None
@@ -5618,14 +5723,18 @@ class EMGVisualizer(QMainWindow):
             f"color: {THEME_COLORS['disabled']}; border-color: {THEME_COLORS['panel']}; }}"
         )
 
+    def layout_has_imu(self):
+        """Wi-Fi and binary USB both deliver the 8 EMG + Roll/Pitch/Yaw layout."""
+        return self.connection_medium == "wireless" or self.wired_binary
+
     def active_emg_channel_count(self):
-        if self.connection_medium == "wireless":
+        if self.layout_has_imu():
             return WIRELESS_EMG_CHANNELS
         return int(self.num_channels)
 
     def channel_display_name(self, index):
         idx = int(index)
-        if self.connection_medium == "wireless" and self.num_channels >= WIRELESS_TOTAL_CHANNELS:
+        if self.layout_has_imu() and self.num_channels >= WIRELESS_TOTAL_CHANNELS:
             if idx == 8:
                 return "ROLL"
             if idx == 9:
@@ -5635,7 +5744,7 @@ class EMGVisualizer(QMainWindow):
         return f"CH {idx + 1}"
 
     def is_wireless_imu_channel(self, index):
-        return self.connection_medium == "wireless" and int(index) >= WIRELESS_EMG_CHANNELS
+        return self.layout_has_imu() and int(index) >= WIRELESS_EMG_CHANNELS
 
     def reset_fps_counters(self):
         self.ui_fps = 0.0
@@ -5807,6 +5916,7 @@ class EMGVisualizer(QMainWindow):
 
         self.live_analysis_enabled = False
         self.connection_medium = "wireless"
+        self.wired_binary = False
         self.current_device = device
         self.wireless_access_key = str(access_key or "").strip()
         self.keepalive_failures = 0
@@ -5977,7 +6087,12 @@ class EMGVisualizer(QMainWindow):
             QMessageBox.warning(self, "No Port", "Please select a valid serial port.")
             return
 
-        self.wired_channel_count = int(max(2, min(9, self.channel_count)))
+        # A real COM port streams the fixed 11-channel BWIM layout; socket:// simulators stream CSV
+        # with a user-chosen 2-11 channels.
+        self.wired_binary = not port_name.lower().startswith("socket://")
+        if self.wired_binary:
+            self.channel_count = WIRELESS_TOTAL_CHANNELS
+        self.wired_channel_count = int(max(2, min(11, self.channel_count)))
         self.channel_count = self.wired_channel_count
         self.reset_runtime_state_for_channels(self.channel_count)
         if self.analysis_window is not None:
@@ -5985,7 +6100,10 @@ class EMGVisualizer(QMainWindow):
             self.analysis_window = None
 
         try:
-            self.packet_tracer.reset("serial", 1)
+            if self.wired_binary:
+                self.packet_tracer.reset("wireless", WIRELESS_FRAMES_PER_PACKET)
+            else:
+                self.packet_tracer.reset("serial", 1)
             self.serial_worker = SerialWorker(port_name, DEFAULT_BAUD_RATE, self.num_channels,
                                               tracer=self.packet_tracer)
             self.serial_worker.batch_received.connect(self.on_serial_batch)
@@ -6223,7 +6341,7 @@ class EMGVisualizer(QMainWindow):
             self.threshold_lines_neg.append(threshold_line_neg)
             self.zero_lines.append(zero_line)
 
-        if self.connection_medium == "wireless" and num_channels >= WIRELESS_TOTAL_CHANNELS:
+        if self.layout_has_imu() and num_channels >= WIRELESS_TOTAL_CHANNELS:
             for i in range(WIRELESS_EMG_CHANNELS):
                 add_emg_plot(i, i, show_bottom=False)
 
@@ -6280,7 +6398,7 @@ class EMGVisualizer(QMainWindow):
         except Exception:
             return
 
-        if self.connection_medium == "wireless" and any(row["kind"] == "imu_combined" for row in self.plot_rows):
+        if self.layout_has_imu() and any(row["kind"] == "imu_combined" for row in self.plot_rows):
             logical_row_count = WIRELESS_TOTAL_CHANNELS
             viewport_height = int(self.plot_widget.viewport().height()) - 8
             if viewport_height <= 0:
@@ -6454,17 +6572,17 @@ class EMGVisualizer(QMainWindow):
                 line.setValue(-threshold)
 
     def apply_channel_count_from_dialog(self, count):
-        if self.connection_medium == "wireless":
+        if self.layout_has_imu():
             QMessageBox.information(
                 self,
-                "Wireless Channel Layout",
-                "Wireless mode uses a fixed 11-channel layout: 8 EMG channels plus Roll, Pitch, and Yaw.",
+                "Fixed Channel Layout",
+                "Wi-Fi and USB (COM port) streaming use a fixed 11-channel layout: 8 EMG channels plus Roll, Pitch, and Yaw.",
             )
             self.channel_count = WIRELESS_TOTAL_CHANNELS
             self.sync_calibration_dialog_state()
             return
 
-        new_count = int(max(2, min(9, count)))
+        new_count = int(max(2, min(11, count)))
         if not (self.is_connected and self.port_config_applied):
             QMessageBox.information(
                 self,
@@ -6498,7 +6616,10 @@ class EMGVisualizer(QMainWindow):
         self.reset_runtime_state_for_channels(self.channel_count)
 
         try:
-            self.packet_tracer.reset("serial", 1)
+            if self.wired_binary:
+                self.packet_tracer.reset("wireless", WIRELESS_FRAMES_PER_PACKET)
+            else:
+                self.packet_tracer.reset("serial", 1)
             self.serial_worker = SerialWorker(port_name, DEFAULT_BAUD_RATE, self.num_channels,
                                               tracer=self.packet_tracer)
             self.serial_worker.batch_received.connect(self.on_serial_batch)
@@ -9235,7 +9356,7 @@ class EMGVisualizer(QMainWindow):
                 ("Channel Calibration", "Done" if self.is_calibrated else "Required",
                  f"Captures REST then FLEX ({self.cal_rest_seconds} s / {self.cal_flex_seconds} s) to set baselines "
                  "and thresholds. Graph, analysis, recording and classification stay locked until it is done."),
-                ("Channels", str(self.num_channels), "Wired: 2-9 channels (set in the calibration dialog). "
+                ("Channels", str(self.num_channels), "Wired CSV simulator: 2-11 channels (set in the calibration dialog); COM port and Wi-Fi: fixed 11. "
                  "Wireless: 8 EMG + 3 IMU channels."),
             ]),
             ("Toolbar", [

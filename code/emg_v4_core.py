@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import struct
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -333,3 +334,180 @@ class SessionRecorder:
                 yield SampleBatch(samples[start:end], data["packet_sequences"][start:end],
                                   data["frame_ids"][start:end], data["emg_timestamps"][start:end],
                                   data["imu_ids"][start:end], data["imu_timestamps"][start:end])
+
+
+# ---------------------------------------------------------------------------------------------
+# BWIM wire format (v1 and v2) and the USB framing (COBS + CRC-16)
+# ---------------------------------------------------------------------------------------------
+BWIM_MAGIC = b"BWIM"
+BWIM_V1_HEADER = struct.Struct("<4sBBHI")                 # magic, version, frames, frame size, sequence
+BWIM_V2_HEADER = struct.Struct("<4sBBHIIIIHH")            # ... + queue drops, overruns, send failures, reconnects, flags
+EMG_CHANNELS = 8
+IMU_CHANNELS = 3
+
+FRAME_DTYPE_V1 = np.dtype([
+    ("frame_id", "<u4"), ("frame_ts", "<u4"), ("imu_id", "<u4"), ("imu_ts", "<u4"),
+    ("emg", "<u2", (EMG_CHANNELS,)), ("imu", "<f4", (IMU_CHANNELS,)), ("fresh", "u1"), ("pad", "V3"),
+])
+FRAME_DTYPE_V2 = np.dtype([
+    ("frame_id", "<u4"), ("frame_ts", "<u8"), ("imu_id", "<u4"), ("imu_ts", "<u8"),
+    ("emg", "<u2", (EMG_CHANNELS,)), ("imu", "<f4", (IMU_CHANNELS,)), ("fresh", "u1"), ("flags", "u1"),
+    ("reserved", "<u2"),
+])
+assert FRAME_DTYPE_V1.itemsize == 48 and FRAME_DTYPE_V2.itemsize == 56
+FRAME_FLAG_LATE = 0x01
+DEVICE_COUNTER_KEYS = ("queue_drops", "acq_overruns", "send_failures", "wifi_reconnects")
+
+
+@dataclass
+class BwimPacket:
+    """One decoded datagram/USB frame. ``frames`` always uses FRAME_DTYPE_V2 (v1 is widened)."""
+    version: int
+    sequence: int
+    frames: np.ndarray
+    device_counters: dict = field(default_factory=dict)   # empty for v1
+
+
+def parse_bwim_packet(data: bytes) -> Optional[BwimPacket]:
+    """Decode a BWIM v1 or v2 packet; ``None`` when it is not a well-formed packet."""
+    size = len(data)
+    if size < BWIM_V1_HEADER.size or data[:4] != BWIM_MAGIC:
+        return None
+    version = data[4]
+    if version == 1:
+        header_size = BWIM_V1_HEADER.size
+        _, _, count, frame_size, sequence = BWIM_V1_HEADER.unpack_from(data, 0)
+        src_dtype, counters = FRAME_DTYPE_V1, {}
+    elif version == 2:
+        header_size = BWIM_V2_HEADER.size
+        if size < header_size:
+            return None
+        _, _, count, frame_size, sequence, drops, overruns, failures, reconnects, _flags = BWIM_V2_HEADER.unpack_from(data, 0)
+        src_dtype = FRAME_DTYPE_V2
+        counters = {"queue_drops": drops, "acq_overruns": overruns,
+                    "send_failures": failures, "wifi_reconnects": reconnects}
+    else:
+        return None
+    if count < 1 or frame_size != src_dtype.itemsize or count * frame_size != size - header_size:
+        return None
+    raw = np.frombuffer(data, dtype=src_dtype, count=count, offset=header_size)
+    if version == 2:
+        frames = raw
+    else:
+        frames = np.zeros(count, dtype=FRAME_DTYPE_V2)
+        for name in ("frame_id", "frame_ts", "imu_id", "imu_ts", "emg", "imu", "fresh"):
+            frames[name] = raw[name]
+    return BwimPacket(version, int(sequence), frames, counters)
+
+
+def crc16_ccitt(data: bytes, crc: int = 0xFFFF) -> int:
+    """CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF), matching the firmware."""
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def cobs_encode(data: bytes) -> bytes:
+    out = bytearray([0])
+    code_index, code = 0, 1
+    for byte in data:
+        if byte == 0:
+            out[code_index] = code
+            code_index, code = len(out), 1
+            out.append(0)
+        else:
+            out.append(byte)
+            code += 1
+            if code == 0xFF:
+                out[code_index] = code
+                code_index, code = len(out), 1
+                out.append(0)
+    out[code_index] = code
+    return bytes(out)
+
+
+def cobs_decode(data: bytes) -> Optional[bytes]:
+    """Inverse of cobs_encode; ``None`` for a malformed block."""
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n:
+        code = data[i]
+        if code == 0:
+            return None
+        end = i + code
+        if end > n:
+            return None
+        out += data[i + 1:end]
+        i = end
+        if code < 0xFF and i < n:
+            out.append(0)
+    return bytes(out)
+
+
+def encode_usb_frame(packet_bytes: bytes) -> bytes:
+    """What the firmware writes for one packet: COBS(packet + CRC16 LE) + 0x00."""
+    return cobs_encode(packet_bytes + struct.pack("<H", crc16_ccitt(packet_bytes))) + b"\x00"
+
+
+class UsbFrameDecoder:
+    """Incremental splitter/decoder for the binary USB stream.
+
+    ``feed`` returns ``(packets, bad)``. ``bad`` counts frames that failed COBS/CRC/format checks;
+    plain text lines (boot messages, replies to INFO) are recognised and ignored, not counted.
+    """
+    MAX_FRAME_BYTES = 2048
+
+    def __init__(self) -> None:
+        self._tail = bytearray()
+        self._overflow = False
+
+    def feed(self, chunk: bytes):
+        packets, bad = [], 0
+        parts = bytes(chunk).split(b"\x00")
+        parts[0] = bytes(self._tail) + parts[0]
+        self._tail = bytearray(parts.pop())
+        if len(self._tail) > self.MAX_FRAME_BYTES:
+            self._tail.clear()
+            bad += 1
+        for frame in parts:
+            if not frame:
+                continue
+            decoded = cobs_decode(frame) if len(frame) <= self.MAX_FRAME_BYTES else None
+            if decoded is not None and len(decoded) > 2:
+                body, crc = decoded[:-2], struct.unpack("<H", decoded[-2:])[0]
+                if crc == crc16_ccitt(body):
+                    parsed = parse_bwim_packet(body)
+                    if parsed is not None:
+                        packets.append(parsed)
+                        continue
+            if self._looks_like_text(frame):
+                continue
+            bad += 1
+        return packets, bad
+
+    @staticmethod
+    def _looks_like_text(frame: bytes) -> bool:
+        stripped = frame.strip()
+        return bool(stripped) and b"|" in stripped and all(32 <= b < 127 or b in (9, 10, 13) for b in stripped)
+
+
+class TimestampUnwrapper:
+    """Turns wrapping uint32 microsecond counters (BWIM v1) into a monotonic int64."""
+    def __init__(self, bits: int = 32) -> None:
+        self._span = 1 << bits
+        self._last_raw: Optional[int] = None
+        self._last_out = 0
+
+    def unwrap(self, values) -> np.ndarray:
+        raw = np.asarray(values, dtype=np.int64).reshape(-1)
+        if raw.size == 0:
+            return raw
+        if self._last_raw is None:
+            self._last_raw, self._last_out = int(raw[0]), int(raw[0])
+        deltas = np.diff(np.concatenate(([self._last_raw], raw)))
+        deltas = (deltas + self._span // 2) % self._span - self._span // 2   # shortest signed step
+        out = self._last_out + np.cumsum(deltas)
+        self._last_raw, self._last_out = int(raw[-1]), int(out[-1])
+        return out
