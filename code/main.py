@@ -89,6 +89,8 @@ from app_theme import (
     themed_label_style,
     themed_status_color,
 )
+from session_recording import (ContinuousRecorder, EventLog, MIN_VALID_SAMPLE_RATIO, SIGNAL_COLUMNS,
+                               finalize_session)
 from emg_v4_core import (StreamAssembler, UsbFrameDecoder, WirelessStats, parse_bwim_packet,
                          segments_to_payload)
 
@@ -377,7 +379,7 @@ DEFAULT_HAND_SWITCH_BREAK_S = 300   # ~5 min when the armband moves to the other
 STUDY_ENV_KEYS = ("temp_start_c", "humidity_start_pct")
 DEFAULT_RECORD_CSV = "realtime_collected_emg.csv"
 DEFAULT_RF_MODEL_ARTIFACT = "rf_realtime_model.joblib"
-MIN_RECORD_SAMPLE_RATIO = 0.80
+MIN_RECORD_SAMPLE_RATIO = MIN_VALID_SAMPLE_RATIO   # 0.98 of expected frames must be valid
 USB_SERIAL_BAUD = 921600
 SERIAL_BOOT_WAIT_S = 3.5
 SERIAL_RESPONSE_TIMEOUT_S = 15.0
@@ -1526,16 +1528,6 @@ class WirelessConfigDialog(QDialog):
             self.status_label.setStyleSheet(themed_label_style("muted"))
 
 
-@dataclass
-class TimedRecordBatch:
-    timestamps_ms: np.ndarray
-    packet_numbers: np.ndarray
-    trial_id: int
-    label: str
-    data: np.ndarray
-    hand: str = ""
-
-
 class RFRealtimeInferenceWorker(QThread):
     prediction_ready = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
@@ -1677,79 +1669,38 @@ class RFRealtimeInferenceWorker(QThread):
                 self.error_occurred.emit(str(e))
 
 
-class RecordedCsvSaveWorker(QThread):
+class SessionFinalizeWorker(QThread):
+    """Drains the recorder, then writes signals_/events_/quality_ files and the metadata text.
+
+    Runs off the GUI thread: a checkpoint (``close_recorder=False``) happens at every break, the
+    final pass (``close_recorder=True``) when the protocol ends or is cancelled.
+    """
     save_completed = pyqtSignal(object)
 
-    def __init__(self, batches, data_csv_path, metadata_path, metadata_lines, parent=None):
+    def __init__(self, recorder, events, out_dir, session, fs, transport, keepalive_restarts, host_origin_s,
+                 metadata_path, metadata_builder, close_recorder, parent=None):
         super().__init__(parent)
-        self._batches = list(batches or [])
-        self._data_csv_path = str(data_csv_path or "")
-        self._metadata_path = str(metadata_path or "")
-        self._metadata_lines = list(metadata_lines or [])
+        self._args = (recorder, events, out_dir, session, fs, transport, keepalive_restarts, host_origin_s)
+        self._metadata_path, self._metadata_builder, self._close = metadata_path, metadata_builder, bool(close_recorder)
 
     def run(self):
+        recorder, events, out_dir, session, fs, transport, restarts, origin = self._args
         try:
-            os.makedirs(os.path.dirname(self._data_csv_path) or ".", exist_ok=True)
-            header = ["Timestamp_ms", "Packet_Number", "Trial_ID"] + [
-                f"Ch{i}" for i in range(1, WIRELESS_TOTAL_CHANNELS + 1)
-            ] + ["Label", "Hand"]
-            with open(self._data_csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                for batch in self._batches:
-                    data = np.asarray(batch.data, dtype=np.float32)
-                    if data.ndim != 2 or data.shape[0] <= 0:
-                        continue
-                    ts = np.asarray(batch.timestamps_ms, dtype=np.float64).reshape(-1)
-                    packets = np.asarray(batch.packet_numbers, dtype=np.int64).reshape(-1)
-                    n_rows = data.shape[0]
-                    n_cols = int(min(WIRELESS_TOTAL_CHANNELS, data.shape[1]))
-                    trial_id = int(batch.trial_id)
-                    label = str(batch.label)
-                    hand = str(getattr(batch, "hand", "") or "")
-                    pad = [""] * (WIRELESS_TOTAL_CHANNELS - n_cols)
-                    # Convert whole arrays to Python scalars once (C-level) instead of boxing
-                    # each numpy scalar per cell, then bulk-write. Same output, much faster.
-                    ts_list = ts.tolist()
-                    pk_list = packets.tolist()
-                    data_list = data[:, :n_cols].tolist()
-                    n_ts = len(ts_list)
-                    n_pk = len(pk_list)
-                    rows = []
-                    for idx in range(n_rows):
-                        row = [
-                            ts_list[idx] if idx < n_ts else 0.0,
-                            pk_list[idx] if idx < n_pk else -1,
-                            trial_id,
-                        ]
-                        row.extend(data_list[idx])
-                        if pad:
-                            row.extend(pad)
-                        row.append(label)
-                        row.append(hand)
-                        rows.append(row)
-                    writer.writerows(rows)
-
-            os.makedirs(os.path.dirname(self._metadata_path) or ".", exist_ok=True)
-            with open(self._metadata_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(self._metadata_lines) + "\n")
-
-            self.save_completed.emit(
-                {
-                    "ok": True,
-                    "data_csv_path": self._data_csv_path,
-                    "metadata_path": self._metadata_path,
-                }
-            )
+            rows = recorder.close() if self._close else recorder.checkpoint()
+            if recorder.error:
+                raise RuntimeError(f"recorder writer failed: {recorder.error}")
+            stats = {"valid_rows": recorder.valid_rows, "clip_counts": recorder.clip_counts.copy(),
+                     "device_counters": dict(recorder.device_counters), "late_rows": recorder.late_rows}
+            result = finalize_session(recorder.raw_path, rows, events, recorder.arrival_index(), out_dir, session,
+                                      fs=fs, transport=transport, recorder_stats=stats,
+                                      keepalive_restarts=restarts, host_origin_s=origin)
+            with open(self._metadata_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(self._metadata_builder(rows, result["quality"])) + "\n")
+            self.save_completed.emit({"ok": True, "data_csv_path": result["signals_path"],
+                                      "metadata_path": self._metadata_path, "quality": result["quality"],
+                                      "events_path": result["events_path"], "quality_path": result["quality_path"]})
         except Exception as e:
-            self.save_completed.emit(
-                {
-                    "ok": False,
-                    "data_csv_path": self._data_csv_path,
-                    "metadata_path": self._metadata_path,
-                    "error": str(e),
-                }
-            )
+            self.save_completed.emit({"ok": False, "error": str(e)})
 
 
 class RFTrainingWorker(QThread):
@@ -2171,7 +2122,7 @@ def plan_summary(settings):
 class TaskProtocolWidget(QWidget):
     start_clicked = pyqtSignal()
     # label, trial_id, phase_name, record_enabled, hand
-    phase_started = pyqtSignal(str, int, str, bool, str)
+    phase_started = pyqtSignal(str, int, str, bool, str, int, int, int)   # label, trial, phase, record, hand, block, cycle, planned ms
     protocol_finished = pyqtSignal()
     protocol_canceled = pyqtSignal()
     paused_changed = pyqtSignal(bool)
@@ -2521,14 +2472,20 @@ class TaskProtocolWidget(QWidget):
         self._update_countdown_labels(self.remaining_ms)
         self.progress.setValue(0)
 
+        self._emit_phase_started(st, int(st["duration_ms"]))
+        self.timer.start(50 if not is_break else 200)
+
+    def _emit_phase_started(self, st, planned_ms):
         self.phase_started.emit(
             str(st["label"]),
             int(st["trial_id"]),
             str(st["phase"]),
             bool(st["record"]),
             str(st["hand"]),
+            int(st["block"]),
+            int(st["cycle_no"]),
+            int(planned_ms),
         )
-        self.timer.start(50 if not is_break else 200)
 
     def toggle_pause(self):
         if self.paused:
@@ -2564,6 +2521,7 @@ class TaskProtocolWidget(QWidget):
                 self.phase_box.set_state(self._pause_saved[2])
             self.btn_skip_break.setEnabled(True)
             self.paused_changed.emit(False)
+            self._emit_phase_started(st, self._pause_remaining_ms)   # the break label resumes at this sample
             self.timer.start(200)
             return
         # Mid-cycle: restart the cycle from its Prepare step so every recorded trial is complete.
@@ -3583,7 +3541,7 @@ def _section_title(text, hint=""):
 class DataCollectionDialog(QDialog):
     start_requested = pyqtSignal(dict)
     settings_changed = pyqtSignal(dict)
-    protocol_phase_started = pyqtSignal(str, int, str, bool, str)
+    protocol_phase_started = pyqtSignal(str, int, str, bool, str, int, int, int)
     protocol_finished = pyqtSignal()
     protocol_canceled = pyqtSignal()
     protocol_paused = pyqtSignal(bool)
@@ -4117,8 +4075,8 @@ class DataCollectionDialog(QDialog):
         if hasattr(self, "protocol_opacity") and self.protocol_opacity is not None:
             self.protocol_opacity.setOpacity(0.42 if dimmed else 1.0)
 
-    def _on_protocol_phase_started(self, label, trial_id, phase_name, record_enabled, hand):
-        self.protocol_phase_started.emit(label, trial_id, phase_name, record_enabled, hand)
+    def _on_protocol_phase_started(self, label, trial_id, phase_name, record_enabled, hand, block, cycle_no, planned_ms):
+        self.protocol_phase_started.emit(label, trial_id, phase_name, record_enabled, hand, block, cycle_no, planned_ms)
 
     def _on_protocol_finished(self):
         self.protocol_running = False
@@ -5267,11 +5225,20 @@ class EMGVisualizer(QMainWindow):
             "hand_switch_s": float(DEFAULT_HAND_SWITCH_BREAK_S),
             **{key: 0.0 for key in STUDY_ENV_KEYS},
         }
-        self.timed_record_hand = ""
         self.record_missing_packets = 0
         self.record_gap_events = 0
         self._session_csv_path = ""
-        self._cycle_batch_start = 0
+        # Continuous session recording (see session_recording.py)
+        self.session_recorder = None
+        self.session_events = None
+        self._session_name = ""
+        self._session_dir = ""
+        self._session_total_ms = 0
+        self._session_host_origin = 0.0
+        self._session_start_utc = ""
+        self._cycle_event_start = 0
+        self._last_session_rows = 0
+        self._last_session_quality = None
         self.contribution_agreed = False
         self.task_labels = [x.strip() for x in DEFAULT_TASK_LABELS.split(",") if x.strip()]
         self.task_labels_locked = False
@@ -5284,13 +5251,6 @@ class EMGVisualizer(QMainWindow):
         self.task_settle_s = float(DEFAULT_TASK_SETTLE_S)
         self.task_randomize_order = True
         self.task_session_active = False
-        self.timed_record_enabled = False
-        self.timed_record_label = ""
-        self.timed_record_trial_id = 0
-        self.timed_record_phase = ""
-        self.recorded_batches = []
-        self._recorded_total_samples = 0
-        self.record_start_unix = 0.0
         self.record_save_dir = DATASET_DIR
         self.last_recorded_csv_path = os.path.join(DATASET_DIR, DEFAULT_RECORD_CSV)
         self._record_graph_stream_prev_checked = True
@@ -6209,9 +6169,6 @@ class EMGVisualizer(QMainWindow):
             self.data_collection_dialog.cancel_task_protocol(emit_signal=True)
         self._set_task_collection_mode(False)
         self.live_analysis_enabled = False
-        self.timed_record_label = ""
-        self.timed_record_phase = ""
-        self.timed_record_trial_id = 0
 
         self.is_connected = False
         self.is_calibrated = False
@@ -7209,7 +7166,7 @@ class EMGVisualizer(QMainWindow):
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         bundle_name = f"{contributor}_{timestamp}"
         bundle_dir = os.path.join(save_dir, bundle_name)
-        return os.path.join(bundle_dir, f"emg_data_{bundle_name}.csv")
+        return os.path.join(bundle_dir, f"signals_{bundle_name}.csv")
 
     @staticmethod
     def _resolve_record_output_paths(path):
@@ -7219,7 +7176,9 @@ class EMGVisualizer(QMainWindow):
 
         base_dir = os.path.dirname(target_path) or "."
         stem = os.path.splitext(os.path.basename(target_path))[0].strip()
-        if stem.startswith("emg_data_"):
+        if stem.startswith("signals_"):
+            bundle_name = stem[len("signals_"):].strip()
+        elif stem.startswith("emg_data_"):
             bundle_name = stem[len("emg_data_"):].strip()
         elif stem.startswith("metadata_"):
             bundle_name = stem[len("metadata_"):].strip()
@@ -7234,7 +7193,7 @@ class EMGVisualizer(QMainWindow):
             bundle_dir = os.path.join(base_dir, bundle_name)
             root_dir = base_dir
 
-        data_csv_path = os.path.join(bundle_dir, f"emg_data_{bundle_name}.csv")
+        data_csv_path = os.path.join(bundle_dir, f"signals_{bundle_name}.csv")
         metadata_path = os.path.join(bundle_dir, f"metadata_{bundle_name}.txt")
         return data_csv_path, metadata_path, root_dir
 
@@ -7308,18 +7267,12 @@ class EMGVisualizer(QMainWindow):
                 raise ValueError("CSV must contain channel columns (Ch1..ChN)")
             return int(len(channel_cols))
 
-    def recorded_sample_count(self, batches=None):
-        total = 0
-        for batch in list(self.recorded_batches if batches is None else batches):
-            try:
-                data = np.asarray(batch.data)
-            except Exception:
-                data = np.asarray([])
-            if data.ndim == 2:
-                total += int(data.shape[0])
-        return int(total)
+    def recorded_sample_count(self):
+        """Frames written so far by the continuous recorder (valid and gap frames)."""
+        rec = self.session_recorder
+        return int(rec.rows) if rec is not None else int(self._last_session_rows)
 
-    def build_recorded_metadata_lines(self, data_csv_path, root_dir, sample_count):
+    def build_recorded_metadata_lines(self, data_csv_path, root_dir, sample_count, quality=None):
         labels = [str(x).strip() for x in self.task_labels if str(x).strip()]
         root_abs = os.path.abspath(root_dir or ".")
         data_abs = os.path.abspath(data_csv_path)
@@ -7327,7 +7280,8 @@ class EMGVisualizer(QMainWindow):
             data_rel = os.path.relpath(data_abs, root_abs).replace("\\", "/")
         except ValueError:
             data_rel = os.path.basename(data_csv_path)
-        sample_eval = self.evaluate_recording_sample_coverage(int(sample_count))
+        valid_count = int((quality or {}).get("rows_valid", sample_count))
+        sample_eval = self.evaluate_recording_sample_coverage(valid_count)
         snap = self.packet_tracer.snapshot()
         return [
             f"created_at={time.strftime('%Y-%m-%d %H:%M:%S')}",
@@ -7370,7 +7324,11 @@ class EMGVisualizer(QMainWindow):
             f"packet_loss_pct={snap['loss_pct']:.3f}",
             f"max_packet_gap_ms={snap['max_gap_ms']:.1f}",
             f"csv_signal_mode=raw",
-            f"csv_columns=Timestamp_ms,Packet_Number,Trial_ID,{','.join(self._record_channel_columns())},Label,Hand",
+            f"csv_columns={','.join(SIGNAL_COLUMNS)}",
+            f"num_valid_samples={valid_count}",
+            f"events_file=events_{os.path.basename(os.path.dirname(data_csv_path))}.csv",
+            f"quality_file=quality_{os.path.basename(os.path.dirname(data_csv_path))}.json",
+            f"session_start_utc={self._session_start_utc}",
             f"data_file={os.path.basename(data_csv_path)}",
             f"data_path={data_rel}",
         ]
@@ -7404,7 +7362,6 @@ class EMGVisualizer(QMainWindow):
 
         was_active = self.task_session_active
         self.task_session_active = False
-        self.timed_record_enabled = False
         self.rf_samples_since_submit = 0
         if was_active:
             self.check_graph_stream.setChecked(bool(self._record_graph_stream_prev_checked))
@@ -7431,8 +7388,9 @@ class EMGVisualizer(QMainWindow):
                 self.set_status(f"Break checkpoint could not be saved: {payload.get('error', 'unknown error')}", "#f57c00")
             return
         if not payload.get("ok", False):
-            self.set_status("Task finished but CSV save failed.", "#f44336")
-            QMessageBox.warning(self, "CSV Save", f"Task finished but CSV save failed:\n{payload.get('error', 'Unknown error')}")
+            self.set_status("Task finished but the recording could not be finalised.", "#f44336")
+            QMessageBox.warning(self, "Recording Save", f"The recording could not be finalised:\n{payload.get('error', 'Unknown error')}\n\n"
+                                "The raw frames were still written to disk (raw_*.bin in the session folder).")
             return
 
         data_csv_path = str(payload.get("data_csv_path", "")).strip()
@@ -7440,62 +7398,51 @@ class EMGVisualizer(QMainWindow):
         self.record_save_dir = str(context.get("root_dir", self.record_save_dir) or self.record_save_dir)
         if self.data_collection_dialog and self.data_collection_dialog.isVisible():
             self.data_collection_dialog.set_csv_dir(self.record_save_dir)
-
         if context.get("show_saved_dialog"):
-            QMessageBox.information(self, "Saved", f"Recorded CSV saved:\n{data_csv_path}")
+            QMessageBox.information(self, "Saved", f"Recording saved:\\n{data_csv_path}")
 
-        sample_eval = context.get("sample_eval")
-        if not isinstance(sample_eval, dict):
-            self.set_status("Recorded CSV saved.", "#2e7d32")
-            return
-
-        summary = (
-            f"Data collection session complete | "
-            f"Samples: {sample_eval['actual_samples']}/{sample_eval['expected_samples']} "
-            f"({sample_eval['sample_ratio_pct']:.1f}%) | "
-            f"Est. rate: {sample_eval['effective_hz']:.1f} Hz"
-        )
-        if sample_eval.get("below_threshold", False):
+        quality = payload.get("quality") or {}
+        self._last_session_quality = quality
+        ratio = float(quality.get("valid_sample_ratio", 0.0))
+        summary = (f"Data collection session complete | Frames: {quality.get('rows_valid', 0):,} valid of "
+                   f"{quality.get('rows_total', 0):,} ({100 * ratio:.2f}% valid) | "
+                   f"Packets missing: {quality.get('transport', {}).get('packets_missing', 0):,}")
+        if not quality.get("meets_valid_sample_threshold", False):
             self.set_status(summary, "#f57c00")
             QMessageBox.warning(
-                self,
-                "Low Effective Sampling",
-                (
-                    "Recorded sample count is lower than expected.\n\n"
-                    f"Expected samples: {sample_eval['expected_samples']}\n"
-                    f"Actual samples: {sample_eval['actual_samples']}\n"
-                    f"Coverage: {sample_eval['sample_ratio_pct']:.1f}%\n"
-                    f"Estimated effective rate: {sample_eval['effective_hz']:.1f} Hz\n"
-                    f"Configured rate: {int(SAMPLE_RATE)} Hz\n\n"
-                    "This can reduce training windows and model quality."
-                ),
-            )
+                self, "Low Valid-Sample Ratio",
+                (f"Only {100 * ratio:.2f}% of the recorded frames are valid; the minimum for a usable session is "
+                 f"{100 * MIN_RECORD_SAMPLE_RATIO:.0f}%.\\n\\nMissing frames are kept as explicit Valid=0 rows. "
+                 f"Gaps: {len(quality.get('gaps', []))}. See quality_*.json next to the signal file.\\n\\n"
+                 "Consider re-recording this session."))
         else:
             self.set_status(summary, "#2e7d32")
 
-    def queue_recorded_csv_save(self, path, batches=None, sample_eval=None, show_saved_dialog=False,
-                                checkpoint=False):
-        batches_to_save = list(self.recorded_batches if batches is None else batches)
-        if self.recorded_sample_count(batches_to_save) <= 0:
-            raise ValueError("No recorded samples available.")
+    def _transport_summary(self):
+        snap = self.packet_tracer.snapshot()
+        return {"kind": snap["kind"], "packets_received": snap["received"], "packets_missing": snap["missing"],
+                "packets_late": snap.get("late", 0), "packets_duplicate": snap.get("duplicate", 0),
+                "packets_out_of_order": snap["out_of_order"], "packets_invalid": snap["invalid"],
+                "frames_missing": snap.get("frames_missing", 0), "loss_pct_packets": snap["loss_pct"],
+                "max_packet_gap_ms": snap["max_gap_ms"], "jitter_ms": snap["jitter_ms"]}
 
-        data_csv_path, metadata_path, root_dir = self._resolve_record_output_paths(path)
-        metadata_lines = self.build_recorded_metadata_lines(
-            data_csv_path,
-            root_dir,
-            self.recorded_sample_count(batches_to_save),
-        )
-        worker = RecordedCsvSaveWorker(batches_to_save, data_csv_path, metadata_path, metadata_lines, self)
-        context = {
-            "root_dir": root_dir,
-            "sample_eval": sample_eval,
-            "show_saved_dialog": bool(show_saved_dialog),
-            "checkpoint": bool(checkpoint),
-        }
-        worker.save_completed.connect(
-            lambda result, w=worker, ctx=context: self._on_record_save_completed(w, ctx, result)
-        )
+    def queue_session_finalize(self, close_recorder, checkpoint=False, show_saved_dialog=False):
+        """Hand the recorder to a background worker that writes the labelled files."""
+        rec = self.session_recorder
+        if rec is None or self.session_events is None:
+            raise ValueError("No recording session is active.")
+        data_csv_path, metadata_path, root_dir = self._resolve_record_output_paths(self._session_csv_path)
+        events = [dict(e) for e in self.session_events.events]
+        builder = lambda rows, quality, d=data_csv_path, r=root_dir: self.build_recorded_metadata_lines(d, r, rows, quality)
+        worker = SessionFinalizeWorker(
+            rec, events, self._session_dir, self._session_name, SAMPLE_RATE, self._transport_summary(),
+            list(self.keepalive_restarts), self._session_host_origin, metadata_path, builder, close_recorder, self)
+        context = {"root_dir": root_dir, "checkpoint": bool(checkpoint), "show_saved_dialog": bool(show_saved_dialog)}
+        worker.save_completed.connect(lambda result, w=worker, ctx=context: self._on_record_save_completed(w, ctx, result))
         self.record_save_workers.append(worker)
+        if close_recorder:
+            self._last_session_rows = int(rec.rows)
+            self.session_recorder = None       # nothing more is appended; the worker drains and closes it
         worker.start(QThread.LowPriority)
         return data_csv_path, metadata_path
 
@@ -7525,17 +7472,25 @@ class EMGVisualizer(QMainWindow):
             QMessageBox.warning(self, "Task Labels", "Provide at least one gesture label.")
             return
 
-        self.recorded_batches = []
-        self._recorded_total_samples = 0
-        self.record_start_unix = time.time()
-        self.timed_record_enabled = False
-        self.timed_record_label = ""
-        self.timed_record_phase = ""
-        self.timed_record_trial_id = 0
-        self.timed_record_hand = ""
+        self._session_csv_path = self.build_auto_record_csv_path()
+        data_csv_path, _metadata_path, _root = self._resolve_record_output_paths(self._session_csv_path)
+        self._session_dir = os.path.dirname(data_csv_path)
+        self._session_name = os.path.basename(self._session_dir)
+        try:
+            self.session_recorder = ContinuousRecorder(
+                os.path.join(self._session_dir, f"raw_{self._session_name}.bin"), SAMPLE_RATE)
+        except OSError as exc:
+            QMessageBox.warning(self, "Recording", f"Cannot create the session files:\\n{exc}")
+            return
+        self.session_events = EventLog()
+        self._last_session_rows = 0
+        self._last_session_quality = None
+        self._cycle_event_start = 0
         self.record_missing_packets = 0
         self.record_gap_events = 0
-        self._session_csv_path = self.build_auto_record_csv_path()
+        self.keepalive_restarts = []
+        self._session_host_origin = time.monotonic()                 # all host times are monotonic
+        self._session_start_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())   # metadata only
 
         started = self.data_collection_dialog.start_task_protocol(
             labels=labels,
@@ -7553,210 +7508,99 @@ class EMGVisualizer(QMainWindow):
             hand_switch_s=self.study_meta["hand_switch_s"],
         )
         if not started:
+            rec, self.session_recorder, self.session_events = self.session_recorder, None, None
+            rec.close()
             QMessageBox.warning(self, "Task Timer", "Unable to start task session.")
             return
+        self._session_total_ms = int(self.data_collection_dialog.task_protocol.session_total_ms)
         self._set_task_collection_mode(True)
-        self.set_status("Task Timer: session started | live graph paused for stable capture", "#00897b")
+        self.set_status("Task Timer: session started | recording every frame continuously", "#00897b")
 
-    def on_task_phase_started(self, label, trial_id, phase_name, record_enabled, hand=""):
-        self.timed_record_label = str(label)
-        self.timed_record_trial_id = int(trial_id)
-        self.timed_record_phase = str(phase_name)
-        self.timed_record_hand = str(hand)
-        self.timed_record_enabled = bool(record_enabled)
-        if str(phase_name).strip().lower() == "prepare":
-            self._cycle_batch_start = len(self.recorded_batches)
+    def on_task_phase_started(self, label, trial_id, phase_name, record_enabled, hand="", block=0, cycle_no=0, planned_ms=0):
+        if self.session_events is not None:
+            idx = self.session_events.add(phase_name, label, hand, trial_id, block, cycle_no, time.monotonic(), planned_ms)
+            if str(phase_name).strip().lower() == "prepare":
+                self._cycle_event_start = idx
         if str(phase_name).strip().lower() in ("break", "switch hand") and self.recorded_sample_count() > 0:
             # Protect the data collected so far: a 60-minute session should not hinge on one final save.
             try:
-                self.queue_recorded_csv_save(
-                    self._session_csv_path or self.build_auto_record_csv_path(), checkpoint=True)
+                self.queue_session_finalize(close_recorder=False, checkpoint=True)
             except Exception:
                 pass
-        mode = "RECORDING" if self.timed_record_enabled else "GUIDE"
         self.set_status(
-            f"Task Timer: {hand} hand | Trial {trial_id} | {phase_name} | Label={label} | {mode}",
-            "#00897b" if self.timed_record_enabled else "#607d8b",
+            f"Task Timer: {hand} hand | Trial {trial_id} | {phase_name} | Label={label} | RECORDING",
+            "#00897b",
         )
 
     def on_task_protocol_finished(self):
         self._set_task_collection_mode(False)
-        self.timed_record_label = ""
-        self.timed_record_phase = ""
-        self.timed_record_trial_id = 0
-        self.timed_record_hand = ""
+        if self.session_events is not None:
+            self.session_events.add("end", "end", "", 0, 0, 0, time.monotonic(), 0)
         self.refresh_csv_counter()
-
-        sample_count = self.recorded_sample_count()
-        sample_eval = self.evaluate_recording_sample_coverage(sample_count)
-        save_path = self._session_csv_path or self.build_auto_record_csv_path()
         for worker in list(self.record_save_workers):
             worker.wait()   # let an in-flight break checkpoint finish before the final write
         try:
-            self.queue_recorded_csv_save(save_path, sample_eval=sample_eval)
-            self.set_status("Task complete - saving CSV in background...", "#00897b")
+            self.queue_session_finalize(close_recorder=True)
+            self.set_status("Task complete - writing signals, events and quality report in background...", "#00897b")
         except Exception as e:
-            QMessageBox.warning(self, "CSV Save", f"Task finished but CSV save failed:\n{e}")
+            QMessageBox.warning(self, "Recording Save", f"Task finished but saving failed:\\n{e}")
 
     def on_task_protocol_paused(self, paused):
         if paused:
-            self.timed_record_enabled = False
-            self.set_status("Task Timer: PAUSED - recording stopped", "#f57c00")
+            if self.session_events is not None:
+                last = self.session_events.events[-1] if len(self.session_events) else None
+                self.session_events.add("paused", "paused", last["hand"] if last else "", last["trial_id"] if last else 0,
+                                        last["block"] if last else 0, last["cycle_no"] if last else 0,
+                                        time.monotonic(), 0)
+            self.set_status("Task Timer: PAUSED - frames keep being recorded, labelled 'paused'", "#f57c00")
 
     def on_task_protocol_rewind(self):
-        """Resume after a pause: discard the interrupted cycle's samples; it restarts from Prepare."""
-        keep = min(self._cycle_batch_start, len(self.recorded_batches))
-        del self.recorded_batches[keep:]
-        self._recorded_total_samples = self.recorded_sample_count()
+        """Resume after a pause: the interrupted cycle is kept but relabelled 'aborted'; it restarts from Prepare."""
+        if self.session_events is not None:
+            self.session_events.mark_aborted_since(self._cycle_event_start)
 
     def on_task_protocol_canceled(self):
         self._set_task_collection_mode(False)
-        self.timed_record_label = ""
-        self.timed_record_phase = ""
-        self.timed_record_trial_id = 0
-        self.timed_record_hand = ""
         self.set_status("Task timer canceled.", "#f57c00")
+        rec = self.session_recorder
         rows = self.recorded_sample_count()
-        if rows > 0 and self.is_connected:
+        if rec is None:
+            return
+        if self.session_events is not None:
+            self.session_events.add("end", "end", "", 0, 0, 0, time.monotonic(), 0)
+        if rows > 0:
             answer = QMessageBox.question(
                 self, "Save Partial Recording",
-                f"The session was cancelled after {rows:,} rows were recorded.\nSave them as a partial CSV?",
+                f"The session was cancelled after {rows:,} frames were recorded.\\nWrite them as a partial recording?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
             if answer == QMessageBox.Yes:
                 try:
-                    self.queue_recorded_csv_save(
-                        self._session_csv_path or self.build_auto_record_csv_path(), show_saved_dialog=True)
+                    self.queue_session_finalize(close_recorder=True, show_saved_dialog=True)
+                    return
                 except Exception as e:
-                    QMessageBox.warning(self, "CSV Save", f"Partial CSV save failed:\n{e}")
+                    QMessageBox.warning(self, "Recording Save", f"Partial save failed:\\n{e}")
+        # Declined (or failed): the raw frames stay on disk, nothing is deleted.
+        self._last_session_rows = int(rec.rows)
+        self.session_recorder = None
+        rec.close()
 
     def expected_recorded_samples(self):
-        labels = [str(x).strip() for x in self.task_labels if str(x).strip()]
-        if len(labels) <= 0:
-            return 0
-        repeats = int(max(1, self.task_repeats))
-        hold_s = float(max(0.0, self.task_hold_s))
-        rest_s = float(max(0.0, self.task_rest_s)) if bool(self.task_record_rest) else 0.0
-        hands = len(hands_for_order(self.study_meta["hand_order"]))
-        recorded_sec = repeats * hands * len(labels) * (hold_s + rest_s)
-        return int(round(recorded_sec * float(SAMPLE_RATE)))
+        """Frames the whole protocol should produce: every phase is recorded now, breaks included."""
+        return int(round(self._session_total_ms / 1000.0 * float(SAMPLE_RATE)))
 
     def evaluate_recording_sample_coverage(self, actual_samples):
         expected = int(max(0, self.expected_recorded_samples()))
         actual = int(max(0, actual_samples))
-        if expected <= 0:
-            return {
-                "expected_samples": expected,
-                "actual_samples": actual,
-                "sample_ratio": 0.0,
-                "sample_ratio_pct": 0.0,
-                "effective_hz": 0.0,
-                "below_threshold": False,
-            }
-        ratio = float(actual) / float(expected)
-        eff_hz = ratio * float(SAMPLE_RATE)
+        ratio = (float(actual) / float(expected)) if expected > 0 else 0.0
         return {
             "expected_samples": expected,
             "actual_samples": actual,
             "sample_ratio": ratio,
             "sample_ratio_pct": ratio * 100.0,
-            "effective_hz": eff_hz,
-            "below_threshold": bool(ratio < float(MIN_RECORD_SAMPLE_RATIO)),
+            "effective_hz": ratio * float(SAMPLE_RATE),
+            "below_threshold": bool(expected > 0 and ratio < float(MIN_RECORD_SAMPLE_RATIO)),
         }
-
-    def append_record_batch(self, raw_batch, packet_numbers=None):
-        if not self.timed_record_enabled:
-            return
-        if raw_batch is None or raw_batch.size == 0:
-            return
-
-        arr = np.asarray(raw_batch, dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[0] <= 0:
-            return
-        n = arr.shape[0]
-        now = time.time()
-        base_ms = (now - self.record_start_unix) * 1000.0
-        timestamps_ms = base_ms + (np.arange(n, dtype=np.float32) * np.float32(1000.0 / SAMPLE_RATE))
-        packet_src = np.asarray(packet_numbers if packet_numbers is not None else [], dtype=np.int64).reshape(-1)
-        packet_arr = np.full(n, -1, dtype=np.int64)
-        if packet_src.size > 0:
-            packet_arr[: min(n, packet_src.size)] = packet_src[: min(n, packet_src.size)]
-
-        self.recorded_batches.append(
-            TimedRecordBatch(
-                timestamps_ms=np.asarray(timestamps_ms, dtype=np.float32),
-                packet_numbers=packet_arr,
-                trial_id=int(self.timed_record_trial_id),
-                label=str(self.timed_record_label),
-                data=np.ascontiguousarray(arr, dtype=np.float32),
-                hand=str(self.timed_record_hand),
-            )
-        )
-        self._recorded_total_samples += n
-
-        # Cap in-memory recording at ~10 min @ 500 Hz × 11 ch to prevent runaway growth.
-        _MAX_RECORD_SAMPLES = 3_300_000
-        while self._recorded_total_samples > _MAX_RECORD_SAMPLES and len(self.recorded_batches) > 1:
-            oldest = self.recorded_batches.pop(0)
-            self._recorded_total_samples -= int(oldest.data.shape[0])
-
-    def save_recorded_csv_dialog(self):
-        if self.recorded_sample_count() <= 0:
-            QMessageBox.information(self, "No Data", "No timed recording samples in memory to save.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Recorded CSV",
-            self.last_recorded_csv_path,
-            "CSV Files (*.csv)",
-        )
-        if not path:
-            return
-        try:
-            data_path, _metadata_path = self.queue_recorded_csv_save(path, show_saved_dialog=True)
-            self.set_status("Saving recorded CSV in background...", "#00897b")
-            self.last_recorded_csv_path = data_path
-        except Exception as e:
-            QMessageBox.warning(self, "CSV Save", str(e))
-
-    def save_recorded_csv(self, path):
-        if self.recorded_sample_count() <= 0:
-            raise ValueError("No recorded rows available.")
-        data_csv_path, metadata_path, root_dir = self._resolve_record_output_paths(path)
-        channel_columns = self._record_channel_columns()
-        fieldnames = ["Timestamp_ms", "Packet_Number", "Trial_ID"] + channel_columns + ["Label"]
-        os.makedirs(os.path.dirname(data_csv_path) or ".", exist_ok=True)
-        with open(data_csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(fieldnames)
-            for batch in self.recorded_batches:
-                data = np.asarray(batch.data, dtype=np.float32)
-                if data.ndim != 2 or data.shape[0] <= 0:
-                    continue
-                n_rows = data.shape[0]
-                n_cols = int(min(WIRELESS_TOTAL_CHANNELS, data.shape[1]))
-                for idx in range(n_rows):
-                    row = [
-                        float(batch.timestamps_ms[idx]) if idx < len(batch.timestamps_ms) else 0.0,
-                        int(batch.packet_numbers[idx]) if idx < len(batch.packet_numbers) else -1,
-                        int(batch.trial_id),
-                    ]
-                    row.extend(float(v) for v in data[idx, :n_cols])
-                    if n_cols < WIRELESS_TOTAL_CHANNELS:
-                        row.extend([""] * (WIRELESS_TOTAL_CHANNELS - n_cols))
-                    row.append(str(batch.label))
-                    writer.writerow(row)
-        self.save_recorded_metadata_txt(
-            metadata_path,
-            data_csv_path,
-            root_dir,
-            sample_count=self.recorded_sample_count(),
-        )
-        self.last_recorded_csv_path = data_csv_path
-        self.record_save_dir = root_dir or self.record_save_dir
-        if self.data_collection_dialog and self.data_collection_dialog.isVisible():
-            self.data_collection_dialog.set_csv_dir(self.record_save_dir)
-        return data_csv_path, metadata_path
 
     @classmethod
     def load_segments_from_record_csv(cls, path):
@@ -7770,6 +7614,7 @@ class EMGVisualizer(QMainWindow):
             label_col = field_map.get("label", "")
             trial_col = field_map.get("trial_id", "")
             phase_col = field_map.get("phase", "")
+            valid_col = field_map.get("valid", "")
             channel_cols = cls._active_channel_columns_from_csv(csv_path)
             if not label_col:
                 raise ValueError("CSV missing required column: Label")
@@ -7783,8 +7628,17 @@ class EMGVisualizer(QMainWindow):
                 label = str(row.get(label_col, "")).strip()
                 if not label:
                     continue
-                trial = str(row.get(trial_col, "1")).strip() if trial_col else "1"
                 phase = str(row.get(phase_col, "")).strip() if phase_col else ""
+                invalid = bool(valid_col) and str(row.get(valid_col, "1")).strip() == "0"
+                # Continuous recordings also contain prepare/settle/break/pause/aborted frames and
+                # NaN gap frames: only task (perform) and rest frames are training data, and a gap
+                # ends the current segment instead of being bridged.
+                if invalid or (phase and phase.lower() not in ("perform", "rest")):
+                    if len(buf) > 0 and current_label:
+                        segments.append((current_label, np.asarray(buf, dtype=np.float32)))
+                    buf, current_key, current_label = [], None, None
+                    continue
+                trial = str(row.get(trial_col, "1")).strip() if trial_col else "1"
                 key = (label, trial, phase)
                 try:
                     sample = []
@@ -8663,6 +8517,9 @@ class EMGVisualizer(QMainWindow):
             return
         if batch.ndim != 2 or batch.shape[1] != self.num_channels:
             return
+        if self.session_recorder is not None and isinstance(payload, dict):
+            # Every frame (gap frames included) goes to disk via the writer thread; labels come later.
+            self.session_recorder.append(payload)
         self.last_transport_metadata = transport_metadata
         # Packet gaps are not silently treated as continuous EMG. Require a
         # fresh full model window before classification resumes.
@@ -8684,7 +8541,7 @@ class EMGVisualizer(QMainWindow):
         if packet_gap > 0:
             self.rf_valid_sample_count = 0
             self.rf_samples_since_submit = 0
-            if self.timed_record_enabled:
+            if self.session_recorder is not None:
                 self.record_missing_packets += packet_gap
                 self.record_gap_events += 1
 
@@ -8706,7 +8563,6 @@ class EMGVisualizer(QMainWindow):
         if not self.is_calibrated:
             return  # Hard requirement: no graph/analysis before calibration.
 
-        self.append_record_batch(batch, packet_numbers=packet_numbers)
         # Single transpose: (samples, channels) → (channels, samples) used for both buffers.
         raw_new_data = batch.T
         raw_num_new = raw_new_data.shape[1]
@@ -9366,7 +9222,7 @@ class EMGVisualizer(QMainWindow):
         self.refresh_csv_counter()
 
     def refresh_csv_counter(self):
-        rows = int(self._recorded_total_samples)
+        rows = int(self.recorded_sample_count())
         expected = int(self.expected_recorded_samples())
         self.lbl_csv_rows.setText(f"CSV rows: {rows:,}")
         if self.data_collection_dialog is None:
@@ -9374,6 +9230,10 @@ class EMGVisualizer(QMainWindow):
         pct = (100.0 * rows / expected) if expected > 0 else 0.0
         text = f"CSV rows recorded: {rows:,} / {expected:,} expected ({pct:.1f}%)"
         kind = "accent"
+        rec = self.session_recorder
+        if rec is not None and rec.rows >= 2000 and rec.valid_rows / rec.rows < MIN_RECORD_SAMPLE_RATIO:
+            text += f" | VALID {100.0 * rec.valid_rows / rec.rows:.1f}% (< {100 * MIN_RECORD_SAMPLE_RATIO:.0f}%)"
+            kind = "warn"
         if self.record_missing_packets > 0:
             text += f" | lost packets: {self.record_missing_packets:,}"
             kind = "warn"
@@ -9439,7 +9299,7 @@ class EMGVisualizer(QMainWindow):
                 ("Block break / hand-switch break", f"{self.study_meta['block_break_s']:.0f} / {self.study_meta['hand_switch_s']:.0f} s", "Rest between blocks (3-4 min) and when the armband changes arm (~5 min). 'Skip Break' ends one early."),
                 ("Record Rest / Randomize order", f"{on_off(self.task_record_rest)} / {on_off(self.task_randomize_order)}", "Record the rest period as a class; shuffle gesture order each repetition."),
                 ("CSV save folder", self.record_save_dir, "Where the session CSV and metadata are written; a checkpoint is saved at every break."),
-                ("Live CSV counter", f"{self._recorded_total_samples:,} rows", "Rows captured so far versus the number the protocol should produce."),
+                ("Live CSV counter", f"{self.recorded_sample_count():,} rows", "Rows captured so far versus the number the protocol should produce."),
             ]),
             ("Models", [
                 ("Train Model", "-", "Train a Random Forest from recorded CSV files and review accuracy and the confusion matrix."),
