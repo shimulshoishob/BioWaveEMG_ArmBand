@@ -102,7 +102,7 @@ static const uint8_t BWIM_VERSION = 2;
 static const char *FW_VERSION = "emg-imu-2.0.0";
 
 // The access key lives in the gitignored secrets.h (see secrets.example.h).
-static const char *DEVICE_ACCESS_KEY = DEVICE_ACCESS_KEY_VALUE;
+static const char *DEVICE_ACCESS_KEY = CHANGE_THIS_TO_A_LONG_RANDOM_KEY;
 
 
 // ---------- EMG ----------
