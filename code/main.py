@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import random
+import secrets
 import socket
 import struct
 import subprocess
@@ -89,8 +90,8 @@ from app_theme import (
     themed_label_style,
     themed_status_color,
 )
-from study_meta import (CONSENT_FORM_VERSION, normalize_participant_id, session_folder_name,
-                        valid_participant_id)
+from study_meta import (CONSENT_FORM_VERSION, default_hand_order, normalize_participant_id,
+                        session_folder_name, valid_participant_id)
 from session_recording import (ContinuousRecorder, EventLog, LABEL_CODES, MIN_VALID_SAMPLE_RATIO, SIGNAL_COLUMNS,
                                finalize_session)
 from emg_v4_core import (StreamAssembler, UsbFrameDecoder, WirelessStats, parse_bwim_packet,
@@ -2145,6 +2146,7 @@ class TaskProtocolWidget(QWidget):
         self.settle_ms = int(DEFAULT_TASK_SETTLE_S * 1000)
         self.record_rest = True
         self.randomize_order = True
+        self.seed = 0
         self.hand_order = DEFAULT_HAND_ORDER
         self.session_day = DEFAULT_SESSION_DAY
         self.max_cycles_per_block = DEFAULT_MAX_CYCLES_PER_BLOCK
@@ -2277,7 +2279,8 @@ class TaskProtocolWidget(QWidget):
     def configure(self, labels, repeats, prep_s, hold_s, rest_s, record_rest=True,
                   settle_s=DEFAULT_TASK_SETTLE_S, randomize_order=True, hand_order=DEFAULT_HAND_ORDER,
                   session_day=DEFAULT_SESSION_DAY, max_cycles_per_block=DEFAULT_MAX_CYCLES_PER_BLOCK,
-                  block_break_s=DEFAULT_BLOCK_BREAK_S, hand_switch_s=DEFAULT_HAND_SWITCH_BREAK_S):
+                  block_break_s=DEFAULT_BLOCK_BREAK_S, hand_switch_s=DEFAULT_HAND_SWITCH_BREAK_S, seed=0):
+        self.seed = int(seed)
         self.labels = [str(x).strip() for x in (labels or []) if str(x).strip()]
         self.repeats = max(1, int(repeats))
         self.prep_ms = int(max(0.2, prep_s) * 1000)
@@ -2340,6 +2343,7 @@ class TaskProtocolWidget(QWidget):
         across hands so (label, trial) stays unique in the CSV.
         """
         steps = []
+        rng = random.Random(self.seed)   # per-session seed, saved in the metadata: the order is reproducible
         hands = hands_for_order(self.hand_order)
         cycles_total = len(self.labels) * self.repeats * len(hands)
         cycle_no = 0
@@ -2349,7 +2353,7 @@ class TaskProtocolWidget(QWidget):
             for rep in range(1, self.repeats + 1):
                 trial_labels = list(self.labels)
                 if self.randomize_order:
-                    random.shuffle(trial_labels)
+                    rng.shuffle(trial_labels)
                 cycles.extend((trial_offset + rep, label) for label in trial_labels)
             blocks = [cycles[i:i + self.max_cycles_per_block] for i in range(0, len(cycles), self.max_cycles_per_block)]
             for block_idx, block in enumerate(blocks):
@@ -3786,6 +3790,12 @@ class DataCollectionDialog(QDialog):
         self.spin_hand_switch.setToolTip("Break while the armband is moved to the other arm (study: about 5 minutes).")
         self.check_record_rest = QCheckBox("Record Rest")
         self.check_record_rest.setChecked(bool(settings.get("record_rest", True)))
+        self.session_seed = int(settings.get("seed", 0) or 0) or secrets.randbits(32)
+        self._hand_order_manual = str(settings.get("hand_order_source", "auto")) == "manual"
+        self.check_practice = QCheckBox("Practice / demo mode")
+        self.check_practice.setChecked(bool(settings.get("practice_mode", False)))
+        self.check_practice.setToolTip("Practice runs are saved under a 'practice_' folder and are NOT part of the dataset.\n"
+                                       "Only in this mode can randomization be switched off.")
         self.check_randomize_order = QCheckBox("Randomize Gesture Order")
         self.check_randomize_order.setChecked(bool(settings.get("randomize_order", True)))
         self.check_randomize_order.setToolTip(
@@ -3810,6 +3820,7 @@ class DataCollectionDialog(QDialog):
         row_checks = QHBoxLayout()
         row_checks.addWidget(self.check_record_rest)
         row_checks.addWidget(self.check_randomize_order)
+        row_checks.addWidget(self.check_practice)
         row_checks.addStretch()
         config_layout.addLayout(row_checks)
 
@@ -3872,9 +3883,15 @@ class DataCollectionDialog(QDialog):
             self.spin_task_hold.valueChanged, self.spin_task_rest.valueChanged,
             self.spin_hand_switch.valueChanged,
             self.check_record_rest.stateChanged, self.check_randomize_order.stateChanged,
+            self.check_practice.stateChanged,
             self.input_record_dir.textChanged,
         ):
             sig.connect(self._emit_settings_changed)
+        self.check_practice.stateChanged.connect(self._apply_practice_rules)
+        self.combo_hand_order.activated.connect(self._on_hand_order_chosen)
+        self.input_contributor.textChanged.connect(self._on_participant_id_changed)
+        self._apply_practice_rules()
+        self._on_participant_id_changed()
         self.check_agree_yes.stateChanged.connect(self._on_agree_yes_changed)
         self.check_agree_no.stateChanged.connect(self._on_agree_no_changed)
 
@@ -3923,6 +3940,11 @@ class DataCollectionDialog(QDialog):
             "temp_start_c": float(self.spin_temp_start.value()),
             "humidity_start_pct": float(self.spin_humidity_start.value()),
             "agreed": bool(self.check_agree_yes.isChecked() and not self.check_agree_no.isChecked()),
+            "seed": int(self.session_seed),
+            "practice_mode": bool(self.check_practice.isChecked()),
+            "hand_order_source": "manual" if self._hand_order_manual else "auto",
+            "hand_order_default": (default_hand_order(self.input_contributor.text())
+                                   if valid_participant_id(self.input_contributor.text()) else ""),
             "task_labels": list(self.task_labels),
             "labels_saved": bool(self.labels_saved),
             "session_day": int(self.spin_session_day.value()),
@@ -4000,6 +4022,31 @@ class DataCollectionDialog(QDialog):
         self.task_protocol.set_start_enabled(self.session_prepared and (not self.protocol_running))
         self.task_protocol.set_cancel_enabled(self.session_prepared and (not self.protocol_running))
 
+    def _apply_practice_rules(self, *_args):
+        """Study mode: randomization is mandatory. Only practice/demo mode may switch it off."""
+        practice = self.check_practice.isChecked()
+        if not practice:
+            self.check_randomize_order.setChecked(True)
+        self.check_randomize_order.setEnabled(practice)
+        self.check_randomize_order.setToolTip(
+            "Shuffle gesture order independently each repeat, so fatigue doesn't always degrade whichever "
+            "gesture is fixed last in the cycle." + ("" if practice else
+                                                      "\nMandatory in study mode (tick Practice / demo mode to change it)."))
+
+    def _on_hand_order_chosen(self, *_args):
+        self._hand_order_manual = True          # the operator overrode the counterbalanced default
+
+    def _on_participant_id_changed(self, *_args):
+        """Odd participant numbers start with the left hand, even with the right, unless overridden."""
+        pid = self.input_contributor.text()
+        if self._hand_order_manual or not valid_participant_id(pid):
+            return
+        if str(self.combo_hand_order.currentData()) not in ("left_right", "right_left"):
+            return
+        idx = self.combo_hand_order.findData(default_hand_order(pid))
+        if idx >= 0 and idx != self.combo_hand_order.currentIndex():
+            self.combo_hand_order.setCurrentIndex(idx)
+
     def _emit_settings_changed(self, *_args):
         self._update_plan_label()
         self.settings_changed.emit(self.settings_payload())
@@ -4019,6 +4066,7 @@ class DataCollectionDialog(QDialog):
             max_cycles_per_block=settings["max_cycles_per_block"],
             block_break_s=settings["block_break_s"],
             hand_switch_s=settings["hand_switch_s"],
+            seed=settings["seed"],
         )
 
     def _emit_start_requested(self):
@@ -4040,6 +4088,8 @@ class DataCollectionDialog(QDialog):
         if not self.labels_saved or len(self.task_labels) == 0:
             QMessageBox.warning(self, "Task Labels", "Click Edit and save class labels before proceeding.")
             return
+        self.session_seed = secrets.randbits(32)     # fresh seed per session; saved with the recording
+        self._emit_settings_changed()                # let the main window store the seed it will start with
         self.task_protocol.configure(**self._protocol_kwargs(self.settings_payload()))
         self.session_prepared = True
         self._set_protocol_dimmed(False)
@@ -5232,6 +5282,7 @@ class EMGVisualizer(QMainWindow):
             "block_break_s": float(DEFAULT_BLOCK_BREAK_S),
             "hand_switch_s": float(DEFAULT_HAND_SWITCH_BREAK_S),
             **{key: 0.0 for key in STUDY_ENV_KEYS},
+            "seed": 0, "practice_mode": False, "hand_order_source": "auto", "hand_order_default": "",
         }
         self.record_missing_packets = 0
         self.record_gap_events = 0
@@ -7076,6 +7127,10 @@ class EMGVisualizer(QMainWindow):
             "max_cycles_per_block": int(self.study_meta["max_cycles_per_block"]),
             "block_break_s": float(self.study_meta["block_break_s"]),
             "hand_switch_s": float(self.study_meta["hand_switch_s"]),
+            "seed": int(self.study_meta["seed"]),
+            "practice_mode": bool(self.study_meta["practice_mode"]),
+            "hand_order_source": str(self.study_meta["hand_order_source"]),
+            "hand_order_default": str(self.study_meta["hand_order_default"]),
             "agreed": bool(self.contribution_agreed),
             "task_labels": list(self.task_labels),
             "labels_saved": bool(self.task_labels_locked),
@@ -7107,6 +7162,8 @@ class EMGVisualizer(QMainWindow):
             "max_cycles_per_block", self.study_meta["max_cycles_per_block"])))
         self.study_meta["block_break_s"] = float(max(0.0, settings.get("block_break_s", self.study_meta["block_break_s"])))
         self.study_meta["hand_switch_s"] = float(max(0.0, settings.get("hand_switch_s", self.study_meta["hand_switch_s"])))
+        for key, cast in (("seed", int), ("practice_mode", bool), ("hand_order_source", str), ("hand_order_default", str)):
+            self.study_meta[key] = cast(settings.get(key, self.study_meta[key]))
         self.contribution_agreed = bool(settings.get("agreed", self.contribution_agreed))
         labels_in = settings.get("task_labels", self.task_labels)
         if isinstance(labels_in, list):
@@ -7171,7 +7228,7 @@ class EMGVisualizer(QMainWindow):
     def build_auto_record_csv_path(self):
         save_dir = (self.record_save_dir or DATASET_DIR).strip() or DATASET_DIR
         bundle_name = session_folder_name(self.participant_id, self.study_meta["session_day"],
-                                          self.study_meta["hand_order"])
+                                          self.study_meta["hand_order"], practice=self.study_meta["practice_mode"])
         return os.path.join(save_dir, bundle_name, f"signals_{bundle_name}.csv")
 
     @staticmethod
@@ -7314,7 +7371,11 @@ class EMGVisualizer(QMainWindow):
             f"rest_s={float(self.task_rest_s)}",
             f"record_rest={bool(self.task_record_rest)}",
             f"settle_s={float(self.task_settle_s)}",
-            f"randomize_order={bool(self.task_randomize_order)}",
+            f"randomize_order={bool(self.task_randomize_order or not self.study_meta['practice_mode'])}",
+            f"random_seed={int(self.study_meta['seed'])}",
+            f"practice_mode={bool(self.study_meta['practice_mode'])}",
+            f"hand_order_source={self.study_meta['hand_order_source']}",
+            f"hand_order_counterbalanced_default={self.study_meta['hand_order_default'] or 'N/A'}",
             f"channel_count={int(self.num_channels)}",
             f"connection_medium={self.connection_medium}",
             f"sample_rate_hz={int(SAMPLE_RATE)}",
@@ -7507,7 +7568,8 @@ class EMGVisualizer(QMainWindow):
             rest_s=self.task_rest_s,
             record_rest=self.task_record_rest,
             settle_s=self.task_settle_s,
-            randomize_order=self.task_randomize_order,
+            randomize_order=True if not self.study_meta["practice_mode"] else self.task_randomize_order,
+            seed=self.study_meta["seed"],
             hand_order=self.study_meta["hand_order"],
             session_day=self.study_meta["session_day"],
             max_cycles_per_block=self.study_meta["max_cycles_per_block"],
