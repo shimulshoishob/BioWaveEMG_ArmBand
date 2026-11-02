@@ -479,7 +479,7 @@ int countTokens(const String &message) {
 String helloPacket() {
   return "HELLO|" + deviceId + "|" + deviceName + "|" + currentWiFiModeString() + "|" +
          currentReachableIpString() + "|" + String(imuReady ? 1 : 0) + "|" +
-         String(targetLocked ? 1 : 0) + "|" + FW_VERSION;
+         String(targetLocked ? 1 : 0) + "|" + FW_VERSION + "|" + String(EMG_FRAME_RATE_HZ);
 }
 
 bool enableOrientationReport() {
@@ -760,7 +760,7 @@ void processSerialCommand(const String &line) {
     writeSerialFrameBreak();
     Serial.println(
       "INFO|" + deviceId + "|" + deviceName + "|" + String(imuReady ? 1 : 0) + "|" +
-      String(hasSavedWiFiCredentials() ? 1 : 0) + "|" + FW_VERSION
+      String(hasSavedWiFiCredentials() ? 1 : 0) + "|" + FW_VERSION + "|" + String(EMG_FRAME_RATE_HZ)
     );
     return;
   }

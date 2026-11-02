@@ -14,6 +14,7 @@ import traceback
 from collections import deque
 from dataclasses import dataclass
 from html import escape as html_escape
+from typing import Optional
 from urllib.parse import quote
 
 import numpy as np
@@ -674,6 +675,14 @@ class SerialWorker(QThread):
         self.wait()
 
 
+def _parse_rate_field(text):
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 @dataclass
 class DeviceInfo:
     ip: str
@@ -684,6 +693,7 @@ class DeviceInfo:
     imu_ready: bool
     streaming: bool
     firmware: str
+    sample_rate_hz: Optional[float] = None
 
     @property
     def summary(self):
@@ -698,6 +708,7 @@ class SerialDeviceInfo:
     imu_ready: bool
     wifi_saved: bool
     firmware: str
+    sample_rate_hz: Optional[float] = None
 
 
 def sign_message(secret, *parts):
@@ -746,7 +757,8 @@ class ControlProtocol:
     @staticmethod
     def parse_device_info(message, source_ip):
         parts = message.strip().split("|")
-        if len(parts) != 8 or parts[0] != "HELLO":
+        # 8 fields from firmware < 2.0; 2.0+ appends the sampling rate (Hz).
+        if len(parts) not in (8, 9) or parts[0] != "HELLO":
             raise ValueError("Unexpected device response.")
 
         return DeviceInfo(
@@ -758,6 +770,7 @@ class ControlProtocol:
             imu_ready=parts[5] == "1",
             streaming=parts[6] == "1",
             firmware=parts[7],
+            sample_rate_hz=_parse_rate_field(parts[8]) if len(parts) > 8 else None,
         )
 
     @staticmethod
@@ -889,7 +902,7 @@ class WiFiSerialProvisionProtocol:
         parts = response.split("|")
         if len(parts) >= 2 and parts[0] == "ERR":
             raise RuntimeError(f"ESP32 returned an error: {parts[1]}")
-        if len(parts) != 6 or parts[0] != "INFO":
+        if len(parts) not in (6, 7) or parts[0] != "INFO":
             raise RuntimeError(f"Unexpected serial response: {response}")
 
         return SerialDeviceInfo(
@@ -899,6 +912,7 @@ class WiFiSerialProvisionProtocol:
             imu_ready=parts[3] == "1",
             wifi_saved=parts[4] == "1",
             firmware=parts[5],
+            sample_rate_hz=_parse_rate_field(parts[6]) if len(parts) > 6 else None,
         )
 
     @staticmethod
