@@ -132,7 +132,6 @@ static const char *CREDENTIAL_PREFIX = "enc1";
 
 // ---------- FORWARD DECLARATIONS ----------
 void handleSerialCommands();
-bool connectToSavedWiFi();
 void monitorWiFiState();
 void handleControlPacket();
 void printDiagnosticsIfDue();
@@ -462,55 +461,34 @@ bool enableOrientationReport() {
   return myIMU.enableRotationVector(IMU_REPORT_INTERVAL_MS);
 }
 
-bool connectToSavedWiFi() {
+// Wi-Fi connection state machine. wifiTick() is called on every network-task pass and never
+// blocks: it only starts an attempt, checks WiFi.status(), or waits out the retry interval.
+enum WifiState : uint8_t { WIFI_STATE_IDLE, WIFI_STATE_CONNECTING, WIFI_STATE_BACKOFF };
+static WifiState wifiState = WIFI_STATE_IDLE;
+static unsigned long wifiAttemptStartedMs = 0;
+static bool wifiEverConnected = false;
+static bool savedCredentialsPresent = false;   // cached: reading Preferences + HMAC every pass is slow
+
+void beginWiFiAttempt() {
   String savedSsid;
   String savedPass;
   loadWiFiCredentials(savedSsid, savedPass);
-
-  if (savedSsid.length() == 0) {
-    udp.stop();
-    return false;
+  savedCredentialsPresent = savedSsid.length() > 0;
+  if (!savedCredentialsPresent) {
+    wifiState = WIFI_STATE_BACKOFF;   // re-check storage every retry interval, not every pass
+    lastWiFiRetryMs = millis();
+    return;
   }
 
-  Serial.println();
-  Serial.println("====================================");
   Serial.print("Connecting to saved Wi-Fi: ");
   Serial.println(savedSsid);
-  Serial.println("====================================");
 
-  clearStreamTarget();
-  WiFi.disconnect(true, true);
-  delay(200);
+  WiFi.disconnect(false, false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(savedSsid.c_str(), savedPass.c_str());
-
-  unsigned long startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - startedAt) < WIFI_CONNECT_TIMEOUT_MS) {
-    handleSerialCommands();
-    delay(50);
-    handleSerialCommands();
-    delay(50);
-    handleSerialCommands();
-    delay(50);
-    handleSerialCommands();
-    delay(50);
-    handleSerialCommands();
-    delay(50);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    udp.stop();
-    Serial.println("Wi-Fi connection failed. Waiting for USB provisioning or later retry.");
-    return false;
-  }
-
-  restartControlSocket();
-  Serial.print("Connected. IP address: ");
-  Serial.println(WiFi.localIP());
-  return true;
+  wifiAttemptStartedMs = millis();
+  wifiState = WIFI_STATE_CONNECTING;
 }
 
 void initImu() {
@@ -956,22 +934,43 @@ void printDiagnosticsIfDue() {
 }
 
 void monitorWiFiState() {
-  if (WiFi.status() == WL_CONNECTED) {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (connected) {
+    if (wifiState == WIFI_STATE_CONNECTING) {
+      restartControlSocket();
+      if (wifiEverConnected) {
+        wifiReconnectsTotal++;
+      }
+      wifiEverConnected = true;
+      Serial.print("Connected. IP address: ");
+      Serial.println(WiFi.localIP());
+    }
+    wifiState = WIFI_STATE_IDLE;
     return;
   }
 
-  if (!hasSavedWiFiCredentials()) {
-    return;
-  }
-
-  if ((millis() - lastWiFiRetryMs) < WIFI_RETRY_INTERVAL_MS) {
-    return;
-  }
-
-  lastWiFiRetryMs = millis();
-  Serial.println("Retrying saved Wi-Fi connection...");
-  if (connectToSavedWiFi()) {
-    wifiReconnectsTotal++;
+  const unsigned long now = millis();
+  switch (wifiState) {
+    case WIFI_STATE_CONNECTING:
+      if ((now - wifiAttemptStartedMs) > WIFI_CONNECT_TIMEOUT_MS) {
+        Serial.println("Wi-Fi connection attempt timed out.");
+        wifiState = WIFI_STATE_BACKOFF;
+        lastWiFiRetryMs = now;
+      }
+      break;
+    case WIFI_STATE_BACKOFF:
+      if ((now - lastWiFiRetryMs) >= WIFI_RETRY_INTERVAL_MS) {
+        beginWiFiAttempt();
+      }
+      break;
+    case WIFI_STATE_IDLE:
+    default:
+      // First attempt after boot, or the link dropped while connected.
+      if (savedCredentialsPresent || !wifiEverConnected) {
+        beginWiFiAttempt();
+      }
+      break;
   }
 }
 
@@ -1127,9 +1126,8 @@ void setup() {
 
   initImu();
 
-  if (hasSavedWiFiCredentials()) {
-    connectToSavedWiFi();
-  } else {
+  savedCredentialsPresent = hasSavedWiFiCredentials();   // the network task starts the connection
+  if (!savedCredentialsPresent) {
     Serial.println("No saved Wi-Fi credentials. Waiting for USB provisioning command.");
   }
 
