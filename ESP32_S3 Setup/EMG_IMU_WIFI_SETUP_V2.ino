@@ -32,6 +32,15 @@
  *   uint8_t  frameCount = 5
  *   uint16_t frameSize  = 56
  *   uint32_t packetSequence
+ *   uint32_t queueDrops        (cumulative since boot: packets dropped from the send queue)
+ *   uint32_t acqOverruns       (cumulative: frames whose sampling deadline was missed)
+ *   uint32_t sendFailures      (cumulative: udp.beginPacket/endPacket failures)
+ *   uint16_t wifiReconnects    (cumulative: successful Wi-Fi re-associations)
+ *   uint16_t headerFlags       (reserved, 0)
+ *   -> header is 28 bytes. Counters are stamped when the packet is sent, so
+ *      they include failures of earlier packets, never of the packet itself.
+ *
+ * Frame flags (bit 0): the frame was sampled late (deadline overrun).
  *
  * Frames:
  *   5 x {
@@ -107,6 +116,9 @@ static const UBaseType_t NETWORK_PRIORITY = 2;
 static const UBaseType_t IMU_PRIORITY = 2;
 static const uint8_t MAX_UDP_PACKETS_PER_PASS = 8;
 static const uint16_t SHORT_BUSY_WAIT_US = 75;
+// A frame sampled more than this after its deadline is flagged FRAME_FLAG_LATE.
+static const int64_t LATE_FRAME_THRESHOLD_US = 250;
+static const uint8_t FRAME_FLAG_LATE = 0x01;
 static const char *CREDENTIAL_PREFIX = "enc1";
 
 // ---------- IMU PINS ----------
@@ -124,7 +136,6 @@ void monitorWiFiState();
 void handleControlPacket();
 void printDiagnosticsIfDue();
 void flushFrameQueue();
-void sendFrameUdp(const void *frameData, size_t frameSize);
 void updateLatestImu();
 String randomHex(uint32_t value);
 String hmacSha256Hex(const String &message, const String &key);
@@ -181,6 +192,11 @@ struct __attribute__((packed)) PacketHeader {
   uint8_t frameCount;
   uint16_t frameSize;
   uint32_t packetSequence;
+  uint32_t queueDrops;
+  uint32_t acqOverruns;
+  uint32_t sendFailures;
+  uint16_t wifiReconnects;
+  uint16_t headerFlags;
 };
 
 struct __attribute__((packed)) EmgImuPacket {
@@ -196,6 +212,11 @@ volatile uint32_t imuEventsThisWindow = 0;
 volatile uint32_t udpPacketsSentThisWindow = 0;
 volatile uint32_t queueDropsThisWindow = 0;
 volatile uint32_t acquisitionOverrunsThisWindow = 0;
+// Cumulative health counters, reported in every packet header.
+volatile uint32_t queueDropsTotal = 0;
+volatile uint32_t acquisitionOverrunsTotal = 0;
+volatile uint32_t udpSendFailuresTotal = 0;
+volatile uint16_t wifiReconnectsTotal = 0;
 unsigned long diagnosticsWindowStartMs = 0;
 
 static inline int readADCStable(int pin) {
@@ -807,6 +828,7 @@ void queueFrame(const EmgImuPacket &packet) {
     // If this still fails, the consumer is badly stalled; keep going.
   }
   queueDropsThisWindow++;
+  queueDropsTotal++;
 }
 
 // One CSV line per frame: 8 raw ADC counts, then roll,pitch,yaw in degrees.
@@ -824,10 +846,25 @@ void sendPacketUsb(const EmgImuPacket &packet) {
   udpPacketsSentThisWindow++;
 }
 
-void sendFrameUdp(const void *frameData, size_t frameSize) {
-  udp.beginPacket(streamTargetIP, streamTargetPort);
-  udp.write(reinterpret_cast<const uint8_t *>(frameData), frameSize);
-  udp.endPacket();
+void stampHeaderCounters(EmgImuPacket &packet) {
+  packet.header.queueDrops = queueDropsTotal;
+  packet.header.acqOverruns = acquisitionOverrunsTotal;
+  packet.header.sendFailures = udpSendFailuresTotal;
+  packet.header.wifiReconnects = wifiReconnectsTotal;
+  packet.header.headerFlags = 0;
+}
+
+void sendFrameUdp(EmgImuPacket &packet) {
+  stampHeaderCounters(packet);
+  bool ok = udp.beginPacket(streamTargetIP, streamTargetPort) != 0;
+  if (ok) {
+    udp.write(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
+    ok = udp.endPacket() != 0;
+  }
+  if (!ok) {
+    udpSendFailuresTotal++;
+    return;
+  }
   udpPacketsSentThisWindow++;
 }
 
@@ -884,7 +921,9 @@ void monitorWiFiState() {
 
   lastWiFiRetryMs = millis();
   Serial.println("Retrying saved Wi-Fi connection...");
-  connectToSavedWiFi();
+  if (connectToSavedWiFi()) {
+    wifiReconnectsTotal++;
+  }
 }
 
 void acquisitionTask(void *parameter) {
@@ -902,6 +941,7 @@ void acquisitionTask(void *parameter) {
   int64_t nextSampleUs = esp_timer_get_time();
   uint32_t lastPackedSampleId = 0;
   uint8_t packetFrameIndex = 0;
+  bool lateNextFrame = false;
 
   for (;;) {
     LatestImuState currentImu;
@@ -924,6 +964,10 @@ void acquisitionTask(void *parameter) {
     frame.imuFresh = (currentImu.sampleId != lastPackedSampleId) ? 1 : 0;
     lastPackedSampleId = currentImu.sampleId;
     frame.flags = 0;
+    if (lateNextFrame || (static_cast<int64_t>(frame.frameTimestampUs) - nextSampleUs) > LATE_FRAME_THRESHOLD_US) {
+      frame.flags |= FRAME_FLAG_LATE;
+    }
+    lateNextFrame = false;
     frame.reserved = 0;
 
     emgFramesThisWindow++;
@@ -952,6 +996,8 @@ void acquisitionTask(void *parameter) {
       }
     } else {
       acquisitionOverrunsThisWindow++;
+      acquisitionOverrunsTotal++;
+      lateNextFrame = true;
       nextSampleUs = esp_timer_get_time();
     }
   }
@@ -991,7 +1037,7 @@ void networkTask(void *parameter) {
     } else if (streamActive) {
       uint8_t packetsSentThisPass = 0;
       while (packetsSentThisPass < MAX_UDP_PACKETS_PER_PASS && xQueueReceive(frameQueue, &packet, 0) == pdTRUE) {
-        sendFrameUdp(&packet, sizeof(packet));
+        sendFrameUdp(packet);
         packetsSentThisPass++;
       }
     } else {
