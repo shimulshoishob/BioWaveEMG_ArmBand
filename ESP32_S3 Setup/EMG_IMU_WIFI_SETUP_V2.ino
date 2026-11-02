@@ -23,26 +23,33 @@
  * per second. Each UDP packet starts with a small header followed by 5
  * consecutive frames.
  *
+ * BWIM v2 (little endian; the first 12 header bytes are identical to v1, so a
+ * v1 parser can still identify the version before rejecting the packet):
+ *
  * Header:
  *   char     magic[4]   = "BWIM"
- *   uint8_t  version    = 1
+ *   uint8_t  version    = 2
  *   uint8_t  frameCount = 5
- *   uint16_t frameSize  = 48
+ *   uint16_t frameSize  = 56
  *   uint32_t packetSequence
  *
  * Frames:
  *   5 x {
  *     uint32_t frameId
- *     uint32_t frameTimestampUs
+ *     uint64_t frameTimestampUs   (esp_timer, microseconds since boot, never wraps)
  *     uint32_t imuSampleId
- *     uint32_t imuTimestampUs
+ *     uint64_t imuTimestampUs     (esp_timer, microseconds since boot, never wraps)
  *     uint16_t emg[8]
  *     float    roll
  *     float    pitch
  *     float    yaw
  *     uint8_t  imuFresh
- *     uint8_t  reserved[3]
+ *     uint8_t  flags
+ *     uint16_t reserved
  *   }
+ *
+ * BWIM v1 (frameSize 48, 32-bit microsecond timestamps that wrap every ~71.6
+ * minutes) is no longer emitted. Host parsers must keep accepting it.
  */
 
 #include <Arduino.h>
@@ -51,6 +58,7 @@
 #include <SPI.h>
 #include <Preferences.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <mbedtls/md.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -70,7 +78,8 @@ static const unsigned long CHALLENGE_TTL_MS = 30000;
 static const uint32_t USB_SERIAL_BAUD = 921600;
 // A wired session ends if the GUI stops sending USBSTART/USBPING keepalives.
 static const unsigned long USB_STREAM_TIMEOUT_MS = 5000;
-static const char *FW_VERSION = "emg-imu-1.6.0";
+static const uint8_t BWIM_VERSION = 2;
+static const char *FW_VERSION = "emg-imu-2.0.0";
 
 // Change this before flashing.
 static const char *DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY";
@@ -149,20 +158,21 @@ struct LatestImuState {
   float pitch;
   float yaw;
   uint32_t sampleId;
-  uint32_t timestampUs;
+  uint64_t timestampUs;
 };
 
 struct __attribute__((packed)) EmgImuFrame {
   uint32_t frameId;
-  uint32_t frameTimestampUs;
+  uint64_t frameTimestampUs;
   uint32_t imuSampleId;
-  uint32_t imuTimestampUs;
+  uint64_t imuTimestampUs;
   uint16_t emg[EMG_CHANNELS];
   float roll;
   float pitch;
   float yaw;
   uint8_t imuFresh;
-  uint8_t reserved[3];
+  uint8_t flags;
+  uint16_t reserved;
 };
 
 struct __attribute__((packed)) PacketHeader {
@@ -496,7 +506,7 @@ void initImu() {
     if (enableOrientationReport()) {
       imuReady = true;
       latestImu.sampleId = 0;
-      latestImu.timestampUs = micros();
+      latestImu.timestampUs = static_cast<uint64_t>(esp_timer_get_time());
       diagnosticsWindowStartMs = millis();
       Serial.println("Rotation Vector enabled with a 200 Hz request.");
       return;
@@ -753,7 +763,7 @@ void updateLatestImu() {
     tempImu.roll = myIMU.getRoll() * (180.0f / PI);
     tempImu.pitch = myIMU.getPitch() * (180.0f / PI);
     tempImu.yaw = myIMU.getYaw() * (180.0f / PI);
-    tempImu.timestampUs = micros();
+    tempImu.timestampUs = static_cast<uint64_t>(esp_timer_get_time());
     imuEventsThisWindow++;
     sawNewImu = true;
   }
@@ -883,13 +893,13 @@ void acquisitionTask(void *parameter) {
   memset(&frame, 0, sizeof(frame));
   memset(&packet, 0, sizeof(packet));
   memcpy(packet.header.magic, "BWIM", 4);
-  packet.header.version = 1;
+  packet.header.version = BWIM_VERSION;
   packet.header.frameCount = EMG_FRAMES_PER_PACKET;
   packet.header.frameSize = sizeof(EmgImuFrame);
   packet.header.packetSequence = 0;
 
   uint32_t frameId = 0;
-  uint32_t nextSampleUs = micros();
+  int64_t nextSampleUs = esp_timer_get_time();
   uint32_t lastPackedSampleId = 0;
   uint8_t packetFrameIndex = 0;
 
@@ -900,7 +910,7 @@ void acquisitionTask(void *parameter) {
     portEXIT_CRITICAL(&imuMutex);
 
     frame.frameId = frameId++;
-    frame.frameTimestampUs = micros();
+    frame.frameTimestampUs = static_cast<uint64_t>(esp_timer_get_time());
 
     for (int ch = 0; ch < EMG_CHANNELS; ++ch) {
       frame.emg[ch] = static_cast<uint16_t>(readADCStable(EMG_PINS[ch]));
@@ -913,9 +923,8 @@ void acquisitionTask(void *parameter) {
     frame.yaw = currentImu.yaw;
     frame.imuFresh = (currentImu.sampleId != lastPackedSampleId) ? 1 : 0;
     lastPackedSampleId = currentImu.sampleId;
-    frame.reserved[0] = 0;
-    frame.reserved[1] = 0;
-    frame.reserved[2] = 0;
+    frame.flags = 0;
+    frame.reserved = 0;
 
     emgFramesThisWindow++;
 
@@ -933,17 +942,17 @@ void acquisitionTask(void *parameter) {
     }
 
     nextSampleUs += EMG_FRAME_PERIOD_US;
-    int32_t remainingUs = static_cast<int32_t>(nextSampleUs - micros());
+    int64_t remainingUs = nextSampleUs - esp_timer_get_time();
     if (remainingUs > 0) {
       if (remainingUs > SHORT_BUSY_WAIT_US) {
         delayMicroseconds(static_cast<unsigned int>(remainingUs - SHORT_BUSY_WAIT_US));
       }
-      while (static_cast<int32_t>(nextSampleUs - micros()) > 0) {
+      while ((nextSampleUs - esp_timer_get_time()) > 0) {
         // Short final spin for tighter frame timing.
       }
     } else {
       acquisitionOverrunsThisWindow++;
-      nextSampleUs = micros();
+      nextSampleUs = esp_timer_get_time();
     }
   }
 }
