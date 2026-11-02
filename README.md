@@ -558,3 +558,18 @@ If you use BioWave in your academic research, please cite:
   howpublished={\url{https://github.com/shimulshoishob/BioWaveEMG_ArmBand}}
 }
 ```
+
+## Recording format (BWIM v2, continuous capture)
+
+* **Secrets.** Copy `ESP32_S3 Setup/secrets.example.h` to `secrets.h` and `code/device_secret.example.json` to
+  `code/device_secret.json`, using the same long random key in both (both real files are gitignored). The firmware will
+  not compile, and the app will not connect, while the placeholder key is in use.
+* **What a session writes** (folder `<ID>_day<NN>_<hand-order>_<UTC>`, e.g. `S03_day01_left-right_20261103T012608Z`):
+  `signals_*.csv` (every device frame, raw ADC counts, labelled by device frame ID), `events_*.csv` (phase changes with the
+  resolved frame IDs), `quality_*.json` (packets, gaps, device counters, clipping, expected vs actual frames),
+  `metadata_*.json` / `.txt`, and `raw_*.bin` (the unlabelled frame stream the other files are derived from).
+* **Gaps are explicit.** Frames that never arrived are rows with `Valid=0`, NaN channels and the correct frame ID;
+  device timestamps are never invented (`-1`). Label edges switch at an exact frame.
+* **Pilot data.** `python code/tools/repair_sessions.py` writes repaired copies of `dataset/` to `dataset_repaired/`
+  (never in place, pseudonymous names, marked `pilot`).
+* **Tests.** `pytest` (from the repository root or `code/`).

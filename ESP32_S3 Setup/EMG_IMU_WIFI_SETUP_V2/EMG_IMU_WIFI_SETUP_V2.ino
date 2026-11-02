@@ -23,26 +23,46 @@
  * per second. Each UDP packet starts with a small header followed by 5
  * consecutive frames.
  *
+ * BWIM v2 (little endian; the first 12 header bytes are identical to v1, so a
+ * v1 parser can still identify the version before rejecting the packet):
+ *
  * Header:
  *   char     magic[4]   = "BWIM"
- *   uint8_t  version    = 1
+ *   uint8_t  version    = 2
  *   uint8_t  frameCount = 5
- *   uint16_t frameSize  = 48
+ *   uint16_t frameSize  = 56
  *   uint32_t packetSequence
+ *   uint32_t queueDrops        (cumulative since boot: packets dropped from the send queue)
+ *   uint32_t acqOverruns       (cumulative: frames whose sampling deadline was missed)
+ *   uint32_t sendFailures      (cumulative: udp.beginPacket/endPacket failures)
+ *   uint16_t wifiReconnects    (cumulative: successful Wi-Fi re-associations)
+ *   uint16_t headerFlags       (reserved, 0)
+ *   -> header is 28 bytes. Counters are stamped when the packet is sent, so
+ *      they include failures of earlier packets, never of the packet itself.
+ *
+ * Frame flags (bit 0): the frame was sampled late (deadline overrun).
  *
  * Frames:
  *   5 x {
  *     uint32_t frameId
- *     uint32_t frameTimestampUs
+ *     uint64_t frameTimestampUs   (esp_timer, microseconds since boot, never wraps)
  *     uint32_t imuSampleId
- *     uint32_t imuTimestampUs
+ *     uint64_t imuTimestampUs     (esp_timer, microseconds since boot, never wraps)
  *     uint16_t emg[8]
  *     float    roll
  *     float    pitch
  *     float    yaw
  *     uint8_t  imuFresh
- *     uint8_t  reserved[3]
+ *     uint8_t  flags
+ *     uint16_t reserved
  *   }
+ *
+ * USB streaming (USBSTART) sends the SAME v2 packet bytes, followed by a CRC-16/CCITT-FALSE
+ * (poly 0x1021, init 0xFFFF, little endian) over the packet, COBS-encoded and terminated by a
+ * 0x00 delimiter. USBSTARTCSV selects the legacy "e1..e8,roll,pitch,yaw" CSV text stream.
+ *
+ * BWIM v1 (frameSize 48, 32-bit microsecond timestamps that wrap every ~71.6
+ * minutes) is no longer emitted. Host parsers must keep accepting it.
  */
 
 #include <Arduino.h>
@@ -51,6 +71,7 @@
 #include <SPI.h>
 #include <Preferences.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <mbedtls/md.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -58,22 +79,31 @@
 #include <freertos/semphr.h>
 #include "SparkFun_BNO08x_Arduino_Library.h"
 
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#error "secrets.h is missing: copy secrets.example.h to secrets.h and set a long random DEVICE_ACCESS_KEY_VALUE."
+#endif
+
 // ---------- NETWORK / CONTROL ----------
 static const uint16_t STREAM_PORT = 5000;
 static const uint16_t CONTROL_PORT = 5001;
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
-static const unsigned long STREAM_KEEPALIVE_TIMEOUT_MS = 5000;
+static const unsigned long STREAM_KEEPALIVE_TIMEOUT_MS = 15000;
 static const unsigned long CHALLENGE_TTL_MS = 30000;
+static const uint8_t CHALLENGE_SLOTS = 4;
 // USB serial baud. Must match the GUI (DEFAULT_BAUD_RATE / USB_SERIAL_BAUD).
 // 500 Hz x 11 channels of CSV text is ~30 KB/s, far beyond 115200 baud.
 static const uint32_t USB_SERIAL_BAUD = 921600;
 // A wired session ends if the GUI stops sending USBSTART/USBPING keepalives.
 static const unsigned long USB_STREAM_TIMEOUT_MS = 5000;
-static const char *FW_VERSION = "emg-imu-1.6.0";
+static const uint8_t BWIM_VERSION = 2;
+static const char *FW_VERSION = "emg-imu-2.0.0";
 
-// Change this before flashing.
-static const char *DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY";
+// The access key lives in the gitignored secrets.h (see secrets.example.h).
+static const char *DEVICE_ACCESS_KEY = CHANGE_THIS_TO_A_LONG_RANDOM_KEY;
+
 
 // ---------- EMG ----------
 static const uint8_t EMG_CHANNELS = 8;
@@ -98,6 +128,9 @@ static const UBaseType_t NETWORK_PRIORITY = 2;
 static const UBaseType_t IMU_PRIORITY = 2;
 static const uint8_t MAX_UDP_PACKETS_PER_PASS = 8;
 static const uint16_t SHORT_BUSY_WAIT_US = 75;
+// A frame sampled more than this after its deadline is flagged FRAME_FLAG_LATE.
+static const int64_t LATE_FRAME_THRESHOLD_US = 250;
+static const uint8_t FRAME_FLAG_LATE = 0x01;
 static const char *CREDENTIAL_PREFIX = "enc1";
 
 // ---------- IMU PINS ----------
@@ -110,12 +143,10 @@ static const char *CREDENTIAL_PREFIX = "enc1";
 
 // ---------- FORWARD DECLARATIONS ----------
 void handleSerialCommands();
-bool connectToSavedWiFi();
 void monitorWiFiState();
 void handleControlPacket();
 void printDiagnosticsIfDue();
 void flushFrameQueue();
-void sendFrameUdp(const void *frameData, size_t frameSize);
 void updateLatestImu();
 String randomHex(uint32_t value);
 String hmacSha256Hex(const String &message, const String &key);
@@ -131,7 +162,8 @@ TaskHandle_t imuTaskHandle = nullptr;
 portMUX_TYPE imuMutex = portMUX_INITIALIZER_UNLOCKED;
 
 volatile bool targetLocked = false;
-volatile bool usbStreaming = false;           // wired CSV streaming over USB serial
+volatile bool usbStreaming = false;           // wired streaming over USB serial
+volatile bool usbCsvMode = false;             // false: COBS+CRC16 binary BWIM v2, true: legacy CSV text
 volatile unsigned long lastUsbCommandMs = 0;
 volatile unsigned long lastAuthorizedCommandMs = 0;
 volatile unsigned long lastWiFiRetryMs = 0;
@@ -140,8 +172,16 @@ uint16_t streamTargetPort = STREAM_PORT;
 
 String deviceId;
 String deviceName;
-String pendingChallenge;
-unsigned long challengeIssuedAt = 0;
+// One outstanding challenge per remote (ip, port) so that a second client asking for a
+// challenge cannot invalidate the first client's.
+struct ChallengeSlot {
+  bool used;
+  uint32_t ip;
+  uint16_t port;
+  unsigned long issuedAt;
+  char challenge[17];
+};
+ChallengeSlot challengeSlots[CHALLENGE_SLOTS] = {};
 bool imuReady = false;
 
 struct LatestImuState {
@@ -149,20 +189,21 @@ struct LatestImuState {
   float pitch;
   float yaw;
   uint32_t sampleId;
-  uint32_t timestampUs;
+  uint64_t timestampUs;
 };
 
 struct __attribute__((packed)) EmgImuFrame {
   uint32_t frameId;
-  uint32_t frameTimestampUs;
+  uint64_t frameTimestampUs;
   uint32_t imuSampleId;
-  uint32_t imuTimestampUs;
+  uint64_t imuTimestampUs;
   uint16_t emg[EMG_CHANNELS];
   float roll;
   float pitch;
   float yaw;
   uint8_t imuFresh;
-  uint8_t reserved[3];
+  uint8_t flags;
+  uint16_t reserved;
 };
 
 struct __attribute__((packed)) PacketHeader {
@@ -171,12 +212,30 @@ struct __attribute__((packed)) PacketHeader {
   uint8_t frameCount;
   uint16_t frameSize;
   uint32_t packetSequence;
+  uint32_t queueDrops;
+  uint32_t acqOverruns;
+  uint32_t sendFailures;
+  uint16_t wifiReconnects;
+  uint16_t headerFlags;
 };
 
 struct __attribute__((packed)) EmgImuPacket {
   PacketHeader header;
   EmgImuFrame frames[EMG_FRAMES_PER_PACKET];
 };
+
+// Compile-time key checks. They sit after the type definitions on purpose: the Arduino
+// prototype generator inserts prototypes before the first function it sees.
+constexpr bool sameText(const char *a, const char *b) {
+  return (*a == *b) && (*a == '\0' || sameText(a + 1, b + 1));
+}
+constexpr size_t textLength(const char *a) {
+  return *a == '\0' ? 0 : 1 + textLength(a + 1);
+}
+static_assert(!sameText(DEVICE_ACCESS_KEY_VALUE, "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"),
+              "DEVICE_ACCESS_KEY_VALUE in secrets.h is still the placeholder: set a long random key before flashing.");
+static_assert(textLength(DEVICE_ACCESS_KEY_VALUE) >= 16,
+              "DEVICE_ACCESS_KEY_VALUE must be at least 16 characters.");
 
 LatestImuState latestImu = {0.0f, 0.0f, 0.0f, 0, 0};
 uint32_t packetSequenceCounter = 0;
@@ -186,6 +245,11 @@ volatile uint32_t imuEventsThisWindow = 0;
 volatile uint32_t udpPacketsSentThisWindow = 0;
 volatile uint32_t queueDropsThisWindow = 0;
 volatile uint32_t acquisitionOverrunsThisWindow = 0;
+// Cumulative health counters, reported in every packet header.
+volatile uint32_t queueDropsTotal = 0;
+volatile uint32_t acquisitionOverrunsTotal = 0;
+volatile uint32_t udpSendFailuresTotal = 0;
+volatile uint16_t wifiReconnectsTotal = 0;
 unsigned long diagnosticsWindowStartMs = 0;
 
 static inline int readADCStable(int pin) {
@@ -415,62 +479,41 @@ int countTokens(const String &message) {
 String helloPacket() {
   return "HELLO|" + deviceId + "|" + deviceName + "|" + currentWiFiModeString() + "|" +
          currentReachableIpString() + "|" + String(imuReady ? 1 : 0) + "|" +
-         String(targetLocked ? 1 : 0) + "|" + FW_VERSION;
+         String(targetLocked ? 1 : 0) + "|" + FW_VERSION + "|" + String(EMG_FRAME_RATE_HZ);
 }
 
 bool enableOrientationReport() {
   return myIMU.enableRotationVector(IMU_REPORT_INTERVAL_MS);
 }
 
-bool connectToSavedWiFi() {
+// Wi-Fi connection state machine. wifiTick() is called on every network-task pass and never
+// blocks: it only starts an attempt, checks WiFi.status(), or waits out the retry interval.
+enum WifiState : uint8_t { WIFI_STATE_IDLE, WIFI_STATE_CONNECTING, WIFI_STATE_BACKOFF };
+static WifiState wifiState = WIFI_STATE_IDLE;
+static unsigned long wifiAttemptStartedMs = 0;
+static bool wifiEverConnected = false;
+static bool savedCredentialsPresent = false;   // cached: reading Preferences + HMAC every pass is slow
+
+void beginWiFiAttempt() {
   String savedSsid;
   String savedPass;
   loadWiFiCredentials(savedSsid, savedPass);
-
-  if (savedSsid.length() == 0) {
-    udp.stop();
-    return false;
+  savedCredentialsPresent = savedSsid.length() > 0;
+  if (!savedCredentialsPresent) {
+    wifiState = WIFI_STATE_BACKOFF;   // re-check storage every retry interval, not every pass
+    lastWiFiRetryMs = millis();
+    return;
   }
 
-  Serial.println();
-  Serial.println("====================================");
   Serial.print("Connecting to saved Wi-Fi: ");
   Serial.println(savedSsid);
-  Serial.println("====================================");
 
-  clearStreamTarget();
-  WiFi.disconnect(true, true);
-  delay(200);
+  WiFi.disconnect(false, false);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(savedSsid.c_str(), savedPass.c_str());
-
-  unsigned long startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - startedAt) < WIFI_CONNECT_TIMEOUT_MS) {
-    handleSerialCommands();
-    delay(50);
-    handleSerialCommands();
-    delay(50);
-    handleSerialCommands();
-    delay(50);
-    handleSerialCommands();
-    delay(50);
-    handleSerialCommands();
-    delay(50);
-    Serial.print(".");
-  }
-  Serial.println();
-
-  if (WiFi.status() != WL_CONNECTED) {
-    udp.stop();
-    Serial.println("Wi-Fi connection failed. Waiting for USB provisioning or later retry.");
-    return false;
-  }
-
-  restartControlSocket();
-  Serial.print("Connected. IP address: ");
-  Serial.println(WiFi.localIP());
-  return true;
+  wifiAttemptStartedMs = millis();
+  wifiState = WIFI_STATE_CONNECTING;
 }
 
 void initImu() {
@@ -496,7 +539,7 @@ void initImu() {
     if (enableOrientationReport()) {
       imuReady = true;
       latestImu.sampleId = 0;
-      latestImu.timestampUs = micros();
+      latestImu.timestampUs = static_cast<uint64_t>(esp_timer_get_time());
       diagnosticsWindowStartMs = millis();
       Serial.println("Rotation Vector enabled with a 200 Hz request.");
       return;
@@ -509,15 +552,57 @@ void initImu() {
   imuReady = false;
 }
 
-bool verifyAuthorizedCommand(const String &command, const String &challenge, const String &payload, const String &authHex) {
-  if (pendingChallenge.length() == 0) {
+ChallengeSlot *findChallengeSlot(const IPAddress &remoteIp, uint16_t remotePort) {
+  uint32_t ip = static_cast<uint32_t>(remoteIp);
+  for (uint8_t i = 0; i < CHALLENGE_SLOTS; ++i) {
+    if (challengeSlots[i].used && challengeSlots[i].ip == ip && challengeSlots[i].port == remotePort) {
+      return &challengeSlots[i];
+    }
+  }
+  return nullptr;
+}
+
+// Reuse the caller's slot, else a free/expired slot, else evict the oldest one.
+String issueChallenge(const IPAddress &remoteIp, uint16_t remotePort) {
+  ChallengeSlot *slot = findChallengeSlot(remoteIp, remotePort);
+  unsigned long now = millis();
+  if (slot == nullptr) {
+    ChallengeSlot *oldest = &challengeSlots[0];
+    for (uint8_t i = 0; i < CHALLENGE_SLOTS; ++i) {
+      ChallengeSlot &candidate = challengeSlots[i];
+      if (!candidate.used || (now - candidate.issuedAt) > CHALLENGE_TTL_MS) {
+        slot = &candidate;
+        break;
+      }
+      if ((now - candidate.issuedAt) > (now - oldest->issuedAt)) {
+        oldest = &candidate;
+      }
+    }
+    if (slot == nullptr) {
+      slot = oldest;
+    }
+  }
+  String challenge = generateChallenge();
+  slot->used = true;
+  slot->ip = static_cast<uint32_t>(remoteIp);
+  slot->port = remotePort;
+  slot->issuedAt = now;
+  strncpy(slot->challenge, challenge.c_str(), sizeof(slot->challenge) - 1);
+  slot->challenge[sizeof(slot->challenge) - 1] = '\0';
+  return challenge;
+}
+
+bool verifyAuthorizedCommand(const String &command, const String &challenge, const String &payload,
+                             const String &authHex, const IPAddress &remoteIp, uint16_t remotePort) {
+  ChallengeSlot *slot = findChallengeSlot(remoteIp, remotePort);
+  if (slot == nullptr) {
     return false;
   }
-  if ((millis() - challengeIssuedAt) > CHALLENGE_TTL_MS) {
-    pendingChallenge = "";
+  if ((millis() - slot->issuedAt) > CHALLENGE_TTL_MS) {
+    slot->used = false;
     return false;
   }
-  if (challenge != pendingChallenge) {
+  if (!secureEquals(String(slot->challenge), challenge)) {
     return false;
   }
 
@@ -528,7 +613,7 @@ bool verifyAuthorizedCommand(const String &command, const String &challenge, con
 
   String expectedAuth = hmacSha256Hex(message, DEVICE_ACCESS_KEY);
   bool ok = secureEquals(expectedAuth, authHex);
-  pendingChallenge = "";
+  slot->used = false;   // each challenge is single use
 
   if (ok) {
     lastAuthorizedCommandMs = millis();
@@ -547,7 +632,7 @@ void handleStart(const String &message, const IPAddress &remoteIp, uint16_t remo
   String clientPortText = getToken(message, 3);
   String authHex = getToken(message, 4);
 
-  if (!verifyAuthorizedCommand("START", challenge, clientIpText + "|" + clientPortText, authHex)) {
+  if (!verifyAuthorizedCommand("START", challenge, clientIpText + "|" + clientPortText, authHex, remoteIp, remotePort)) {
     sendReply(remoteIp, remotePort, "ERR|AUTH_FAILED");
     return;
   }
@@ -589,7 +674,7 @@ void handleStop(const String &message, const IPAddress &remoteIp, uint16_t remot
   String challenge = getToken(message, 1);
   String authHex = getToken(message, 2);
 
-  if (!verifyAuthorizedCommand("STOP", challenge, "", authHex)) {
+  if (!verifyAuthorizedCommand("STOP", challenge, "", authHex, remoteIp, remotePort)) {
     sendReply(remoteIp, remotePort, "ERR|AUTH_FAILED");
     return;
   }
@@ -607,7 +692,7 @@ void handlePing(const String &message, const IPAddress &remoteIp, uint16_t remot
   String challenge = getToken(message, 1);
   String authHex = getToken(message, 2);
 
-  if (!verifyAuthorizedCommand("PING", challenge, "", authHex)) {
+  if (!verifyAuthorizedCommand("PING", challenge, "", authHex, remoteIp, remotePort)) {
     sendReply(remoteIp, remotePort, "ERR|AUTH_FAILED");
     return;
   }
@@ -642,9 +727,7 @@ void handleControlPacket() {
   }
 
   if (message == "CHALLENGE") {
-    pendingChallenge = generateChallenge();
-    challengeIssuedAt = millis();
-    sendReply(remoteIp, remotePort, "CHALLENGE|" + pendingChallenge);
+    sendReply(remoteIp, remotePort, "CHALLENGE|" + issueChallenge(remoteIp, remotePort));
     return;
   }
 
@@ -660,24 +743,35 @@ void handleControlPacket() {
   }
 }
 
+// While a binary USB stream is running, a text reply must not glue itself to the next frame:
+// a 0x00 first terminates whatever frame was in flight, so the text parses as its own chunk.
+void writeSerialFrameBreak() {
+  if (usbStreaming && !usbCsvMode) {
+    Serial.write(static_cast<uint8_t>(0));
+  }
+}
+
 void processSerialCommand(const String &line) {
   if (line.length() == 0) {
     return;
   }
 
   if (line == "INFO") {
+    writeSerialFrameBreak();
     Serial.println(
       "INFO|" + deviceId + "|" + deviceName + "|" + String(imuReady ? 1 : 0) + "|" +
-      String(hasSavedWiFiCredentials() ? 1 : 0) + "|" + FW_VERSION
+      String(hasSavedWiFiCredentials() ? 1 : 0) + "|" + FW_VERSION + "|" + String(EMG_FRAME_RATE_HZ)
     );
     return;
   }
 
-  if (line == "USBSTART" || line == "USBPING") {
-    // Wired mode: stream "e1..e8,roll,pitch,yaw" CSV lines (11 values) at 500 Hz.
-    // USBSTART is repeated by the GUI as a keepalive, so only reset on a new session.
-    if (!usbStreaming) {
+  if (line == "USBSTART" || line == "USBSTARTCSV" || line == "USBPING") {
+    // Wired mode. USBSTART streams COBS+CRC16 framed binary BWIM v2 packets; USBSTARTCSV streams the
+    // legacy CSV text. Either is repeated by the GUI as a keepalive (USBPING refreshes only), so the
+    // mode and queue are only reset when a new session starts.
+    if (!usbStreaming && line != "USBPING") {
       flushFrameQueue();
+      usbCsvMode = (line == "USBSTARTCSV");
       usbStreaming = true;
     }
     lastUsbCommandMs = millis();
@@ -713,6 +807,7 @@ void processSerialCommand(const String &line) {
     return;
   }
 
+  writeSerialFrameBreak();
   Serial.println("ERR|UNKNOWN_COMMAND");
 }
 
@@ -753,7 +848,7 @@ void updateLatestImu() {
     tempImu.roll = myIMU.getRoll() * (180.0f / PI);
     tempImu.pitch = myIMU.getPitch() * (180.0f / PI);
     tempImu.yaw = myIMU.getYaw() * (180.0f / PI);
-    tempImu.timestampUs = micros();
+    tempImu.timestampUs = static_cast<uint64_t>(esp_timer_get_time());
     imuEventsThisWindow++;
     sawNewImu = true;
   }
@@ -797,9 +892,64 @@ void queueFrame(const EmgImuPacket &packet) {
     // If this still fails, the consumer is badly stalled; keep going.
   }
   queueDropsThisWindow++;
+  queueDropsTotal++;
 }
 
-// One CSV line per frame: 8 raw ADC counts, then roll,pitch,yaw in degrees.
+uint16_t crc16Ccitt(const uint8_t *data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; ++i) {
+    crc ^= static_cast<uint16_t>(data[i]) << 8;
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021) : static_cast<uint16_t>(crc << 1);
+    }
+  }
+  return crc;
+}
+
+// Consistent Overhead Byte Stuffing: the output contains no 0x00, so 0x00 can delimit frames.
+size_t cobsEncode(const uint8_t *input, size_t length, uint8_t *output) {
+  size_t readIndex = 0;
+  size_t writeIndex = 1;
+  size_t codeIndex = 0;
+  uint8_t code = 1;
+  while (readIndex < length) {
+    if (input[readIndex] == 0) {
+      output[codeIndex] = code;
+      code = 1;
+      codeIndex = writeIndex++;
+      readIndex++;
+    } else {
+      output[writeIndex++] = input[readIndex++];
+      code++;
+      if (code == 0xFF) {
+        output[codeIndex] = code;
+        code = 1;
+        codeIndex = writeIndex++;
+      }
+    }
+  }
+  output[codeIndex] = code;
+  return writeIndex;
+}
+
+void sendPacketUsbBinary(EmgImuPacket &packet) {
+  stampHeaderCounters(packet);
+  uint8_t raw[sizeof(EmgImuPacket) + 2];
+  memcpy(raw, &packet, sizeof(packet));
+  const uint16_t crc = crc16Ccitt(raw, sizeof(packet));
+  raw[sizeof(packet)] = static_cast<uint8_t>(crc & 0xFF);
+  raw[sizeof(packet) + 1] = static_cast<uint8_t>(crc >> 8);
+  uint8_t encoded[sizeof(raw) + (sizeof(raw) / 254) + 3];
+  size_t n = cobsEncode(raw, sizeof(raw), encoded);
+  encoded[n++] = 0;
+  if (Serial.write(encoded, n) != n) {
+    udpSendFailuresTotal++;   // short write: the transport could not take the whole frame
+    return;
+  }
+  udpPacketsSentThisWindow++;
+}
+
+// Legacy CSV: one line per frame, 8 raw ADC counts, then roll,pitch,yaw in degrees.
 void sendPacketUsb(const EmgImuPacket &packet) {
   char line[96];
   for (uint8_t i = 0; i < packet.header.frameCount; ++i) {
@@ -814,10 +964,25 @@ void sendPacketUsb(const EmgImuPacket &packet) {
   udpPacketsSentThisWindow++;
 }
 
-void sendFrameUdp(const void *frameData, size_t frameSize) {
-  udp.beginPacket(streamTargetIP, streamTargetPort);
-  udp.write(reinterpret_cast<const uint8_t *>(frameData), frameSize);
-  udp.endPacket();
+void stampHeaderCounters(EmgImuPacket &packet) {
+  packet.header.queueDrops = queueDropsTotal;
+  packet.header.acqOverruns = acquisitionOverrunsTotal;
+  packet.header.sendFailures = udpSendFailuresTotal;
+  packet.header.wifiReconnects = wifiReconnectsTotal;
+  packet.header.headerFlags = 0;
+}
+
+void sendFrameUdp(EmgImuPacket &packet) {
+  stampHeaderCounters(packet);
+  bool ok = udp.beginPacket(streamTargetIP, streamTargetPort) != 0;
+  if (ok) {
+    udp.write(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
+    ok = udp.endPacket() != 0;
+  }
+  if (!ok) {
+    udpSendFailuresTotal++;
+    return;
+  }
   udpPacketsSentThisWindow++;
 }
 
@@ -860,21 +1025,44 @@ void printDiagnosticsIfDue() {
 }
 
 void monitorWiFiState() {
-  if (WiFi.status() == WL_CONNECTED) {
+  const bool connected = WiFi.status() == WL_CONNECTED;
+
+  if (connected) {
+    if (wifiState == WIFI_STATE_CONNECTING) {
+      restartControlSocket();
+      if (wifiEverConnected) {
+        wifiReconnectsTotal++;
+      }
+      wifiEverConnected = true;
+      Serial.print("Connected. IP address: ");
+      Serial.println(WiFi.localIP());
+    }
+    wifiState = WIFI_STATE_IDLE;
     return;
   }
 
-  if (!hasSavedWiFiCredentials()) {
-    return;
+  const unsigned long now = millis();
+  switch (wifiState) {
+    case WIFI_STATE_CONNECTING:
+      if ((now - wifiAttemptStartedMs) > WIFI_CONNECT_TIMEOUT_MS) {
+        Serial.println("Wi-Fi connection attempt timed out.");
+        wifiState = WIFI_STATE_BACKOFF;
+        lastWiFiRetryMs = now;
+      }
+      break;
+    case WIFI_STATE_BACKOFF:
+      if ((now - lastWiFiRetryMs) >= WIFI_RETRY_INTERVAL_MS) {
+        beginWiFiAttempt();
+      }
+      break;
+    case WIFI_STATE_IDLE:
+    default:
+      // First attempt after boot, or the link dropped while connected.
+      if (savedCredentialsPresent || !wifiEverConnected) {
+        beginWiFiAttempt();
+      }
+      break;
   }
-
-  if ((millis() - lastWiFiRetryMs) < WIFI_RETRY_INTERVAL_MS) {
-    return;
-  }
-
-  lastWiFiRetryMs = millis();
-  Serial.println("Retrying saved Wi-Fi connection...");
-  connectToSavedWiFi();
 }
 
 void acquisitionTask(void *parameter) {
@@ -883,15 +1071,16 @@ void acquisitionTask(void *parameter) {
   memset(&frame, 0, sizeof(frame));
   memset(&packet, 0, sizeof(packet));
   memcpy(packet.header.magic, "BWIM", 4);
-  packet.header.version = 1;
+  packet.header.version = BWIM_VERSION;
   packet.header.frameCount = EMG_FRAMES_PER_PACKET;
   packet.header.frameSize = sizeof(EmgImuFrame);
   packet.header.packetSequence = 0;
 
   uint32_t frameId = 0;
-  uint32_t nextSampleUs = micros();
+  int64_t nextSampleUs = esp_timer_get_time();
   uint32_t lastPackedSampleId = 0;
   uint8_t packetFrameIndex = 0;
+  bool lateNextFrame = false;
 
   for (;;) {
     LatestImuState currentImu;
@@ -900,7 +1089,7 @@ void acquisitionTask(void *parameter) {
     portEXIT_CRITICAL(&imuMutex);
 
     frame.frameId = frameId++;
-    frame.frameTimestampUs = micros();
+    frame.frameTimestampUs = static_cast<uint64_t>(esp_timer_get_time());
 
     for (int ch = 0; ch < EMG_CHANNELS; ++ch) {
       frame.emg[ch] = static_cast<uint16_t>(readADCStable(EMG_PINS[ch]));
@@ -913,9 +1102,12 @@ void acquisitionTask(void *parameter) {
     frame.yaw = currentImu.yaw;
     frame.imuFresh = (currentImu.sampleId != lastPackedSampleId) ? 1 : 0;
     lastPackedSampleId = currentImu.sampleId;
-    frame.reserved[0] = 0;
-    frame.reserved[1] = 0;
-    frame.reserved[2] = 0;
+    frame.flags = 0;
+    if (lateNextFrame || (static_cast<int64_t>(frame.frameTimestampUs) - nextSampleUs) > LATE_FRAME_THRESHOLD_US) {
+      frame.flags |= FRAME_FLAG_LATE;
+    }
+    lateNextFrame = false;
+    frame.reserved = 0;
 
     emgFramesThisWindow++;
 
@@ -933,17 +1125,19 @@ void acquisitionTask(void *parameter) {
     }
 
     nextSampleUs += EMG_FRAME_PERIOD_US;
-    int32_t remainingUs = static_cast<int32_t>(nextSampleUs - micros());
+    int64_t remainingUs = nextSampleUs - esp_timer_get_time();
     if (remainingUs > 0) {
       if (remainingUs > SHORT_BUSY_WAIT_US) {
         delayMicroseconds(static_cast<unsigned int>(remainingUs - SHORT_BUSY_WAIT_US));
       }
-      while (static_cast<int32_t>(nextSampleUs - micros()) > 0) {
+      while ((nextSampleUs - esp_timer_get_time()) > 0) {
         // Short final spin for tighter frame timing.
       }
     } else {
       acquisitionOverrunsThisWindow++;
-      nextSampleUs = micros();
+      acquisitionOverrunsTotal++;
+      lateNextFrame = true;
+      nextSampleUs = esp_timer_get_time();
     }
   }
 }
@@ -976,13 +1170,17 @@ void networkTask(void *parameter) {
       } else {
         // Drain everything queued so USB output never lags behind acquisition.
         while (xQueueReceive(frameQueue, &packet, 0) == pdTRUE) {
-          sendPacketUsb(packet);
+          if (usbCsvMode) {
+            sendPacketUsb(packet);
+          } else {
+            sendPacketUsbBinary(packet);
+          }
         }
       }
     } else if (streamActive) {
       uint8_t packetsSentThisPass = 0;
       while (packetsSentThisPass < MAX_UDP_PACKETS_PER_PASS && xQueueReceive(frameQueue, &packet, 0) == pdTRUE) {
-        sendFrameUdp(&packet, sizeof(packet));
+        sendFrameUdp(packet);
         packetsSentThisPass++;
       }
     } else {
@@ -1023,9 +1221,8 @@ void setup() {
 
   initImu();
 
-  if (hasSavedWiFiCredentials()) {
-    connectToSavedWiFi();
-  } else {
+  savedCredentialsPresent = hasSavedWiFiCredentials();   // the network task starts the connection
+  if (!savedCredentialsPresent) {
     Serial.println("No saved Wi-Fi credentials. Waiting for USB provisioning command.");
   }
 

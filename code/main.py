@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import random
+import secrets
 import socket
 import struct
 import subprocess
@@ -14,6 +15,7 @@ import traceback
 from collections import deque
 from dataclasses import dataclass
 from html import escape as html_escape
+from typing import Optional
 from urllib.parse import quote
 
 import numpy as np
@@ -88,7 +90,12 @@ from app_theme import (
     themed_label_style,
     themed_status_color,
 )
-from emg_v4_core import WirelessStats
+from study_meta import (CONSENT_FORM_VERSION, build_metadata_json, default_hand_order, normalize_participant_id,
+                        parse_info_line, session_folder_name, valid_participant_id)
+from session_recording import (ContinuousRecorder, EventLog, LABEL_CODES, LABEL_MAP, MIN_VALID_SAMPLE_RATIO,
+                               PSEUDO_LABELS, SIGNAL_COLUMNS, finalize_session)
+from emg_v4_core import (StreamAssembler, UsbFrameDecoder, WirelessStats, parse_bwim_packet,
+                         segments_to_payload)
 
 try:
     import pywt  # Optional for wavelet-energy features
@@ -170,6 +177,7 @@ GESTURE_IMAGE_FILES = {
     "doublefistclose": "double_fist_close.png",
     "doublefist": "double_fist_close.png",
     "pinch": "pinch.png",
+    "pinchthumbindex": "pinch.png",
     "pinchusingthumbandindexfinger": "pinch.png",
     "indexthumbpinch": "pinch.png",
     "thumbindexpinch": "pinch.png",
@@ -257,6 +265,9 @@ class StableLabel(QLabel):
 
 # --- PARTICIPANT INFO (data collection; saved to the metadata file) ---
 BLOOD_GROUP_OPTIONS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
+ELECTRODE_LANDMARKS = ["Lateral epicondyle", "Medial epicondyle", "Olecranon", "Ulnar styloid process",
+                       "Radial styloid process", "Other"]
+SKIN_PREPARATIONS = ["None (dry skin)", "Alcohol wipe", "Shaved + alcohol", "Abraded + alcohol"]
 
 
 def _value_or_na(value, fmt, cast=float):
@@ -328,7 +339,9 @@ def center_window(window, parent_widget=None):
 
 # --- DEFAULTS ---
 APP_NAME = "BioWave - EMG"
-DEFAULT_BAUD_RATE = 921600
+APP_VERSION = "2.0.0"
+DEFAULT_BAUD_RATE = 921600   # keep equal to USB_SERIAL_BAUD and the firmware's USB_SERIAL_BAUD
+USB_KEEPALIVE_INTERVAL_S = 2.0
 WINDOW_SIZE = 1000               # Number of samples shown on each channel
 SAMPLE_RATE = 500                # Hz (matching ESP32 sketch)
 PLOT_REFRESH_MS = 33             # ~30 FPS UI refresh (EMG does not need 50 FPS)
@@ -348,10 +361,11 @@ DEFAULT_HZ_THRESHOLD = 30.0      # EMG dominant-frequency gate before calibratio
 FFT_MIN_HZ = 20.0                # Typical lower EMG band edge
 FFT_MAX_HZ = 220.0               # Keep below Nyquist (250Hz at 500Hz sample rate)
 BAND_DEFS = [(20.0, 60.0), (60.0, 120.0), (120.0, 220.0)]
-MAINS_FREQS = [50.0, 60.0]
+MAINS_FREQS = [50.0, 100.0, 150.0, 200.0]   # 50 Hz mains and harmonics; analysis displays only, never applied to saved data
 MAINS_BAND_HZ = 2.0
 MAX_LAG_SAMPLES = int(0.10 * SAMPLE_RATE)
-DEFAULT_TASK_LABELS ="Left,Right,fist_close,Up,Down,Double_Closed_Fist,Victory_Sign,Thumbs_Up,Pinch_using_thumb_and_index_finger,Rest"
+# Dataset label names (see session_recording.LABEL_MAP for the old names and numeric codes).
+DEFAULT_TASK_LABELS = "left,right,fist_close,up,down,double_fist_close,victory_sign,thumbs_up,pinch_thumb_index,rest"
 # --- STUDY PROTOCOL (defaults follow the approved study procedure) ---
 # One task cycle = 4 s prepare + 3 s perform/hold + 3 s rest = 10 s. The rest period is
 # recorded as its own class. Each day: 9 repetitions per hand (left + right) of every class.
@@ -374,13 +388,17 @@ DEFAULT_HAND_SWITCH_BREAK_S = 300   # ~5 min when the armband moves to the other
 STUDY_ENV_KEYS = ("temp_start_c", "humidity_start_pct")
 DEFAULT_RECORD_CSV = "realtime_collected_emg.csv"
 DEFAULT_RF_MODEL_ARTIFACT = "rf_realtime_model.joblib"
-MIN_RECORD_SAMPLE_RATIO = 0.80
-USB_SERIAL_BAUD = 115200
+MIN_RECORD_SAMPLE_RATIO = MIN_VALID_SAMPLE_RATIO   # 0.98 of expected frames must be valid
+USB_SERIAL_BAUD = 921600
 SERIAL_BOOT_WAIT_S = 3.5
 SERIAL_RESPONSE_TIMEOUT_S = 15.0
 WIFI_STREAM_PORT = 5000
 WIFI_CONTROL_PORT = 5001
-DEFAULT_DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"
+PLACEHOLDER_DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"
+MIN_DEVICE_ACCESS_KEY_LEN = 16
+DEVICE_SECRET_PATH = os.path.join(SCRIPT_DIR, "device_secret.json")   # gitignored; see device_secret.example.json
+CONTROL_RETRY_BACKOFF_S = (0.2, 0.5, 1.0)   # waits before retry 1..3 of a control command
+KEEPALIVE_RESTART_AFTER = 2                 # consecutive failed pings before START is re-issued
 DISCOVERY_ADDRESS = "255.255.255.255"
 DISCOVERY_TIMEOUT = 1.2
 CONTROL_TIMEOUT = 2.0
@@ -477,6 +495,7 @@ class PacketTracer:
             self.kind = str(kind)
             self.frames_per_packet = max(1, int(frames_per_packet))
             self.stats = WirelessStats()
+            self.asm = {}
             self.invalid_lines = 0
             self.samples = 0
             self.bytes = 0
@@ -491,16 +510,26 @@ class PacketTracer:
             self.missing_history = deque(maxlen=self.HISTORY)
 
     # -- writers (receive thread) ------------------------------------------------
-    def observe_wireless(self, sequence, n_samples, n_bytes, arrival):
-        """Record one datagram; returns how many packets were missing before it."""
+    def observe_packet(self, n_samples, n_bytes, arrival):
+        """Record one received datagram/USB frame (arrival order; loss accounting comes from the assembler)."""
         with self._lock:
-            gap = self.stats.observe(sequence, arrival)
+            self.stats.packets_received += 1
+            if self.stats.last_arrival is not None:
+                self.stats.arrival_intervals.append(arrival - self.stats.last_arrival)
+            self.stats.last_arrival = arrival
             self.samples += int(n_samples)
             self.bytes += int(n_bytes)
             if self.last_arrival:
                 self.max_gap_s = max(self.max_gap_s, arrival - self.last_arrival)
             self.last_arrival = arrival
-            return gap
+
+    def sync_assembler(self, asm_stats):
+        """Copy the sequencer's loss / late / duplicate counters (called by the receive thread)."""
+        with self._lock:
+            self.stats.packets_missing = int(asm_stats["packets_missing"])
+            self.stats.packets_out_of_order = int(asm_stats["packets_reordered"] + asm_stats["packets_late"]
+                                                  + asm_stats["packets_duplicate"])
+            self.asm = dict(asm_stats)
 
     def observe_invalid_packet(self):
         with self._lock:
@@ -549,6 +578,10 @@ class PacketTracer:
                 "missing": missing,
                 "missing_samples": missing * (self.frames_per_packet if self.kind == "wireless" else 1),
                 "out_of_order": int(self.stats.packets_out_of_order),
+                "late": int(self.asm.get("packets_late", 0)),
+                "duplicate": int(self.asm.get("packets_duplicate", 0)),
+                "frames_missing": int(self.asm.get("frames_missing", 0)),
+                "device_counters": dict(self.asm.get("device_counters", {})),
                 "invalid": int(self.stats.invalid_packets) + int(self.invalid_lines),
                 "loss_pct": (100.0 * missing / total) if total else 0.0,
                 "pkt_rate": float(self.pkt_rate),
@@ -567,12 +600,20 @@ class PacketTracer:
 
 
 class SerialWorker(QThread):
+    """Wired receiver.
+
+    A real COM port carries the same BWIM v2 packets as Wi-Fi, COBS-framed with a CRC-16, so the
+    wired stream has packet sequence numbers, 64-bit device timestamps and all 11 channels. The
+    app sends USBSTART after opening the port (repeated until data flows), USBPING every 2 s as a
+    keepalive and USBSTOP on shutdown. ``socket://`` URLs (the simulator) keep the legacy CSV text.
+    """
     batch_received = pyqtSignal(object)  # dict: batch (n, channels), packet_numbers, source
     error_occurred = pyqtSignal(str)
 
     FLUSH_INTERVAL_S = 0.040
 
-    def __init__(self, port_name, baud_rate, num_channels, batch_size=SERIAL_BATCH_SIZE, tracer=None):
+    def __init__(self, port_name, baud_rate, num_channels, batch_size=SERIAL_BATCH_SIZE, tracer=None,
+                 binary=None):
         super().__init__()
         self.port_name = port_name
         self.baud_rate = baud_rate
@@ -580,9 +621,12 @@ class SerialWorker(QThread):
         self.batch_size = batch_size
         self.tracer = tracer
         self.is_socket_url = str(port_name).strip().lower().startswith("socket://")
+        self.binary = (not self.is_socket_url) if binary is None else bool(binary)
         self._running = True
         self._serial = None
         self._packet_sequence_counter = 0
+        self._assembler = StreamAssembler()
+        self.device_info = {}
 
     def _emit_batch(self, batch):
         arr = np.asarray(batch, dtype=np.float32)
@@ -593,9 +637,15 @@ class SerialWorker(QThread):
         packet_numbers = np.full(arr.shape[0], packet_no, dtype=np.int64)
         self.batch_received.emit({"batch": arr, "packet_numbers": packet_numbers, "source": "serial"})
 
-    def _close_serial(self):
+    def _close_serial(self, send_stop=False):
         try:
             if self._serial and self._serial.is_open:
+                if send_stop and self.binary:
+                    try:
+                        self._serial.write(b"USBSTOP\n")
+                        self._serial.flush()
+                    except Exception:
+                        pass
                 self._serial.close()
         except Exception:
             pass
@@ -603,7 +653,14 @@ class SerialWorker(QThread):
 
     def _open_serial(self):
         # Supports both COM ports (e.g. COM3) and URL handlers (e.g. socket://127.0.0.1:7000).
-        ser = serial.serial_for_url(self.port_name, self.baud_rate, timeout=0.02)
+        ser = serial.serial_for_url(self.port_name, self.baud_rate, timeout=0.02, write_timeout=1.0, do_not_open=True)
+        if self.binary:
+            try:
+                ser.dtr = False   # do not reset the ESP32 when the port opens
+                ser.rts = False
+            except Exception:
+                pass
+        ser.open()
         try:
             ser.set_buffer_size(rx_size=262144)   # Windows only; headroom against UI stalls
         except Exception:
@@ -614,64 +671,146 @@ class SerialWorker(QThread):
             pass
         return ser
 
-    def run(self):
+    # -- binary (BWIM v2 over COBS) ------------------------------------------------------
+    def _run_binary(self):
+        decoder = UsbFrameDecoder()
+        asm = self._assembler = StreamAssembler()
+        pending, last_flush = [], time.monotonic()
+        last_command, last_packet = 0.0, 0.0
+        while self._running:
+            try:
+                if self._serial is None or not self._serial.is_open:
+                    self._serial = self._open_serial()
+                    decoder = UsbFrameDecoder()
+                    last_command = last_packet = 0.0
+                    self._serial.write(b"INFO\n")        # device id / firmware / sampling rate for the metadata
+                now = time.monotonic()
+                if now - last_command >= USB_KEEPALIVE_INTERVAL_S:
+                    # USBSTART (re)starts the stream until packets flow; USBPING keeps it alive after.
+                    streaming = last_packet and (now - last_packet) < USB_KEEPALIVE_INTERVAL_S
+                    self._serial.write(b"USBPING\n" if streaming else b"USBSTART\n")
+                    last_command = now
+                chunk = self._serial.read(max(1, self._serial.in_waiting))
+                now = time.monotonic()
+                if chunk:
+                    packets, bad = decoder.feed(chunk)
+                    if decoder.info_line and not self.device_info:
+                        self.device_info = parse_info_line(decoder.info_line)
+                    if self.tracer is not None:
+                        for _ in range(bad):
+                            self.tracer.observe_invalid_packet()
+                    for pkt in packets:
+                        last_packet = now
+                        if self.tracer is not None:
+                            self.tracer.observe_packet(len(pkt.frames), 0, now)
+                        pending.extend(asm.push(pkt, now))
+                pending.extend(asm.poll(now))
+                if pending and (now - last_flush) >= STREAM_EMIT_INTERVAL_S:
+                    self.batch_received.emit(segments_to_payload(pending, now, "wired_binary"))
+                    if self.tracer is not None:
+                        self.tracer.sync_assembler(asm.stats())
+                    pending, last_flush = [], now
+            except Exception as e:
+                if not self._running:
+                    break
+                self._close_serial()
+                self.error_occurred.emit(str(e))
+                break
+        pending.extend(asm.flush())
+        if pending:
+            self.batch_received.emit(segments_to_payload(pending, time.monotonic(), "wired_binary"))
+            if self.tracer is not None:
+                self.tracer.sync_assembler(asm.stats())
+
+    # -- legacy CSV text -------------------------------------------------------------------
+    def _run_csv(self):
         nch = int(self.num_channels)
         tail = b""
         batch = []
         last_flush = time.monotonic()
-        try:
-            while self._running:
-                try:
-                    if self._serial is None or not self._serial.is_open:
-                        self._serial = self._open_serial()
-                        tail = b""
-
-                    chunk = self._serial.read(max(1, self._serial.in_waiting))
-                    now = time.monotonic()
-                    if chunk:
-                        lines = (tail + chunk).split(b"\n")
-                        tail = lines.pop()  # Keep incomplete tail for next read.
-                        good = bad = 0
-                        for raw_line in lines:
-                            parts = raw_line.replace(b",", b" ").split()
-                            if not parts:
-                                continue
-                            if len(parts) < nch:
-                                bad += 1
-                                continue
-                            try:
-                                batch.append([float(x) for x in parts[:nch]])
-                                good += 1
-                            except ValueError:
-                                bad += 1
-                        if self.tracer is not None and (good or bad):
-                            self.tracer.observe_serial(good, bad, len(chunk), now)
-
-                    if batch and (len(batch) >= self.batch_size or (now - last_flush) >= self.FLUSH_INTERVAL_S):
-                        self._emit_batch(batch)
-                        batch = []
-                        last_flush = now
-                except Exception as e:
-                    if not self._running:
-                        break
-                    self._close_serial()
+        while self._running:
+            try:
+                if self._serial is None or not self._serial.is_open:
+                    self._serial = self._open_serial()
                     tail = b""
-                    if self.is_socket_url:
-                        # Auto-recover TCP socket disconnects without hard-failing the app.
-                        time.sleep(0.3)
-                        continue
-                    self.error_occurred.emit(str(e))
+
+                chunk = self._serial.read(max(1, self._serial.in_waiting))
+                now = time.monotonic()
+                if chunk:
+                    lines = (tail + chunk).split(b"\n")
+                    tail = lines.pop()  # Keep incomplete tail for next read.
+                    good = bad = 0
+                    for raw_line in lines:
+                        parts = raw_line.replace(b",", b" ").split()
+                        if not parts:
+                            continue
+                        if len(parts) < nch:
+                            bad += 1
+                            continue
+                        try:
+                            batch.append([float(x) for x in parts[:nch]])
+                            good += 1
+                        except ValueError:
+                            bad += 1
+                    if self.tracer is not None and (good or bad):
+                        self.tracer.observe_serial(good, bad, len(chunk), now)
+
+                if batch and (len(batch) >= self.batch_size or (now - last_flush) >= self.FLUSH_INTERVAL_S):
+                    self._emit_batch(batch)
+                    batch = []
+                    last_flush = now
+            except Exception as e:
+                if not self._running:
                     break
+                self._close_serial()
+                tail = b""
+                if self.is_socket_url:
+                    # Auto-recover TCP socket disconnects without hard-failing the app.
+                    time.sleep(0.3)
+                    continue
+                self.error_occurred.emit(str(e))
+                break
+        if batch:
+            self._emit_batch(batch)
 
-            if batch:
-                self._emit_batch(batch)
-
+    def run(self):
+        try:
+            if self.binary:
+                self._run_binary()
+            else:
+                self._run_csv()
         finally:
-            self._close_serial()
+            self._close_serial(send_stop=True)
 
     def stop(self):
         self._running = False
         self.wait()
+
+
+_GIT_INFO_CACHE = {}
+
+
+def app_git_info():
+    """Commit hash (and whether the tree is dirty) of the running code; cached, never raises."""
+    if not _GIT_INFO_CACHE:
+        info = {"commit": None, "dirty": None}
+        try:
+            run = lambda *args: subprocess.run(["git", *args], cwd=SCRIPT_DIR, capture_output=True, text=True,
+                                               timeout=3, check=True).stdout.strip()
+            info["commit"] = run("rev-parse", "HEAD")
+            info["dirty"] = bool(run("status", "--porcelain", "--untracked-files=no"))
+        except Exception:
+            pass
+        _GIT_INFO_CACHE.update(info)
+    return dict(_GIT_INFO_CACHE)
+
+
+def _parse_rate_field(text):
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 @dataclass
@@ -684,6 +823,7 @@ class DeviceInfo:
     imu_ready: bool
     streaming: bool
     firmware: str
+    sample_rate_hz: Optional[float] = None
 
     @property
     def summary(self):
@@ -698,6 +838,28 @@ class SerialDeviceInfo:
     imu_ready: bool
     wifi_saved: bool
     firmware: str
+    sample_rate_hz: Optional[float] = None
+
+
+def access_key_problem(key):
+    """Why ``key`` must not be used to talk to a device, or "" when it is acceptable."""
+    key = str(key or "").strip()
+    if not key:
+        return "No device access key is set. Put it in code/device_secret.json (see device_secret.example.json)."
+    if key == PLACEHOLDER_DEVICE_ACCESS_KEY:
+        return "The device access key is still the placeholder. Set a real key in secrets.h (firmware) and code/device_secret.json."
+    if len(key) < MIN_DEVICE_ACCESS_KEY_LEN:
+        return f"The device access key is too short (minimum {MIN_DEVICE_ACCESS_KEY_LEN} characters)."
+    return ""
+
+
+def load_device_access_key(path=DEVICE_SECRET_PATH):
+    """Key from the gitignored device_secret.json, or "" when it is missing or unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return str(json.load(fh).get("device_access_key", "")).strip()
+    except (OSError, ValueError, AttributeError):
+        return ""
 
 
 def sign_message(secret, *parts):
@@ -746,7 +908,8 @@ class ControlProtocol:
     @staticmethod
     def parse_device_info(message, source_ip):
         parts = message.strip().split("|")
-        if len(parts) != 8 or parts[0] != "HELLO":
+        # 8 fields from firmware < 2.0; 2.0+ appends the sampling rate (Hz).
+        if len(parts) not in (8, 9) or parts[0] != "HELLO":
             raise ValueError("Unexpected device response.")
 
         return DeviceInfo(
@@ -758,6 +921,7 @@ class ControlProtocol:
             imu_ready=parts[5] == "1",
             streaming=parts[6] == "1",
             firmware=parts[7],
+            sample_rate_hz=_parse_rate_field(parts[8]) if len(parts) > 8 else None,
         )
 
     @staticmethod
@@ -804,32 +968,62 @@ class ControlProtocol:
         return list(devices.values())
 
     @staticmethod
-    def get_challenge(target_ip):
-        response, _ = ControlProtocol.send_and_receive("CHALLENGE", target_ip)
+    def get_challenge(target_ip, timeout=None):
+        response, _ = ControlProtocol.send_and_receive("CHALLENGE", target_ip,
+                                                       timeout=CONTROL_TIMEOUT if timeout is None else timeout)
         parts = response.strip().split("|")
         if len(parts) != 2 or parts[0] != "CHALLENGE":
             raise RuntimeError("Device did not return a valid challenge.")
         return parts[1]
 
     @staticmethod
-    def authenticated_command(target_ip, secret, command, *payload):
-        if not secret:
-            raise RuntimeError("Device access key is required.")
+    def _authenticated_once(target_ip, secret, command, payload, timeout):
+        # The firmware ties a challenge to the sender's (ip, port), so the CHALLENGE request and the
+        # signed command must leave from the SAME socket.
+        timeout = CONTROL_TIMEOUT if timeout is None else timeout
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            destination = (target_ip, WIFI_CONTROL_PORT)
+            sock.sendto(b"CHALLENGE", destination)
+            parts = sock.recvfrom(2048)[0].decode("utf-8", errors="replace").strip().split("|")
+            if len(parts) != 2 or parts[0] != "CHALLENGE":
+                raise RuntimeError("Device did not return a valid challenge.")
+            challenge = parts[1]
+            auth = sign_message(secret, command, challenge, *payload)
+            sock.sendto("|".join([command, challenge, *payload, auth]).encode("utf-8"), destination)
+            parts = sock.recvfrom(2048)[0].decode("utf-8", errors="replace").strip().split("|")
+        finally:
+            sock.close()
 
-        challenge = ControlProtocol.get_challenge(target_ip)
-        auth = sign_message(secret, command, challenge, *payload)
-        message = "|".join([command, challenge, *payload, auth])
-        response, _ = ControlProtocol.send_and_receive(message, target_ip)
-
-        parts = response.strip().split("|")
-        if not parts:
-            raise RuntimeError("Device returned an empty response.")
         if parts[0] == "ERR":
             detail = parts[1] if len(parts) > 1 else "UNKNOWN"
             raise RuntimeError(f"Device rejected command: {detail}")
         if parts[0] != "ACK":
             raise RuntimeError("Unexpected device acknowledgement.")
         return parts[1:]
+
+    @staticmethod
+    def authenticated_command(target_ip, secret, command, *payload, timeout=None, backoff=CONTROL_RETRY_BACKOFF_S):
+        """Run one signed command, retrying lost datagrams with a fresh challenge each attempt.
+
+        UDP loses packets and a device can answer a challenge for another client, so up to
+        ``len(backoff)`` retries are made (0.2 / 0.5 / 1.0 s by default). Blocking: call it from a
+        worker thread, never from the GUI thread when it can be avoided.
+        """
+        problem = access_key_problem(secret)
+        if problem:
+            raise RuntimeError(problem)
+
+        last_error = None
+        for attempt in range(len(backoff) + 1):
+            if attempt:
+                time.sleep(backoff[attempt - 1])
+            try:
+                return ControlProtocol._authenticated_once(target_ip, secret, command, payload, timeout)
+            except (OSError, RuntimeError) as exc:      # socket.timeout is an OSError
+                last_error = exc
+        raise RuntimeError(f"{command} failed after {len(backoff) + 1} attempts: {last_error}")
 
     @staticmethod
     def start_stream(target_ip, secret, client_ip, client_port):
@@ -889,7 +1083,7 @@ class WiFiSerialProvisionProtocol:
         parts = response.split("|")
         if len(parts) >= 2 and parts[0] == "ERR":
             raise RuntimeError(f"ESP32 returned an error: {parts[1]}")
-        if len(parts) != 6 or parts[0] != "INFO":
+        if len(parts) not in (6, 7) or parts[0] != "INFO":
             raise RuntimeError(f"Unexpected serial response: {response}")
 
         return SerialDeviceInfo(
@@ -899,6 +1093,7 @@ class WiFiSerialProvisionProtocol:
             imu_ready=parts[3] == "1",
             wifi_saved=parts[4] == "1",
             firmware=parts[5],
+            sample_rate_hz=_parse_rate_field(parts[6]) if len(parts) > 6 else None,
         )
 
     @staticmethod
@@ -920,14 +1115,17 @@ class WiFiSerialProvisionProtocol:
 
 
 class WirelessStreamWorker(QThread):
-    """UDP receiver. Its only jobs are to drain the socket quickly and parse packets.
+    """UDP receiver. Its only jobs are to drain the socket quickly and sequence packets.
 
     * A 4 MB kernel receive buffer rides out UI stalls (a UDP datagram that arrives while
       the buffer is full is lost for good, so the buffer is the first line of defence).
     * Runs at time-critical thread priority and does no per-sample Python work: a packet
       is decoded with one numpy view instead of a struct.unpack per frame.
-    * Packets are merged for ~20 ms before being handed to the UI, so the main thread
-      does ~50 updates/s instead of one per datagram. Nothing is discarded or reordered.
+    * A small reorder buffer (5 packets / 50 ms) releases packets in sequence order; lost
+      packets become explicit NaN frames with the correct frame IDs and Valid=0, and late or
+      duplicate packets are counted but never inserted.
+    * Segments are merged for ~20 ms before being handed to the UI, so the main thread
+      does ~50 updates/s instead of one per datagram.
     """
     batch_received = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
@@ -940,6 +1138,7 @@ class WirelessStreamWorker(QThread):
         self._fallback_packet_sequence = 0
         self.tracer = tracer if tracer is not None else PacketTracer()
         self.stats = self.tracer.stats
+        self.assembler = StreamAssembler()
 
     @staticmethod
     def _frames_to_batch(frames):
@@ -955,66 +1154,28 @@ class WirelessStreamWorker(QThread):
         return {"batch": batch, "packet_numbers": np.full(batch.shape[0], packet_no, dtype=np.int64),
                 "source": source}
 
-    def _parse_datagram(self, data):
+    def _handle_datagram(self, data, arrival):
+        """Returns (segments, legacy_payload); at most one of them is non-empty."""
         size = len(data)
-        if size == WIRELESS_PACKET_SIZE:
-            magic, version, frame_count, frame_size, packet_sequence = struct.unpack_from(
-                WIFI_PACKET_HEADER_FORMAT, data, 0
-            )
-            if (magic != b"BWIM" or version != 1 or frame_size != WIRELESS_FRAME_SIZE
-                    or frame_count * frame_size != size - WIFI_PACKET_HEADER_SIZE):
-                self.tracer.observe_invalid_packet()
-                return None
-            frames = np.frombuffer(data, dtype=_WIRELESS_FRAME_DTYPE, count=frame_count,
-                                   offset=WIFI_PACKET_HEADER_SIZE)
-            batch = self._frames_to_batch(frames)
-            arrival = time.monotonic()
-            gap = self.tracer.observe_wireless(packet_sequence, frame_count, size, arrival)
-            return {"batch": batch,
-                    "packet_numbers": np.full(frame_count, int(packet_sequence), dtype=np.int64),
-                    "source": "wireless",
-                    "frame_ids": frames["frame_id"].astype(np.int64),
-                    "emg_timestamps": frames["frame_ts"].astype(np.int64),
-                    "imu_ids": frames["imu_id"].astype(np.int64),
-                    "imu_timestamps": frames["imu_ts"].astype(np.int64),
-                    "host_received_monotonic": arrival, "packet_gap": gap}
+        pkt = parse_bwim_packet(data)
+        if pkt is not None:
+            self.tracer.observe_packet(len(pkt.frames), size, arrival)
+            return self.assembler.push(pkt, arrival), None
 
         if size == WIRELESS_FRAME_SIZE * WIRELESS_FRAMES_PER_PACKET:
             frames = np.frombuffer(data, dtype=_WIRELESS_FRAME_DTYPE, count=WIRELESS_FRAMES_PER_PACKET)
-            return self._legacy_payload(frames, "wireless_legacy")
-
+            return [], self._legacy_payload(frames, "wireless_legacy")
         if size == WIRELESS_FRAME_SIZE:
             frames = np.frombuffer(data, dtype=_WIRELESS_FRAME_DTYPE, count=1)
-            return self._legacy_payload(frames, "wireless_single")
+            return [], self._legacy_payload(frames, "wireless_single")
 
         self.tracer.observe_invalid_packet()
-        return None
+        return [], None
 
-    @staticmethod
-    def _merge(payloads):
-        """Concatenate consecutive wireless payloads into one (order preserved)."""
-        if len(payloads) == 1:
-            return payloads[0]
-        merged = {"source": payloads[0]["source"]}
-        for key in ("batch", "packet_numbers", "frame_ids", "emg_timestamps", "imu_ids", "imu_timestamps"):
-            merged[key] = np.concatenate([p[key] for p in payloads], axis=0)
-        merged["host_received_monotonic"] = payloads[-1]["host_received_monotonic"]
-        merged["packet_gap"] = int(sum(int(p.get("packet_gap") or 0) for p in payloads))
-        return merged
-
-    def _flush(self, pending):
-        """Emit pending payloads; legacy/odd payloads are never merged with full packets."""
-        group = []
-        for payload in pending:
-            if payload["source"] != "wireless":
-                if group:
-                    self.batch_received.emit(self._merge(group))
-                    group = []
-                self.batch_received.emit(payload)
-            else:
-                group.append(payload)
-        if group:
-            self.batch_received.emit(self._merge(group))
+    def _emit_segments(self, segments, now):
+        if segments:
+            self.batch_received.emit(segments_to_payload(segments, now, "wireless"))
+        self.tracer.sync_assembler(self.assembler.stats())
 
     def run(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1037,18 +1198,21 @@ class WirelessStreamWorker(QThread):
                 except OSError:
                     break
 
-                if data is not None:
-                    payload = self._parse_datagram(data)
-                    if payload is not None and payload["batch"].size > 0:
-                        pending.append(payload)
-
                 now = time.monotonic()
+                if data is not None:
+                    segments, legacy = self._handle_datagram(data, now)
+                    pending.extend(segments)
+                    if legacy is not None:
+                        self._emit_segments(pending, now); pending = []
+                        self.batch_received.emit(legacy)
+                pending.extend(self.assembler.poll(now))
+
                 if pending and (data is None or (now - last_emit) >= STREAM_EMIT_INTERVAL_S):
-                    self._flush(pending)
+                    self._emit_segments(pending, now)
                     pending = []
                     last_emit = now
-            if pending:
-                self._flush(pending)
+            pending.extend(self.assembler.flush())
+            self._emit_segments(pending, time.monotonic())
         except Exception as exc:
             if self._running:
                 self.error_occurred.emit(f"Wireless stream error: {exc}")
@@ -1395,16 +1559,6 @@ class WirelessConfigDialog(QDialog):
             self.status_label.setStyleSheet(themed_label_style("muted"))
 
 
-@dataclass
-class TimedRecordBatch:
-    timestamps_ms: np.ndarray
-    packet_numbers: np.ndarray
-    trial_id: int
-    label: str
-    data: np.ndarray
-    hand: str = ""
-
-
 class RFRealtimeInferenceWorker(QThread):
     prediction_ready = pyqtSignal(object)
     error_occurred = pyqtSignal(str)
@@ -1546,79 +1700,42 @@ class RFRealtimeInferenceWorker(QThread):
                 self.error_occurred.emit(str(e))
 
 
-class RecordedCsvSaveWorker(QThread):
+class SessionFinalizeWorker(QThread):
+    """Drains the recorder, then writes signals_/events_/quality_ files and the metadata text.
+
+    Runs off the GUI thread: a checkpoint (``close_recorder=False``) happens at every break, the
+    final pass (``close_recorder=True``) when the protocol ends or is cancelled.
+    """
     save_completed = pyqtSignal(object)
 
-    def __init__(self, batches, data_csv_path, metadata_path, metadata_lines, parent=None):
+    def __init__(self, recorder, events, out_dir, session, fs, transport, keepalive_restarts, host_origin_s,
+                 metadata_path, metadata_builder, close_recorder, json_builder=None, parent=None):
         super().__init__(parent)
-        self._batches = list(batches or [])
-        self._data_csv_path = str(data_csv_path or "")
-        self._metadata_path = str(metadata_path or "")
-        self._metadata_lines = list(metadata_lines or [])
+        self._args = (recorder, events, out_dir, session, fs, transport, keepalive_restarts, host_origin_s)
+        self._metadata_path, self._metadata_builder, self._close = metadata_path, metadata_builder, bool(close_recorder)
+        self._json_builder = json_builder
 
     def run(self):
+        recorder, events, out_dir, session, fs, transport, restarts, origin = self._args
         try:
-            os.makedirs(os.path.dirname(self._data_csv_path) or ".", exist_ok=True)
-            header = ["Timestamp_ms", "Packet_Number", "Trial_ID"] + [
-                f"Ch{i}" for i in range(1, WIRELESS_TOTAL_CHANNELS + 1)
-            ] + ["Label", "Hand"]
-            with open(self._data_csv_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                for batch in self._batches:
-                    data = np.asarray(batch.data, dtype=np.float32)
-                    if data.ndim != 2 or data.shape[0] <= 0:
-                        continue
-                    ts = np.asarray(batch.timestamps_ms, dtype=np.float64).reshape(-1)
-                    packets = np.asarray(batch.packet_numbers, dtype=np.int64).reshape(-1)
-                    n_rows = data.shape[0]
-                    n_cols = int(min(WIRELESS_TOTAL_CHANNELS, data.shape[1]))
-                    trial_id = int(batch.trial_id)
-                    label = str(batch.label)
-                    hand = str(getattr(batch, "hand", "") or "")
-                    pad = [""] * (WIRELESS_TOTAL_CHANNELS - n_cols)
-                    # Convert whole arrays to Python scalars once (C-level) instead of boxing
-                    # each numpy scalar per cell, then bulk-write. Same output, much faster.
-                    ts_list = ts.tolist()
-                    pk_list = packets.tolist()
-                    data_list = data[:, :n_cols].tolist()
-                    n_ts = len(ts_list)
-                    n_pk = len(pk_list)
-                    rows = []
-                    for idx in range(n_rows):
-                        row = [
-                            ts_list[idx] if idx < n_ts else 0.0,
-                            pk_list[idx] if idx < n_pk else -1,
-                            trial_id,
-                        ]
-                        row.extend(data_list[idx])
-                        if pad:
-                            row.extend(pad)
-                        row.append(label)
-                        row.append(hand)
-                        rows.append(row)
-                    writer.writerows(rows)
-
-            os.makedirs(os.path.dirname(self._metadata_path) or ".", exist_ok=True)
-            with open(self._metadata_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(self._metadata_lines) + "\n")
-
-            self.save_completed.emit(
-                {
-                    "ok": True,
-                    "data_csv_path": self._data_csv_path,
-                    "metadata_path": self._metadata_path,
-                }
-            )
+            rows = recorder.close() if self._close else recorder.checkpoint()
+            if recorder.error:
+                raise RuntimeError(f"recorder writer failed: {recorder.error}")
+            stats = {"valid_rows": recorder.valid_rows, "clip_counts": recorder.clip_counts.copy(),
+                     "device_counters": dict(recorder.device_counters), "late_rows": recorder.late_rows}
+            result = finalize_session(recorder.raw_path, rows, events, recorder.arrival_index(), out_dir, session,
+                                      fs=fs, transport=transport, recorder_stats=stats,
+                                      keepalive_restarts=restarts, host_origin_s=origin)
+            with open(self._metadata_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(self._metadata_builder(rows, result["quality"])) + "\n")
+            if self._json_builder is not None:
+                with open(os.path.splitext(self._metadata_path)[0] + ".json", "w", encoding="utf-8") as fh:
+                    json.dump(self._json_builder(rows, result["quality"]), fh, indent=2, default=str)
+            self.save_completed.emit({"ok": True, "data_csv_path": result["signals_path"],
+                                      "metadata_path": self._metadata_path, "quality": result["quality"],
+                                      "events_path": result["events_path"], "quality_path": result["quality_path"]})
         except Exception as e:
-            self.save_completed.emit(
-                {
-                    "ok": False,
-                    "data_csv_path": self._data_csv_path,
-                    "metadata_path": self._metadata_path,
-                    "error": str(e),
-                }
-            )
+            self.save_completed.emit({"ok": False, "error": str(e)})
 
 
 class RFTrainingWorker(QThread):
@@ -2040,7 +2157,7 @@ def plan_summary(settings):
 class TaskProtocolWidget(QWidget):
     start_clicked = pyqtSignal()
     # label, trial_id, phase_name, record_enabled, hand
-    phase_started = pyqtSignal(str, int, str, bool, str)
+    phase_started = pyqtSignal(str, int, str, bool, str, int, int, int)   # label, trial, phase, record, hand, block, cycle, planned ms
     protocol_finished = pyqtSignal()
     protocol_canceled = pyqtSignal()
     paused_changed = pyqtSignal(bool)
@@ -2059,6 +2176,7 @@ class TaskProtocolWidget(QWidget):
         self.settle_ms = int(DEFAULT_TASK_SETTLE_S * 1000)
         self.record_rest = True
         self.randomize_order = True
+        self.seed = 0
         self.hand_order = DEFAULT_HAND_ORDER
         self.session_day = DEFAULT_SESSION_DAY
         self.max_cycles_per_block = DEFAULT_MAX_CYCLES_PER_BLOCK
@@ -2191,7 +2309,8 @@ class TaskProtocolWidget(QWidget):
     def configure(self, labels, repeats, prep_s, hold_s, rest_s, record_rest=True,
                   settle_s=DEFAULT_TASK_SETTLE_S, randomize_order=True, hand_order=DEFAULT_HAND_ORDER,
                   session_day=DEFAULT_SESSION_DAY, max_cycles_per_block=DEFAULT_MAX_CYCLES_PER_BLOCK,
-                  block_break_s=DEFAULT_BLOCK_BREAK_S, hand_switch_s=DEFAULT_HAND_SWITCH_BREAK_S):
+                  block_break_s=DEFAULT_BLOCK_BREAK_S, hand_switch_s=DEFAULT_HAND_SWITCH_BREAK_S, seed=0):
+        self.seed = int(seed)
         self.labels = [str(x).strip() for x in (labels or []) if str(x).strip()]
         self.repeats = max(1, int(repeats))
         self.prep_ms = int(max(0.2, prep_s) * 1000)
@@ -2254,6 +2373,7 @@ class TaskProtocolWidget(QWidget):
         across hands so (label, trial) stays unique in the CSV.
         """
         steps = []
+        rng = random.Random(self.seed)   # per-session seed, saved in the metadata: the order is reproducible
         hands = hands_for_order(self.hand_order)
         cycles_total = len(self.labels) * self.repeats * len(hands)
         cycle_no = 0
@@ -2263,7 +2383,7 @@ class TaskProtocolWidget(QWidget):
             for rep in range(1, self.repeats + 1):
                 trial_labels = list(self.labels)
                 if self.randomize_order:
-                    random.shuffle(trial_labels)
+                    rng.shuffle(trial_labels)
                 cycles.extend((trial_offset + rep, label) for label in trial_labels)
             blocks = [cycles[i:i + self.max_cycles_per_block] for i in range(0, len(cycles), self.max_cycles_per_block)]
             for block_idx, block in enumerate(blocks):
@@ -2390,14 +2510,20 @@ class TaskProtocolWidget(QWidget):
         self._update_countdown_labels(self.remaining_ms)
         self.progress.setValue(0)
 
+        self._emit_phase_started(st, int(st["duration_ms"]))
+        self.timer.start(50 if not is_break else 200)
+
+    def _emit_phase_started(self, st, planned_ms):
         self.phase_started.emit(
             str(st["label"]),
             int(st["trial_id"]),
             str(st["phase"]),
             bool(st["record"]),
             str(st["hand"]),
+            int(st["block"]),
+            int(st["cycle_no"]),
+            int(planned_ms),
         )
-        self.timer.start(50 if not is_break else 200)
 
     def toggle_pause(self):
         if self.paused:
@@ -2433,6 +2559,7 @@ class TaskProtocolWidget(QWidget):
                 self.phase_box.set_state(self._pause_saved[2])
             self.btn_skip_break.setEnabled(True)
             self.paused_changed.emit(False)
+            self._emit_phase_started(st, self._pause_remaining_ms)   # the break label resumes at this sample
             self.timer.start(200)
             return
         # Mid-cycle: restart the cycle from its Prepare step so every recorded trial is complete.
@@ -3452,7 +3579,7 @@ def _section_title(text, hint=""):
 class DataCollectionDialog(QDialog):
     start_requested = pyqtSignal(dict)
     settings_changed = pyqtSignal(dict)
-    protocol_phase_started = pyqtSignal(str, int, str, bool, str)
+    protocol_phase_started = pyqtSignal(str, int, str, bool, str, int, int, int)
     protocol_finished = pyqtSignal()
     protocol_canceled = pyqtSignal()
     protocol_paused = pyqtSignal(bool)
@@ -3508,9 +3635,12 @@ class DataCollectionDialog(QDialog):
         consent_layout.setSpacing(8)
 
         row_contributor = QHBoxLayout()
-        row_contributor.addWidget(QLabel("Contributor:"))
-        self.input_contributor = QLineEdit(str(settings.get("contributor_name", "")))
-        self.input_contributor.setPlaceholderText("Enter contributor name / participant ID")
+        row_contributor.addWidget(QLabel("Participant ID:"))
+        self.input_contributor = QLineEdit(str(settings.get("participant_id", "")))
+        self.input_contributor.setPlaceholderText("S01  (pseudonymous ID - never a name)")
+        self.input_contributor.setMaxLength(4)
+        self.input_contributor.setToolTip("Pseudonymous participant ID: the letter S followed by 2-3 digits (S01, S02, ... S101).\n"
+                                          "Names are never stored in the dataset.")
         row_contributor.addWidget(self.input_contributor, stretch=1)
         self.btn_terms = QPushButton("Study Procedure")
         self.btn_terms.setStyleSheet(themed_button_style("accent"))
@@ -3593,7 +3723,41 @@ class DataCollectionDialog(QDialog):
         extra_layout.addLayout(participant_grid)
 
         extra_layout.addLayout(_section_title(
-            "Room Conditions", "(note at the start of the session; optional)"))
+            "Electrode Placement", "(saved to the metadata; fields left empty are saved as N/A)"))
+        electrode = dict(settings.get("electrode", {}) or {})
+        electrode_grid = QGridLayout()
+        electrode_grid.setHorizontalSpacing(10)
+        electrode_grid.setVerticalSpacing(6)
+        self.combo_landmark = QComboBox()
+        self.combo_landmark.addItems(["N/A"] + ELECTRODE_LANDMARKS)
+        if electrode.get("landmark") in ELECTRODE_LANDMARKS:
+            self.combo_landmark.setCurrentText(electrode["landmark"])
+        self.spin_landmark_distance = _make_spin(0.0, 60.0, 0.5, 1, " cm", electrode.get("landmark_distance_cm", 0.0))
+        self.spin_landmark_distance.setToolTip("Distance from the landmark to the centre of the armband, along the forearm.")
+        self.input_ch1_muscle = QLineEdit(str(electrode.get("channel1_muscle", "") or ""))
+        self.input_ch1_muscle.setPlaceholderText("muscle under channel 1")
+        self.combo_skin_prep = QComboBox()
+        self.combo_skin_prep.addItems(["N/A"] + SKIN_PREPARATIONS)
+        if electrode.get("skin_preparation") in SKIN_PREPARATIONS:
+            self.combo_skin_prep.setCurrentText(electrode["skin_preparation"])
+        self.input_electrode_type = QLineEdit(str(electrode.get("electrode_type", "") or ""))
+        self.input_electrode_type.setPlaceholderText("e.g. dry electrodes, OYMotion armband")
+        self.input_photo = QLineEdit(str(electrode.get("photo_filename", "") or ""))
+        self.input_photo.setPlaceholderText("placement photo file name")
+        for col, (text, widget) in enumerate([
+            ("Landmark:", self.combo_landmark), ("Distance:", self.spin_landmark_distance),
+            ("Channel 1 muscle:", self.input_ch1_muscle), ("Skin preparation:", self.combo_skin_prep),
+            ("Electrode type:", self.input_electrode_type), ("Photo file:", self.input_photo),
+        ]):
+            row, base = divmod(col, 2)
+            electrode_grid.addWidget(QLabel(text), row, base * 2)
+            electrode_grid.addWidget(widget, row, base * 2 + 1)
+        electrode_grid.setColumnStretch(1, 1)
+        electrode_grid.setColumnStretch(3, 1)
+        extra_layout.addLayout(electrode_grid)
+
+        extra_layout.addLayout(_section_title(
+            "Room Conditions", "(REQUIRED - note temperature and humidity at the start of the session)"))
         env_grid = QGridLayout()
         env_grid.setHorizontalSpacing(10)
         env_grid.setVerticalSpacing(6)
@@ -3690,6 +3854,12 @@ class DataCollectionDialog(QDialog):
         self.spin_hand_switch.setToolTip("Break while the armband is moved to the other arm (study: about 5 minutes).")
         self.check_record_rest = QCheckBox("Record Rest")
         self.check_record_rest.setChecked(bool(settings.get("record_rest", True)))
+        self.session_seed = int(settings.get("seed", 0) or 0) or secrets.randbits(32)
+        self._hand_order_manual = str(settings.get("hand_order_source", "auto")) == "manual"
+        self.check_practice = QCheckBox("Practice / demo mode")
+        self.check_practice.setChecked(bool(settings.get("practice_mode", False)))
+        self.check_practice.setToolTip("Practice runs are saved under a 'practice_' folder and are NOT part of the dataset.\n"
+                                       "Only in this mode can randomization be switched off.")
         self.check_randomize_order = QCheckBox("Randomize Gesture Order")
         self.check_randomize_order.setChecked(bool(settings.get("randomize_order", True)))
         self.check_randomize_order.setToolTip(
@@ -3714,6 +3884,7 @@ class DataCollectionDialog(QDialog):
         row_checks = QHBoxLayout()
         row_checks.addWidget(self.check_record_rest)
         row_checks.addWidget(self.check_randomize_order)
+        row_checks.addWidget(self.check_practice)
         row_checks.addStretch()
         config_layout.addLayout(row_checks)
 
@@ -3771,14 +3942,23 @@ class DataCollectionDialog(QDialog):
             self.spin_height.valueChanged, self.spin_weight.valueChanged, self.spin_age.valueChanged,
             self.spin_forearm_circumference.valueChanged,
             self.spin_temp_start.valueChanged, self.spin_humidity_start.valueChanged,
+            self.combo_landmark.currentIndexChanged, self.spin_landmark_distance.valueChanged,
+            self.input_ch1_muscle.textChanged, self.combo_skin_prep.currentIndexChanged,
+            self.input_electrode_type.textChanged, self.input_photo.textChanged,
             self.spin_session_day.valueChanged, self.combo_hand_order.currentIndexChanged,
             self.spin_task_repeats.valueChanged, self.spin_task_prep.valueChanged,
             self.spin_task_hold.valueChanged, self.spin_task_rest.valueChanged,
             self.spin_hand_switch.valueChanged,
             self.check_record_rest.stateChanged, self.check_randomize_order.stateChanged,
+            self.check_practice.stateChanged,
             self.input_record_dir.textChanged,
         ):
             sig.connect(self._emit_settings_changed)
+        self.check_practice.stateChanged.connect(self._apply_practice_rules)
+        self.combo_hand_order.activated.connect(self._on_hand_order_chosen)
+        self.input_contributor.textChanged.connect(self._on_participant_id_changed)
+        self._apply_practice_rules()
+        self._on_participant_id_changed()
         self.check_agree_yes.stateChanged.connect(self._on_agree_yes_changed)
         self.check_agree_no.stateChanged.connect(self._on_agree_no_changed)
 
@@ -3818,7 +3998,7 @@ class DataCollectionDialog(QDialog):
 
     def settings_payload(self):
         return {
-            "contributor_name": self.input_contributor.text().strip(),
+            "participant_id": normalize_participant_id(self.input_contributor.text()),
             "blood_group": self.combo_blood_group.currentText() if self.combo_blood_group.currentIndex() > 0 else "",
             "height_cm": float(self.spin_height.value()),
             "weight_kg": float(self.spin_weight.value()),
@@ -3826,7 +4006,20 @@ class DataCollectionDialog(QDialog):
             "forearm_circumference_cm": float(self.spin_forearm_circumference.value()),
             "temp_start_c": float(self.spin_temp_start.value()),
             "humidity_start_pct": float(self.spin_humidity_start.value()),
+            "electrode": {
+                "landmark": self.combo_landmark.currentText() if self.combo_landmark.currentIndex() > 0 else "",
+                "landmark_distance_cm": float(self.spin_landmark_distance.value()),
+                "channel1_muscle": self.input_ch1_muscle.text().strip(),
+                "skin_preparation": self.combo_skin_prep.currentText() if self.combo_skin_prep.currentIndex() > 0 else "",
+                "electrode_type": self.input_electrode_type.text().strip(),
+                "photo_filename": os.path.basename(self.input_photo.text().strip()),
+            },
             "agreed": bool(self.check_agree_yes.isChecked() and not self.check_agree_no.isChecked()),
+            "seed": int(self.session_seed),
+            "practice_mode": bool(self.check_practice.isChecked()),
+            "hand_order_source": "manual" if self._hand_order_manual else "auto",
+            "hand_order_default": (default_hand_order(self.input_contributor.text())
+                                   if valid_participant_id(self.input_contributor.text()) else ""),
             "task_labels": list(self.task_labels),
             "labels_saved": bool(self.labels_saved),
             "session_day": int(self.spin_session_day.value()),
@@ -3904,6 +4097,31 @@ class DataCollectionDialog(QDialog):
         self.task_protocol.set_start_enabled(self.session_prepared and (not self.protocol_running))
         self.task_protocol.set_cancel_enabled(self.session_prepared and (not self.protocol_running))
 
+    def _apply_practice_rules(self, *_args):
+        """Study mode: randomization is mandatory. Only practice/demo mode may switch it off."""
+        practice = self.check_practice.isChecked()
+        if not practice:
+            self.check_randomize_order.setChecked(True)
+        self.check_randomize_order.setEnabled(practice)
+        self.check_randomize_order.setToolTip(
+            "Shuffle gesture order independently each repeat, so fatigue doesn't always degrade whichever "
+            "gesture is fixed last in the cycle." + ("" if practice else
+                                                      "\nMandatory in study mode (tick Practice / demo mode to change it)."))
+
+    def _on_hand_order_chosen(self, *_args):
+        self._hand_order_manual = True          # the operator overrode the counterbalanced default
+
+    def _on_participant_id_changed(self, *_args):
+        """Odd participant numbers start with the left hand, even with the right, unless overridden."""
+        pid = self.input_contributor.text()
+        if self._hand_order_manual or not valid_participant_id(pid):
+            return
+        if str(self.combo_hand_order.currentData()) not in ("left_right", "right_left"):
+            return
+        idx = self.combo_hand_order.findData(default_hand_order(pid))
+        if idx >= 0 and idx != self.combo_hand_order.currentIndex():
+            self.combo_hand_order.setCurrentIndex(idx)
+
     def _emit_settings_changed(self, *_args):
         self._update_plan_label()
         self.settings_changed.emit(self.settings_payload())
@@ -3923,6 +4141,7 @@ class DataCollectionDialog(QDialog):
             max_cycles_per_block=settings["max_cycles_per_block"],
             block_break_s=settings["block_break_s"],
             hand_switch_s=settings["hand_switch_s"],
+            seed=settings["seed"],
         )
 
     def _emit_start_requested(self):
@@ -3935,14 +4154,22 @@ class DataCollectionDialog(QDialog):
         if not self.check_agree_yes.isChecked() or self.check_agree_no.isChecked():
             QMessageBox.warning(self, "Agreement Required", "You must agree to contribute before proceeding.")
             return
-        if not self.input_contributor.text().strip():
-            QMessageBox.warning(self, "Contributor", "Please provide a contributor name.")
+        if not valid_participant_id(self.input_contributor.text()):
+            QMessageBox.warning(self, "Participant ID", "The participant ID must be the letter S followed by 2-3 digits "
+                                "(for example S01). Do not enter a name.")
             return
-        # Participant info and room conditions are optional; anything left empty is
+        if self.spin_temp_start.value() <= 0.0 or self.spin_humidity_start.value() <= 0.0:
+            self.btn_additional.setChecked(True)      # show the fields that are missing
+            QMessageBox.warning(self, "Room Conditions", "Temperature and humidity are required: enter the values "
+                                "under Additional Information > Room Conditions.")
+            return
+        # Participant info and electrode placement are optional; anything left empty is
         # written to the metadata file as N/A.
         if not self.labels_saved or len(self.task_labels) == 0:
             QMessageBox.warning(self, "Task Labels", "Click Edit and save class labels before proceeding.")
             return
+        self.session_seed = secrets.randbits(32)     # fresh seed per session; saved with the recording
+        self._emit_settings_changed()                # let the main window store the seed it will start with
         self.task_protocol.configure(**self._protocol_kwargs(self.settings_payload()))
         self.session_prepared = True
         self._set_protocol_dimmed(False)
@@ -3986,8 +4213,8 @@ class DataCollectionDialog(QDialog):
         if hasattr(self, "protocol_opacity") and self.protocol_opacity is not None:
             self.protocol_opacity.setOpacity(0.42 if dimmed else 1.0)
 
-    def _on_protocol_phase_started(self, label, trial_id, phase_name, record_enabled, hand):
-        self.protocol_phase_started.emit(label, trial_id, phase_name, record_enabled, hand)
+    def _on_protocol_phase_started(self, label, trial_id, phase_name, record_enabled, hand, block, cycle_no, planned_ms):
+        self.protocol_phase_started.emit(label, trial_id, phase_name, record_enabled, hand, block, cycle_no, planned_ms)
 
     def _on_protocol_finished(self):
         self.protocol_running = False
@@ -5121,7 +5348,7 @@ class EMGVisualizer(QMainWindow):
 
         self.data_collection_dialog = None
         self.training_dialog = None
-        self.contributor_name = ""
+        self.participant_id = ""
         self.participant_blood_group = ""
         self.participant_height_cm = 0.0
         self.participant_weight_kg = 0.0
@@ -5135,12 +5362,23 @@ class EMGVisualizer(QMainWindow):
             "block_break_s": float(DEFAULT_BLOCK_BREAK_S),
             "hand_switch_s": float(DEFAULT_HAND_SWITCH_BREAK_S),
             **{key: 0.0 for key in STUDY_ENV_KEYS},
+            "seed": 0, "practice_mode": False, "hand_order_source": "auto", "hand_order_default": "",
+            "electrode": {},
         }
-        self.timed_record_hand = ""
         self.record_missing_packets = 0
         self.record_gap_events = 0
         self._session_csv_path = ""
-        self._cycle_batch_start = 0
+        # Continuous session recording (see session_recording.py)
+        self.session_recorder = None
+        self.session_events = None
+        self._session_name = ""
+        self._session_dir = ""
+        self._session_total_ms = 0
+        self._session_host_origin = 0.0
+        self._session_start_utc = ""
+        self._cycle_event_start = 0
+        self._last_session_rows = 0
+        self._last_session_quality = None
         self.contribution_agreed = False
         self.task_labels = [x.strip() for x in DEFAULT_TASK_LABELS.split(",") if x.strip()]
         self.task_labels_locked = False
@@ -5153,25 +5391,21 @@ class EMGVisualizer(QMainWindow):
         self.task_settle_s = float(DEFAULT_TASK_SETTLE_S)
         self.task_randomize_order = True
         self.task_session_active = False
-        self.timed_record_enabled = False
-        self.timed_record_label = ""
-        self.timed_record_trial_id = 0
-        self.timed_record_phase = ""
-        self.recorded_batches = []
-        self._recorded_total_samples = 0
-        self.record_start_unix = 0.0
         self.record_save_dir = DATASET_DIR
         self.last_recorded_csv_path = os.path.join(DATASET_DIR, DEFAULT_RECORD_CSV)
         self._record_graph_stream_prev_checked = True
         self._record_live_analysis_prev_enabled = False
         self.record_save_workers = []
         self.connection_medium = "wired"
+        self.wired_binary = False
         self.wired_channel_count = 4
         self.current_port_name = "socket://127.0.0.1:7000"
         self.current_device = None
         self.discovered_wireless_devices = []
-        self.wireless_access_key = DEFAULT_DEVICE_ACCESS_KEY
+        self.wireless_access_key = load_device_access_key()
         self.keepalive_failures = 0
+        self.keepalive_restarts = []      # every automatic START re-issue, for the quality report
+        self._stream_client_ip = ""
         self.port_config_dialog = None
         self.wireless_config_dialog = None
         self.port_config_applied = False
@@ -5604,14 +5838,18 @@ class EMGVisualizer(QMainWindow):
             f"color: {THEME_COLORS['disabled']}; border-color: {THEME_COLORS['panel']}; }}"
         )
 
+    def layout_has_imu(self):
+        """Wi-Fi and binary USB both deliver the 8 EMG + Roll/Pitch/Yaw layout."""
+        return self.connection_medium == "wireless" or self.wired_binary
+
     def active_emg_channel_count(self):
-        if self.connection_medium == "wireless":
+        if self.layout_has_imu():
             return WIRELESS_EMG_CHANNELS
         return int(self.num_channels)
 
     def channel_display_name(self, index):
         idx = int(index)
-        if self.connection_medium == "wireless" and self.num_channels >= WIRELESS_TOTAL_CHANNELS:
+        if self.layout_has_imu() and self.num_channels >= WIRELESS_TOTAL_CHANNELS:
             if idx == 8:
                 return "ROLL"
             if idx == 9:
@@ -5621,7 +5859,7 @@ class EMGVisualizer(QMainWindow):
         return f"CH {idx + 1}"
 
     def is_wireless_imu_channel(self, index):
-        return self.connection_medium == "wireless" and int(index) >= WIRELESS_EMG_CHANNELS
+        return self.layout_has_imu() and int(index) >= WIRELESS_EMG_CHANNELS
 
     def reset_fps_counters(self):
         self.ui_fps = 0.0
@@ -5647,12 +5885,25 @@ class EMGVisualizer(QMainWindow):
             return
         ip, key = self.current_device.ip, self.wireless_access_key
 
+        client_ip = self._stream_client_ip
+
         def _ping():
             try:
                 ControlProtocol.ping(ip, key)
                 self.keepalive_failures = 0
-            except Exception:
+            except Exception as exc:
                 self.keepalive_failures += 1
+                if self.keepalive_failures >= KEEPALIVE_RESTART_AFTER and client_ip:
+                    # The device probably lost its stream target (reboot, Wi-Fi drop, timeout):
+                    # re-issue START from this background thread and keep a record of it.
+                    event = {"host_monotonic_s": time.monotonic(), "reason": str(exc), "ok": False}
+                    try:
+                        ControlProtocol.start_stream(ip, key, client_ip, WIFI_STREAM_PORT)
+                        event["ok"] = True
+                        self.keepalive_failures = 0
+                    except Exception as restart_exc:
+                        event["error"] = str(restart_exc)
+                    self.keepalive_restarts.append(event)
 
         self._keepalive_thread = threading.Thread(target=_ping, name="biowave-keepalive", daemon=True)
         self._keepalive_thread.start()
@@ -5793,9 +6044,14 @@ class EMGVisualizer(QMainWindow):
 
         self.live_analysis_enabled = False
         self.connection_medium = "wireless"
+        self.wired_binary = False
         self.current_device = device
         self.wireless_access_key = str(access_key or "").strip()
+        problem = access_key_problem(self.wireless_access_key)
+        if problem:
+            raise RuntimeError(problem)
         self.keepalive_failures = 0
+        self.keepalive_restarts = []
         self.channel_count = WIRELESS_TOTAL_CHANNELS
         self.reset_runtime_state_for_channels(self.channel_count)
 
@@ -5811,6 +6067,7 @@ class EMGVisualizer(QMainWindow):
             self.serial_worker.start(QThread.TimeCriticalPriority)
 
             client_ip = get_local_ip_for_target(device.ip)
+            self._stream_client_ip = client_ip
             ControlProtocol.start_stream(device.ip, self.wireless_access_key, client_ip, WIFI_STREAM_PORT)
 
             self.current_port_name = f"wifi://{device.ip}"
@@ -5963,7 +6220,12 @@ class EMGVisualizer(QMainWindow):
             QMessageBox.warning(self, "No Port", "Please select a valid serial port.")
             return
 
-        self.wired_channel_count = int(max(2, min(9, self.channel_count)))
+        # A real COM port streams the fixed 11-channel BWIM layout; socket:// simulators stream CSV
+        # with a user-chosen 2-11 channels.
+        self.wired_binary = not port_name.lower().startswith("socket://")
+        if self.wired_binary:
+            self.channel_count = WIRELESS_TOTAL_CHANNELS
+        self.wired_channel_count = int(max(2, min(11, self.channel_count)))
         self.channel_count = self.wired_channel_count
         self.reset_runtime_state_for_channels(self.channel_count)
         if self.analysis_window is not None:
@@ -5971,7 +6233,10 @@ class EMGVisualizer(QMainWindow):
             self.analysis_window = None
 
         try:
-            self.packet_tracer.reset("serial", 1)
+            if self.wired_binary:
+                self.packet_tracer.reset("wireless", WIRELESS_FRAMES_PER_PACKET)
+            else:
+                self.packet_tracer.reset("serial", 1)
             self.serial_worker = SerialWorker(port_name, DEFAULT_BAUD_RATE, self.num_channels,
                                               tracer=self.packet_tracer)
             self.serial_worker.batch_received.connect(self.on_serial_batch)
@@ -6044,9 +6309,6 @@ class EMGVisualizer(QMainWindow):
             self.data_collection_dialog.cancel_task_protocol(emit_signal=True)
         self._set_task_collection_mode(False)
         self.live_analysis_enabled = False
-        self.timed_record_label = ""
-        self.timed_record_phase = ""
-        self.timed_record_trial_id = 0
 
         self.is_connected = False
         self.is_calibrated = False
@@ -6209,7 +6471,7 @@ class EMGVisualizer(QMainWindow):
             self.threshold_lines_neg.append(threshold_line_neg)
             self.zero_lines.append(zero_line)
 
-        if self.connection_medium == "wireless" and num_channels >= WIRELESS_TOTAL_CHANNELS:
+        if self.layout_has_imu() and num_channels >= WIRELESS_TOTAL_CHANNELS:
             for i in range(WIRELESS_EMG_CHANNELS):
                 add_emg_plot(i, i, show_bottom=False)
 
@@ -6266,7 +6528,7 @@ class EMGVisualizer(QMainWindow):
         except Exception:
             return
 
-        if self.connection_medium == "wireless" and any(row["kind"] == "imu_combined" for row in self.plot_rows):
+        if self.layout_has_imu() and any(row["kind"] == "imu_combined" for row in self.plot_rows):
             logical_row_count = WIRELESS_TOTAL_CHANNELS
             viewport_height = int(self.plot_widget.viewport().height()) - 8
             if viewport_height <= 0:
@@ -6440,17 +6702,17 @@ class EMGVisualizer(QMainWindow):
                 line.setValue(-threshold)
 
     def apply_channel_count_from_dialog(self, count):
-        if self.connection_medium == "wireless":
+        if self.layout_has_imu():
             QMessageBox.information(
                 self,
-                "Wireless Channel Layout",
-                "Wireless mode uses a fixed 11-channel layout: 8 EMG channels plus Roll, Pitch, and Yaw.",
+                "Fixed Channel Layout",
+                "Wi-Fi and USB (COM port) streaming use a fixed 11-channel layout: 8 EMG channels plus Roll, Pitch, and Yaw.",
             )
             self.channel_count = WIRELESS_TOTAL_CHANNELS
             self.sync_calibration_dialog_state()
             return
 
-        new_count = int(max(2, min(9, count)))
+        new_count = int(max(2, min(11, count)))
         if not (self.is_connected and self.port_config_applied):
             QMessageBox.information(
                 self,
@@ -6484,7 +6746,10 @@ class EMGVisualizer(QMainWindow):
         self.reset_runtime_state_for_channels(self.channel_count)
 
         try:
-            self.packet_tracer.reset("serial", 1)
+            if self.wired_binary:
+                self.packet_tracer.reset("wireless", WIRELESS_FRAMES_PER_PACKET)
+            else:
+                self.packet_tracer.reset("serial", 1)
             self.serial_worker = SerialWorker(port_name, DEFAULT_BAUD_RATE, self.num_channels,
                                               tracer=self.packet_tracer)
             self.serial_worker.batch_received.connect(self.on_serial_batch)
@@ -6931,7 +7196,7 @@ class EMGVisualizer(QMainWindow):
 
     def data_collection_settings_payload(self):
         return {
-            "contributor_name": self.contributor_name,
+            "participant_id": self.participant_id,
             "blood_group": self.participant_blood_group,
             "height_cm": float(self.participant_height_cm),
             "weight_kg": float(self.participant_weight_kg),
@@ -6943,6 +7208,11 @@ class EMGVisualizer(QMainWindow):
             "max_cycles_per_block": int(self.study_meta["max_cycles_per_block"]),
             "block_break_s": float(self.study_meta["block_break_s"]),
             "hand_switch_s": float(self.study_meta["hand_switch_s"]),
+            "electrode": dict(self.study_meta["electrode"]),
+            "seed": int(self.study_meta["seed"]),
+            "practice_mode": bool(self.study_meta["practice_mode"]),
+            "hand_order_source": str(self.study_meta["hand_order_source"]),
+            "hand_order_default": str(self.study_meta["hand_order_default"]),
             "agreed": bool(self.contribution_agreed),
             "task_labels": list(self.task_labels),
             "labels_saved": bool(self.task_labels_locked),
@@ -6958,7 +7228,7 @@ class EMGVisualizer(QMainWindow):
 
     def update_data_collection_settings(self, settings):
         settings = dict(settings or {})
-        self.contributor_name = str(settings.get("contributor_name", self.contributor_name)).strip()
+        self.participant_id = normalize_participant_id(settings.get("participant_id", self.participant_id))
         self.participant_blood_group = str(settings.get("blood_group", self.participant_blood_group)).strip()
         self.participant_height_cm = float(settings.get("height_cm", self.participant_height_cm) or 0.0)
         self.participant_weight_kg = float(settings.get("weight_kg", self.participant_weight_kg) or 0.0)
@@ -6974,6 +7244,9 @@ class EMGVisualizer(QMainWindow):
             "max_cycles_per_block", self.study_meta["max_cycles_per_block"])))
         self.study_meta["block_break_s"] = float(max(0.0, settings.get("block_break_s", self.study_meta["block_break_s"])))
         self.study_meta["hand_switch_s"] = float(max(0.0, settings.get("hand_switch_s", self.study_meta["hand_switch_s"])))
+        self.study_meta["electrode"] = dict(settings.get("electrode", self.study_meta["electrode"]) or {})
+        for key, cast in (("seed", int), ("practice_mode", bool), ("hand_order_source", str), ("hand_order_default", str)):
+            self.study_meta[key] = cast(settings.get(key, self.study_meta[key]))
         self.contribution_agreed = bool(settings.get("agreed", self.contribution_agreed))
         labels_in = settings.get("task_labels", self.task_labels)
         if isinstance(labels_in, list):
@@ -7037,11 +7310,9 @@ class EMGVisualizer(QMainWindow):
 
     def build_auto_record_csv_path(self):
         save_dir = (self.record_save_dir or DATASET_DIR).strip() or DATASET_DIR
-        contributor = self._sanitize_filename_token(self.contributor_name)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        bundle_name = f"{contributor}_{timestamp}"
-        bundle_dir = os.path.join(save_dir, bundle_name)
-        return os.path.join(bundle_dir, f"emg_data_{bundle_name}.csv")
+        bundle_name = session_folder_name(self.participant_id, self.study_meta["session_day"],
+                                          self.study_meta["hand_order"], practice=self.study_meta["practice_mode"])
+        return os.path.join(save_dir, bundle_name, f"signals_{bundle_name}.csv")
 
     @staticmethod
     def _resolve_record_output_paths(path):
@@ -7051,7 +7322,9 @@ class EMGVisualizer(QMainWindow):
 
         base_dir = os.path.dirname(target_path) or "."
         stem = os.path.splitext(os.path.basename(target_path))[0].strip()
-        if stem.startswith("emg_data_"):
+        if stem.startswith("signals_"):
+            bundle_name = stem[len("signals_"):].strip()
+        elif stem.startswith("emg_data_"):
             bundle_name = stem[len("emg_data_"):].strip()
         elif stem.startswith("metadata_"):
             bundle_name = stem[len("metadata_"):].strip()
@@ -7066,7 +7339,7 @@ class EMGVisualizer(QMainWindow):
             bundle_dir = os.path.join(base_dir, bundle_name)
             root_dir = base_dir
 
-        data_csv_path = os.path.join(bundle_dir, f"emg_data_{bundle_name}.csv")
+        data_csv_path = os.path.join(bundle_dir, f"signals_{bundle_name}.csv")
         metadata_path = os.path.join(bundle_dir, f"metadata_{bundle_name}.txt")
         return data_csv_path, metadata_path, root_dir
 
@@ -7140,18 +7413,12 @@ class EMGVisualizer(QMainWindow):
                 raise ValueError("CSV must contain channel columns (Ch1..ChN)")
             return int(len(channel_cols))
 
-    def recorded_sample_count(self, batches=None):
-        total = 0
-        for batch in list(self.recorded_batches if batches is None else batches):
-            try:
-                data = np.asarray(batch.data)
-            except Exception:
-                data = np.asarray([])
-            if data.ndim == 2:
-                total += int(data.shape[0])
-        return int(total)
+    def recorded_sample_count(self):
+        """Frames written so far by the continuous recorder (valid and gap frames)."""
+        rec = self.session_recorder
+        return int(rec.rows) if rec is not None else int(self._last_session_rows)
 
-    def build_recorded_metadata_lines(self, data_csv_path, root_dir, sample_count):
+    def build_recorded_metadata_lines(self, data_csv_path, root_dir, sample_count, quality=None):
         labels = [str(x).strip() for x in self.task_labels if str(x).strip()]
         root_abs = os.path.abspath(root_dir or ".")
         data_abs = os.path.abspath(data_csv_path)
@@ -7159,16 +7426,25 @@ class EMGVisualizer(QMainWindow):
             data_rel = os.path.relpath(data_abs, root_abs).replace("\\", "/")
         except ValueError:
             data_rel = os.path.basename(data_csv_path)
-        sample_eval = self.evaluate_recording_sample_coverage(int(sample_count))
+        valid_count = int((quality or {}).get("rows_valid", sample_count))
+        sample_eval = self.evaluate_recording_sample_coverage(valid_count)
         snap = self.packet_tracer.snapshot()
         return [
             f"created_at={time.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"contributor={self.contributor_name}",
+            f"participant_id={self.participant_id}",
             f"blood_group={self.participant_blood_group or 'N/A'}",
             f"height_cm={_value_or_na(self.participant_height_cm, '{:.1f}')}",
             f"weight_kg={_value_or_na(self.participant_weight_kg, '{:.1f}')}",
             f"age_years={_value_or_na(self.participant_age_years, '{:d}', cast=int)}",
             f"forearm_circumference_cm={_value_or_na(self.participant_forearm_circumference_cm, '{:.2f}')}",
+            f"electrode_landmark={self.study_meta['electrode'].get('landmark') or 'N/A'}",
+            f"electrode_landmark_distance_cm={_value_or_na(self.study_meta['electrode'].get('landmark_distance_cm'), '{:.1f}')}",
+            f"channel1_muscle={self.study_meta['electrode'].get('channel1_muscle') or 'N/A'}",
+            f"skin_preparation={self.study_meta['electrode'].get('skin_preparation') or 'N/A'}",
+            f"electrode_type={self.study_meta['electrode'].get('electrode_type') or 'N/A'}",
+            f"electrode_photo={self.study_meta['electrode'].get('photo_filename') or 'N/A'}",
+            f"app_version={APP_VERSION}",
+            f"git_commit={app_git_info()['commit'] or 'N/A'}",
             f"session_day={int(self.study_meta['session_day'])}",
             f"hand_order={'+'.join(hands_for_order(self.study_meta['hand_order'])).lower()}",
             f"max_cycles_per_block={int(self.study_meta['max_cycles_per_block'])}",
@@ -7176,8 +7452,9 @@ class EMGVisualizer(QMainWindow):
             f"hand_switch_break_s={float(self.study_meta['hand_switch_s']):.0f}",
             f"temp_start_c={_value_or_na(self.study_meta['temp_start_c'], '{:.1f}')}",
             f"humidity_start_pct={_value_or_na(self.study_meta['humidity_start_pct'], '{:.0f}')}",
-            f"agreement={bool(self.contribution_agreed)}",
+            f"consent_form_version={CONSENT_FORM_VERSION if self.contribution_agreed else 'NOT_CONSENTED'}",
             f"labels={','.join(labels)}",
+            "label_codes=" + ",".join(f"{name}:{code}" for name, code in sorted(LABEL_CODES.items(), key=lambda kv: kv[1])),
             f"labels_saved={bool(self.task_labels_locked)}",
             f"repeats={int(self.task_repeats)}",
             f"prep_s={float(self.task_prep_s)}",
@@ -7185,7 +7462,11 @@ class EMGVisualizer(QMainWindow):
             f"rest_s={float(self.task_rest_s)}",
             f"record_rest={bool(self.task_record_rest)}",
             f"settle_s={float(self.task_settle_s)}",
-            f"randomize_order={bool(self.task_randomize_order)}",
+            f"randomize_order={bool(self.task_randomize_order or not self.study_meta['practice_mode'])}",
+            f"random_seed={int(self.study_meta['seed'])}",
+            f"practice_mode={bool(self.study_meta['practice_mode'])}",
+            f"hand_order_source={self.study_meta['hand_order_source']}",
+            f"hand_order_counterbalanced_default={self.study_meta['hand_order_default'] or 'N/A'}",
             f"channel_count={int(self.num_channels)}",
             f"connection_medium={self.connection_medium}",
             f"sample_rate_hz={int(SAMPLE_RATE)}",
@@ -7202,7 +7483,11 @@ class EMGVisualizer(QMainWindow):
             f"packet_loss_pct={snap['loss_pct']:.3f}",
             f"max_packet_gap_ms={snap['max_gap_ms']:.1f}",
             f"csv_signal_mode=raw",
-            f"csv_columns=Timestamp_ms,Packet_Number,Trial_ID,{','.join(self._record_channel_columns())},Label,Hand",
+            f"csv_columns={','.join(SIGNAL_COLUMNS)}",
+            f"num_valid_samples={valid_count}",
+            f"events_file=events_{os.path.basename(os.path.dirname(data_csv_path))}.csv",
+            f"quality_file=quality_{os.path.basename(os.path.dirname(data_csv_path))}.json",
+            f"session_start_utc={self._session_start_utc}",
             f"data_file={os.path.basename(data_csv_path)}",
             f"data_path={data_rel}",
         ]
@@ -7236,7 +7521,6 @@ class EMGVisualizer(QMainWindow):
 
         was_active = self.task_session_active
         self.task_session_active = False
-        self.timed_record_enabled = False
         self.rf_samples_since_submit = 0
         if was_active:
             self.check_graph_stream.setChecked(bool(self._record_graph_stream_prev_checked))
@@ -7263,8 +7547,9 @@ class EMGVisualizer(QMainWindow):
                 self.set_status(f"Break checkpoint could not be saved: {payload.get('error', 'unknown error')}", "#f57c00")
             return
         if not payload.get("ok", False):
-            self.set_status("Task finished but CSV save failed.", "#f44336")
-            QMessageBox.warning(self, "CSV Save", f"Task finished but CSV save failed:\n{payload.get('error', 'Unknown error')}")
+            self.set_status("Task finished but the recording could not be finalised.", "#f44336")
+            QMessageBox.warning(self, "Recording Save", f"The recording could not be finalised:\n{payload.get('error', 'Unknown error')}\n\n"
+                                "The raw frames were still written to disk (raw_*.bin in the session folder).")
             return
 
         data_csv_path = str(payload.get("data_csv_path", "")).strip()
@@ -7272,64 +7557,119 @@ class EMGVisualizer(QMainWindow):
         self.record_save_dir = str(context.get("root_dir", self.record_save_dir) or self.record_save_dir)
         if self.data_collection_dialog and self.data_collection_dialog.isVisible():
             self.data_collection_dialog.set_csv_dir(self.record_save_dir)
-
         if context.get("show_saved_dialog"):
-            QMessageBox.information(self, "Saved", f"Recorded CSV saved:\n{data_csv_path}")
+            QMessageBox.information(self, "Saved", f"Recording saved:\\n{data_csv_path}")
 
-        sample_eval = context.get("sample_eval")
-        if not isinstance(sample_eval, dict):
-            self.set_status("Recorded CSV saved.", "#2e7d32")
-            return
-
-        summary = (
-            f"Data collection session complete | "
-            f"Samples: {sample_eval['actual_samples']}/{sample_eval['expected_samples']} "
-            f"({sample_eval['sample_ratio_pct']:.1f}%) | "
-            f"Est. rate: {sample_eval['effective_hz']:.1f} Hz"
-        )
-        if sample_eval.get("below_threshold", False):
+        quality = payload.get("quality") or {}
+        self._last_session_quality = quality
+        ratio = float(quality.get("valid_sample_ratio", 0.0))
+        summary = (f"Data collection session complete | Frames: {quality.get('rows_valid', 0):,} valid of "
+                   f"{quality.get('rows_total', 0):,} ({100 * ratio:.2f}% valid) | "
+                   f"Packets missing: {quality.get('transport', {}).get('packets_missing', 0):,}")
+        if not quality.get("meets_valid_sample_threshold", False):
             self.set_status(summary, "#f57c00")
             QMessageBox.warning(
-                self,
-                "Low Effective Sampling",
-                (
-                    "Recorded sample count is lower than expected.\n\n"
-                    f"Expected samples: {sample_eval['expected_samples']}\n"
-                    f"Actual samples: {sample_eval['actual_samples']}\n"
-                    f"Coverage: {sample_eval['sample_ratio_pct']:.1f}%\n"
-                    f"Estimated effective rate: {sample_eval['effective_hz']:.1f} Hz\n"
-                    f"Configured rate: {int(SAMPLE_RATE)} Hz\n\n"
-                    "This can reduce training windows and model quality."
-                ),
-            )
+                self, "Low Valid-Sample Ratio",
+                (f"Only {100 * ratio:.2f}% of the recorded frames are valid; the minimum for a usable session is "
+                 f"{100 * MIN_RECORD_SAMPLE_RATIO:.0f}%.\\n\\nMissing frames are kept as explicit Valid=0 rows. "
+                 f"Gaps: {len(quality.get('gaps', []))}. See quality_*.json next to the signal file.\\n\\n"
+                 "Consider re-recording this session."))
         else:
             self.set_status(summary, "#2e7d32")
 
-    def queue_recorded_csv_save(self, path, batches=None, sample_eval=None, show_saved_dialog=False,
-                                checkpoint=False):
-        batches_to_save = list(self.recorded_batches if batches is None else batches)
-        if self.recorded_sample_count(batches_to_save) <= 0:
-            raise ValueError("No recorded samples available.")
+    def _transport_summary(self):
+        snap = self.packet_tracer.snapshot()
+        return {"kind": snap["kind"], "packets_received": snap["received"], "packets_missing": snap["missing"],
+                "packets_late": snap.get("late", 0), "packets_duplicate": snap.get("duplicate", 0),
+                "packets_out_of_order": snap["out_of_order"], "packets_invalid": snap["invalid"],
+                "frames_missing": snap.get("frames_missing", 0), "loss_pct_packets": snap["loss_pct"],
+                "max_packet_gap_ms": snap["max_gap_ms"], "jitter_ms": snap["jitter_ms"]}
 
-        data_csv_path, metadata_path, root_dir = self._resolve_record_output_paths(path)
-        metadata_lines = self.build_recorded_metadata_lines(
-            data_csv_path,
-            root_dir,
-            self.recorded_sample_count(batches_to_save),
-        )
-        worker = RecordedCsvSaveWorker(batches_to_save, data_csv_path, metadata_path, metadata_lines, self)
-        context = {
-            "root_dir": root_dir,
-            "sample_eval": sample_eval,
-            "show_saved_dialog": bool(show_saved_dialog),
-            "checkpoint": bool(checkpoint),
-        }
-        worker.save_completed.connect(
-            lambda result, w=worker, ctx=context: self._on_record_save_completed(w, ctx, result)
-        )
+    def queue_session_finalize(self, close_recorder, checkpoint=False, show_saved_dialog=False):
+        """Hand the recorder to a background worker that writes the labelled files."""
+        rec = self.session_recorder
+        if rec is None or self.session_events is None:
+            raise ValueError("No recording session is active.")
+        data_csv_path, metadata_path, root_dir = self._resolve_record_output_paths(self._session_csv_path)
+        events = [dict(e) for e in self.session_events.events]
+        builder = lambda rows, quality, d=data_csv_path, r=root_dir: self.build_recorded_metadata_lines(d, r, rows, quality)
+        worker = SessionFinalizeWorker(
+            rec, events, self._session_dir, self._session_name, SAMPLE_RATE, self._transport_summary(),
+            list(self.keepalive_restarts), self._session_host_origin, metadata_path, builder, close_recorder,
+            json_builder=self.make_metadata_json_builder(data_csv_path), parent=self)
+        context = {"root_dir": root_dir, "checkpoint": bool(checkpoint), "show_saved_dialog": bool(show_saved_dialog)}
+        worker.save_completed.connect(lambda result, w=worker, ctx=context: self._on_record_save_completed(w, ctx, result))
         self.record_save_workers.append(worker)
+        if close_recorder:
+            self._last_session_rows = int(rec.rows)
+            self.session_recorder = None       # nothing more is appended; the worker drains and closes it
         worker.start(QThread.LowPriority)
         return data_csv_path, metadata_path
+
+    def make_metadata_json_builder(self, data_csv_path):
+        """Snapshot everything that goes into metadata_<session>.json now (GUI thread); the worker adds the results."""
+        session = os.path.basename(os.path.dirname(data_csv_path))
+        git = app_git_info()
+        info = {}
+        if self.connection_medium == "wireless" and self.current_device is not None:
+            d = self.current_device
+            info = {"firmware_version": d.firmware, "device_id": d.device_id, "device_name": d.device_name,
+                    "sampling_rate_hz": d.sample_rate_hz, "imu_ready": d.imu_ready}
+        elif self.serial_worker is not None and getattr(self.serial_worker, "device_info", None):
+            info = dict(self.serial_worker.device_info)
+        medium = ("wifi" if self.connection_medium == "wireless"
+                  else "usb_binary" if self.wired_binary else "usb_csv_simulator")
+        device = {**info, "connection_medium": medium,
+                  "configured_sampling_rate_hz": SAMPLE_RATE,
+                  "sampling_rate_hz": info.get("sample_rate_hz") or info.get("sampling_rate_hz") or SAMPLE_RATE,
+                  "sampling_rate_source": "device" if (info.get("sample_rate_hz") or info.get("sampling_rate_hz"))
+                  else "app_default (firmware did not report it)"}
+        device.pop("sample_rate_hz", None)
+        sm = self.study_meta
+        labels = [str(x).strip() for x in self.task_labels if str(x).strip()]
+        sections = dict(
+            mode="practice" if sm["practice_mode"] else "study",
+            participant_id=self.participant_id,
+            consent_form_version=CONSENT_FORM_VERSION if self.contribution_agreed else None,
+            software={"app_version": APP_VERSION, "git_commit": git["commit"], "git_dirty": git["dirty"],
+                      "python": sys.version.split()[0], "platform": sys.platform},
+            device=device,
+            session_info={"session_day": int(sm["session_day"]), "hand_order": sm["hand_order"],
+                     "hand_order_source": sm["hand_order_source"],
+                     "hand_order_counterbalanced_default": sm["hand_order_default"],
+                     "start_utc": self._session_start_utc, "host_clock": "time.monotonic (seconds)",
+                     "random_seed": int(sm["seed"])},
+            protocol={"labels": labels, "repeats_per_class_per_hand": int(self.task_repeats),
+                      "prepare_s": float(self.task_prep_s), "perform_s": float(self.task_hold_s),
+                      "rest_s": float(self.task_rest_s), "settle_s": float(self.task_settle_s),
+                      "record_rest": bool(self.task_record_rest),
+                      "randomize_order": bool(self.task_randomize_order or not sm["practice_mode"]),
+                      "max_cycles_per_block": int(sm["max_cycles_per_block"]),
+                      "block_break_s": float(sm["block_break_s"]), "hand_switch_break_s": float(sm["hand_switch_s"]),
+                      "recording": "continuous (all phases), labelled afterwards by device frame ID"},
+            environment={"temperature_c": float(sm["temp_start_c"]), "humidity_pct": float(sm["humidity_start_pct"])},
+            participant={"blood_group": self.participant_blood_group, "height_cm": self.participant_height_cm or None,
+                         "weight_kg": self.participant_weight_kg or None, "age_years": self.participant_age_years or None},
+            electrode_placement={
+                "landmark": sm["electrode"].get("landmark"),
+                "distance_from_landmark_cm": sm["electrode"].get("landmark_distance_cm") or None,
+                "channel_1_muscle": sm["electrode"].get("channel1_muscle"),
+                "forearm_circumference_cm": self.participant_forearm_circumference_cm or None,
+                "skin_preparation": sm["electrode"].get("skin_preparation"),
+                "electrode_type": sm["electrode"].get("electrode_type"),
+                "photo_filename": sm["electrode"].get("photo_filename")},
+            files={"signals": f"signals_{session}.csv", "events": f"events_{session}.csv",
+                   "quality": f"quality_{session}.json", "metadata_text": f"metadata_{session}.txt",
+                   "raw_frames": f"raw_{session}.bin"},
+        )
+        label_map = [{"old_name": old, "name": new, "code": code} for old, (new, code) in LABEL_MAP.items()]
+        phase_labels = {"paused": PSEUDO_LABELS["paused"], "aborted": PSEUDO_LABELS["aborted"]}
+
+        def build(rows, quality):
+            return build_metadata_json(session=session, label_map=label_map, phase_labels=phase_labels, **sections,
+                                       result={"rows": int(rows), "valid_sample_ratio": quality.get("valid_sample_ratio"),
+                                               "meets_valid_sample_threshold": quality.get("meets_valid_sample_threshold")})
+        return build
 
     def start_task_timer_recording(self):
         if not self.data_collection_dialog or not self.data_collection_dialog.isVisible():
@@ -7345,8 +7685,11 @@ class EMGVisualizer(QMainWindow):
         if not self.contribution_agreed:
             QMessageBox.warning(self, "Agreement Required", "Open Data Collection and agree to contribute first.")
             return
-        if not self.contributor_name.strip():
-            QMessageBox.warning(self, "Contributor", "Provide contributor name in Data Collection before starting.")
+        if not valid_participant_id(self.participant_id):
+            QMessageBox.warning(self, "Participant ID", "Provide a pseudonymous participant ID (S01, S02, ...) in Data Collection before starting.")
+            return
+        if self.study_meta["temp_start_c"] <= 0.0 or self.study_meta["humidity_start_pct"] <= 0.0:
+            QMessageBox.warning(self, "Room Conditions", "Temperature and humidity are required before a session can start.")
             return
         if not self.task_labels_locked:
             QMessageBox.warning(self, "Task Labels", "Save task labels in Data Collection before starting.")
@@ -7357,17 +7700,25 @@ class EMGVisualizer(QMainWindow):
             QMessageBox.warning(self, "Task Labels", "Provide at least one gesture label.")
             return
 
-        self.recorded_batches = []
-        self._recorded_total_samples = 0
-        self.record_start_unix = time.time()
-        self.timed_record_enabled = False
-        self.timed_record_label = ""
-        self.timed_record_phase = ""
-        self.timed_record_trial_id = 0
-        self.timed_record_hand = ""
+        self._session_csv_path = self.build_auto_record_csv_path()
+        data_csv_path, _metadata_path, _root = self._resolve_record_output_paths(self._session_csv_path)
+        self._session_dir = os.path.dirname(data_csv_path)
+        self._session_name = os.path.basename(self._session_dir)
+        try:
+            self.session_recorder = ContinuousRecorder(
+                os.path.join(self._session_dir, f"raw_{self._session_name}.bin"), SAMPLE_RATE)
+        except OSError as exc:
+            QMessageBox.warning(self, "Recording", f"Cannot create the session files:\\n{exc}")
+            return
+        self.session_events = EventLog()
+        self._last_session_rows = 0
+        self._last_session_quality = None
+        self._cycle_event_start = 0
         self.record_missing_packets = 0
         self.record_gap_events = 0
-        self._session_csv_path = self.build_auto_record_csv_path()
+        self.keepalive_restarts = []
+        self._session_host_origin = time.monotonic()                 # all host times are monotonic
+        self._session_start_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())   # metadata only
 
         started = self.data_collection_dialog.start_task_protocol(
             labels=labels,
@@ -7377,7 +7728,8 @@ class EMGVisualizer(QMainWindow):
             rest_s=self.task_rest_s,
             record_rest=self.task_record_rest,
             settle_s=self.task_settle_s,
-            randomize_order=self.task_randomize_order,
+            randomize_order=True if not self.study_meta["practice_mode"] else self.task_randomize_order,
+            seed=self.study_meta["seed"],
             hand_order=self.study_meta["hand_order"],
             session_day=self.study_meta["session_day"],
             max_cycles_per_block=self.study_meta["max_cycles_per_block"],
@@ -7385,210 +7737,99 @@ class EMGVisualizer(QMainWindow):
             hand_switch_s=self.study_meta["hand_switch_s"],
         )
         if not started:
+            rec, self.session_recorder, self.session_events = self.session_recorder, None, None
+            rec.close()
             QMessageBox.warning(self, "Task Timer", "Unable to start task session.")
             return
+        self._session_total_ms = int(self.data_collection_dialog.task_protocol.session_total_ms)
         self._set_task_collection_mode(True)
-        self.set_status("Task Timer: session started | live graph paused for stable capture", "#00897b")
+        self.set_status("Task Timer: session started | recording every frame continuously", "#00897b")
 
-    def on_task_phase_started(self, label, trial_id, phase_name, record_enabled, hand=""):
-        self.timed_record_label = str(label)
-        self.timed_record_trial_id = int(trial_id)
-        self.timed_record_phase = str(phase_name)
-        self.timed_record_hand = str(hand)
-        self.timed_record_enabled = bool(record_enabled)
-        if str(phase_name).strip().lower() == "prepare":
-            self._cycle_batch_start = len(self.recorded_batches)
+    def on_task_phase_started(self, label, trial_id, phase_name, record_enabled, hand="", block=0, cycle_no=0, planned_ms=0):
+        if self.session_events is not None:
+            idx = self.session_events.add(phase_name, label, hand, trial_id, block, cycle_no, time.monotonic(), planned_ms)
+            if str(phase_name).strip().lower() == "prepare":
+                self._cycle_event_start = idx
         if str(phase_name).strip().lower() in ("break", "switch hand") and self.recorded_sample_count() > 0:
             # Protect the data collected so far: a 60-minute session should not hinge on one final save.
             try:
-                self.queue_recorded_csv_save(
-                    self._session_csv_path or self.build_auto_record_csv_path(), checkpoint=True)
+                self.queue_session_finalize(close_recorder=False, checkpoint=True)
             except Exception:
                 pass
-        mode = "RECORDING" if self.timed_record_enabled else "GUIDE"
         self.set_status(
-            f"Task Timer: {hand} hand | Trial {trial_id} | {phase_name} | Label={label} | {mode}",
-            "#00897b" if self.timed_record_enabled else "#607d8b",
+            f"Task Timer: {hand} hand | Trial {trial_id} | {phase_name} | Label={label} | RECORDING",
+            "#00897b",
         )
 
     def on_task_protocol_finished(self):
         self._set_task_collection_mode(False)
-        self.timed_record_label = ""
-        self.timed_record_phase = ""
-        self.timed_record_trial_id = 0
-        self.timed_record_hand = ""
+        if self.session_events is not None:
+            self.session_events.add("end", "end", "", 0, 0, 0, time.monotonic(), 0)
         self.refresh_csv_counter()
-
-        sample_count = self.recorded_sample_count()
-        sample_eval = self.evaluate_recording_sample_coverage(sample_count)
-        save_path = self._session_csv_path or self.build_auto_record_csv_path()
         for worker in list(self.record_save_workers):
             worker.wait()   # let an in-flight break checkpoint finish before the final write
         try:
-            self.queue_recorded_csv_save(save_path, sample_eval=sample_eval)
-            self.set_status("Task complete - saving CSV in background...", "#00897b")
+            self.queue_session_finalize(close_recorder=True)
+            self.set_status("Task complete - writing signals, events and quality report in background...", "#00897b")
         except Exception as e:
-            QMessageBox.warning(self, "CSV Save", f"Task finished but CSV save failed:\n{e}")
+            QMessageBox.warning(self, "Recording Save", f"Task finished but saving failed:\\n{e}")
 
     def on_task_protocol_paused(self, paused):
         if paused:
-            self.timed_record_enabled = False
-            self.set_status("Task Timer: PAUSED - recording stopped", "#f57c00")
+            if self.session_events is not None:
+                last = self.session_events.events[-1] if len(self.session_events) else None
+                self.session_events.add("paused", "paused", last["hand"] if last else "", last["trial_id"] if last else 0,
+                                        last["block"] if last else 0, last["cycle_no"] if last else 0,
+                                        time.monotonic(), 0)
+            self.set_status("Task Timer: PAUSED - frames keep being recorded, labelled 'paused'", "#f57c00")
 
     def on_task_protocol_rewind(self):
-        """Resume after a pause: discard the interrupted cycle's samples; it restarts from Prepare."""
-        keep = min(self._cycle_batch_start, len(self.recorded_batches))
-        del self.recorded_batches[keep:]
-        self._recorded_total_samples = self.recorded_sample_count()
+        """Resume after a pause: the interrupted cycle is kept but relabelled 'aborted'; it restarts from Prepare."""
+        if self.session_events is not None:
+            self.session_events.mark_aborted_since(self._cycle_event_start)
 
     def on_task_protocol_canceled(self):
         self._set_task_collection_mode(False)
-        self.timed_record_label = ""
-        self.timed_record_phase = ""
-        self.timed_record_trial_id = 0
-        self.timed_record_hand = ""
         self.set_status("Task timer canceled.", "#f57c00")
+        rec = self.session_recorder
         rows = self.recorded_sample_count()
-        if rows > 0 and self.is_connected:
+        if rec is None:
+            return
+        if self.session_events is not None:
+            self.session_events.add("end", "end", "", 0, 0, 0, time.monotonic(), 0)
+        if rows > 0:
             answer = QMessageBox.question(
                 self, "Save Partial Recording",
-                f"The session was cancelled after {rows:,} rows were recorded.\nSave them as a partial CSV?",
+                f"The session was cancelled after {rows:,} frames were recorded.\\nWrite them as a partial recording?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
             if answer == QMessageBox.Yes:
                 try:
-                    self.queue_recorded_csv_save(
-                        self._session_csv_path or self.build_auto_record_csv_path(), show_saved_dialog=True)
+                    self.queue_session_finalize(close_recorder=True, show_saved_dialog=True)
+                    return
                 except Exception as e:
-                    QMessageBox.warning(self, "CSV Save", f"Partial CSV save failed:\n{e}")
+                    QMessageBox.warning(self, "Recording Save", f"Partial save failed:\\n{e}")
+        # Declined (or failed): the raw frames stay on disk, nothing is deleted.
+        self._last_session_rows = int(rec.rows)
+        self.session_recorder = None
+        rec.close()
 
     def expected_recorded_samples(self):
-        labels = [str(x).strip() for x in self.task_labels if str(x).strip()]
-        if len(labels) <= 0:
-            return 0
-        repeats = int(max(1, self.task_repeats))
-        hold_s = float(max(0.0, self.task_hold_s))
-        rest_s = float(max(0.0, self.task_rest_s)) if bool(self.task_record_rest) else 0.0
-        hands = len(hands_for_order(self.study_meta["hand_order"]))
-        recorded_sec = repeats * hands * len(labels) * (hold_s + rest_s)
-        return int(round(recorded_sec * float(SAMPLE_RATE)))
+        """Frames the whole protocol should produce: every phase is recorded now, breaks included."""
+        return int(round(self._session_total_ms / 1000.0 * float(SAMPLE_RATE)))
 
     def evaluate_recording_sample_coverage(self, actual_samples):
         expected = int(max(0, self.expected_recorded_samples()))
         actual = int(max(0, actual_samples))
-        if expected <= 0:
-            return {
-                "expected_samples": expected,
-                "actual_samples": actual,
-                "sample_ratio": 0.0,
-                "sample_ratio_pct": 0.0,
-                "effective_hz": 0.0,
-                "below_threshold": False,
-            }
-        ratio = float(actual) / float(expected)
-        eff_hz = ratio * float(SAMPLE_RATE)
+        ratio = (float(actual) / float(expected)) if expected > 0 else 0.0
         return {
             "expected_samples": expected,
             "actual_samples": actual,
             "sample_ratio": ratio,
             "sample_ratio_pct": ratio * 100.0,
-            "effective_hz": eff_hz,
-            "below_threshold": bool(ratio < float(MIN_RECORD_SAMPLE_RATIO)),
+            "effective_hz": ratio * float(SAMPLE_RATE),
+            "below_threshold": bool(expected > 0 and ratio < float(MIN_RECORD_SAMPLE_RATIO)),
         }
-
-    def append_record_batch(self, raw_batch, packet_numbers=None):
-        if not self.timed_record_enabled:
-            return
-        if raw_batch is None or raw_batch.size == 0:
-            return
-
-        arr = np.asarray(raw_batch, dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[0] <= 0:
-            return
-        n = arr.shape[0]
-        now = time.time()
-        base_ms = (now - self.record_start_unix) * 1000.0
-        timestamps_ms = base_ms + (np.arange(n, dtype=np.float32) * np.float32(1000.0 / SAMPLE_RATE))
-        packet_src = np.asarray(packet_numbers if packet_numbers is not None else [], dtype=np.int64).reshape(-1)
-        packet_arr = np.full(n, -1, dtype=np.int64)
-        if packet_src.size > 0:
-            packet_arr[: min(n, packet_src.size)] = packet_src[: min(n, packet_src.size)]
-
-        self.recorded_batches.append(
-            TimedRecordBatch(
-                timestamps_ms=np.asarray(timestamps_ms, dtype=np.float32),
-                packet_numbers=packet_arr,
-                trial_id=int(self.timed_record_trial_id),
-                label=str(self.timed_record_label),
-                data=np.ascontiguousarray(arr, dtype=np.float32),
-                hand=str(self.timed_record_hand),
-            )
-        )
-        self._recorded_total_samples += n
-
-        # Cap in-memory recording at ~10 min @ 500 Hz × 11 ch to prevent runaway growth.
-        _MAX_RECORD_SAMPLES = 3_300_000
-        while self._recorded_total_samples > _MAX_RECORD_SAMPLES and len(self.recorded_batches) > 1:
-            oldest = self.recorded_batches.pop(0)
-            self._recorded_total_samples -= int(oldest.data.shape[0])
-
-    def save_recorded_csv_dialog(self):
-        if self.recorded_sample_count() <= 0:
-            QMessageBox.information(self, "No Data", "No timed recording samples in memory to save.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Recorded CSV",
-            self.last_recorded_csv_path,
-            "CSV Files (*.csv)",
-        )
-        if not path:
-            return
-        try:
-            data_path, _metadata_path = self.queue_recorded_csv_save(path, show_saved_dialog=True)
-            self.set_status("Saving recorded CSV in background...", "#00897b")
-            self.last_recorded_csv_path = data_path
-        except Exception as e:
-            QMessageBox.warning(self, "CSV Save", str(e))
-
-    def save_recorded_csv(self, path):
-        if self.recorded_sample_count() <= 0:
-            raise ValueError("No recorded rows available.")
-        data_csv_path, metadata_path, root_dir = self._resolve_record_output_paths(path)
-        channel_columns = self._record_channel_columns()
-        fieldnames = ["Timestamp_ms", "Packet_Number", "Trial_ID"] + channel_columns + ["Label"]
-        os.makedirs(os.path.dirname(data_csv_path) or ".", exist_ok=True)
-        with open(data_csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(fieldnames)
-            for batch in self.recorded_batches:
-                data = np.asarray(batch.data, dtype=np.float32)
-                if data.ndim != 2 or data.shape[0] <= 0:
-                    continue
-                n_rows = data.shape[0]
-                n_cols = int(min(WIRELESS_TOTAL_CHANNELS, data.shape[1]))
-                for idx in range(n_rows):
-                    row = [
-                        float(batch.timestamps_ms[idx]) if idx < len(batch.timestamps_ms) else 0.0,
-                        int(batch.packet_numbers[idx]) if idx < len(batch.packet_numbers) else -1,
-                        int(batch.trial_id),
-                    ]
-                    row.extend(float(v) for v in data[idx, :n_cols])
-                    if n_cols < WIRELESS_TOTAL_CHANNELS:
-                        row.extend([""] * (WIRELESS_TOTAL_CHANNELS - n_cols))
-                    row.append(str(batch.label))
-                    writer.writerow(row)
-        self.save_recorded_metadata_txt(
-            metadata_path,
-            data_csv_path,
-            root_dir,
-            sample_count=self.recorded_sample_count(),
-        )
-        self.last_recorded_csv_path = data_csv_path
-        self.record_save_dir = root_dir or self.record_save_dir
-        if self.data_collection_dialog and self.data_collection_dialog.isVisible():
-            self.data_collection_dialog.set_csv_dir(self.record_save_dir)
-        return data_csv_path, metadata_path
 
     @classmethod
     def load_segments_from_record_csv(cls, path):
@@ -7602,6 +7843,7 @@ class EMGVisualizer(QMainWindow):
             label_col = field_map.get("label", "")
             trial_col = field_map.get("trial_id", "")
             phase_col = field_map.get("phase", "")
+            valid_col = field_map.get("valid", "")
             channel_cols = cls._active_channel_columns_from_csv(csv_path)
             if not label_col:
                 raise ValueError("CSV missing required column: Label")
@@ -7615,8 +7857,17 @@ class EMGVisualizer(QMainWindow):
                 label = str(row.get(label_col, "")).strip()
                 if not label:
                     continue
-                trial = str(row.get(trial_col, "1")).strip() if trial_col else "1"
                 phase = str(row.get(phase_col, "")).strip() if phase_col else ""
+                invalid = bool(valid_col) and str(row.get(valid_col, "1")).strip() == "0"
+                # Continuous recordings also contain prepare/settle/break/pause/aborted frames and
+                # NaN gap frames: only task (perform) and rest frames are training data, and a gap
+                # ends the current segment instead of being bridged.
+                if invalid or (phase and phase.lower() not in ("perform", "rest")):
+                    if len(buf) > 0 and current_label:
+                        segments.append((current_label, np.asarray(buf, dtype=np.float32)))
+                    buf, current_key, current_label = [], None, None
+                    continue
+                trial = str(row.get(trial_col, "1")).strip() if trial_col else "1"
                 key = (label, trial, phase)
                 try:
                     sample = []
@@ -8480,7 +8731,8 @@ class EMGVisualizer(QMainWindow):
             packet_numbers = np.asarray(payload.get("packet_numbers", []), dtype=np.int64).reshape(-1)
             metadata = {key: payload.get(key) for key in (
                 "source", "frame_ids", "emg_timestamps", "imu_ids", "imu_timestamps",
-                "host_received_monotonic", "packet_gap")}
+                "host_received_monotonic", "packet_gap", "gap_frames", "valid", "late_flags",
+                "imu_fresh", "host_received_s", "device_counters", "restart")}
             return batch, packet_numbers, metadata
 
         batch = np.asarray(payload, dtype=np.float32)
@@ -8494,14 +8746,31 @@ class EMGVisualizer(QMainWindow):
             return
         if batch.ndim != 2 or batch.shape[1] != self.num_channels:
             return
+        if self.session_recorder is not None and isinstance(payload, dict):
+            # Every frame (gap frames included) goes to disk via the writer thread; labels come later.
+            self.session_recorder.append(payload)
         self.last_transport_metadata = transport_metadata
         # Packet gaps are not silently treated as continuous EMG. Require a
         # fresh full model window before classification resumes.
         packet_gap = int(transport_metadata.get("packet_gap") or 0)
+        if int(transport_metadata.get("gap_frames") or 0) > 0:
+            packet_gap = max(packet_gap, 1)
+        valid = transport_metadata.get("valid")
+        if valid is not None and not np.all(valid):
+            # NaN gap rows exist for the recording; the live filters/plots must only see real samples.
+            keep = np.asarray(valid, dtype=bool)
+            batch = batch[keep]
+            if packet_numbers.shape[0] == keep.shape[0]:
+                packet_numbers = packet_numbers[keep]
+            if batch.shape[0] == 0:
+                if packet_gap > 0:
+                    self.rf_valid_sample_count = 0
+                    self.rf_samples_since_submit = 0
+                return
         if packet_gap > 0:
             self.rf_valid_sample_count = 0
             self.rf_samples_since_submit = 0
-            if self.timed_record_enabled:
+            if self.session_recorder is not None:
                 self.record_missing_packets += packet_gap
                 self.record_gap_events += 1
 
@@ -8523,7 +8792,6 @@ class EMGVisualizer(QMainWindow):
         if not self.is_calibrated:
             return  # Hard requirement: no graph/analysis before calibration.
 
-        self.append_record_batch(batch, packet_numbers=packet_numbers)
         # Single transpose: (samples, channels) → (channels, samples) used for both buffers.
         raw_new_data = batch.T
         raw_num_new = raw_new_data.shape[1]
@@ -9183,7 +9451,7 @@ class EMGVisualizer(QMainWindow):
         self.refresh_csv_counter()
 
     def refresh_csv_counter(self):
-        rows = int(self._recorded_total_samples)
+        rows = int(self.recorded_sample_count())
         expected = int(self.expected_recorded_samples())
         self.lbl_csv_rows.setText(f"CSV rows: {rows:,}")
         if self.data_collection_dialog is None:
@@ -9191,6 +9459,10 @@ class EMGVisualizer(QMainWindow):
         pct = (100.0 * rows / expected) if expected > 0 else 0.0
         text = f"CSV rows recorded: {rows:,} / {expected:,} expected ({pct:.1f}%)"
         kind = "accent"
+        rec = self.session_recorder
+        if rec is not None and rec.rows >= 2000 and rec.valid_rows / rec.rows < MIN_RECORD_SAMPLE_RATIO:
+            text += f" | VALID {100.0 * rec.valid_rows / rec.rows:.1f}% (< {100 * MIN_RECORD_SAMPLE_RATIO:.0f}%)"
+            kind = "warn"
         if self.record_missing_packets > 0:
             text += f" | lost packets: {self.record_missing_packets:,}"
             kind = "warn"
@@ -9221,7 +9493,7 @@ class EMGVisualizer(QMainWindow):
                 ("Channel Calibration", "Done" if self.is_calibrated else "Required",
                  f"Captures REST then FLEX ({self.cal_rest_seconds} s / {self.cal_flex_seconds} s) to set baselines "
                  "and thresholds. Graph, analysis, recording and classification stay locked until it is done."),
-                ("Channels", str(self.num_channels), "Wired: 2-9 channels (set in the calibration dialog). "
+                ("Channels", str(self.num_channels), "Wired CSV simulator: 2-11 channels (set in the calibration dialog); COM port and Wi-Fi: fixed 11. "
                  "Wireless: 8 EMG + 3 IMU channels."),
             ]),
             ("Toolbar", [
@@ -9240,7 +9512,7 @@ class EMGVisualizer(QMainWindow):
                 ("Options Info", "This window", "Lists every option with its live value."),
             ]),
             ("Data Collection", [
-                ("Contributor", self.contributor_name or "-", "Participant name / ID; used in the output folder name."),
+                ("Participant ID", self.participant_id or "-", "Pseudonymous ID (S01...); used in the output folder name. Names are never stored."),
                 ("Agreement", "Yes" if self.contribution_agreed else "No", "Consent to take part; required before a session can start."),
                 ("Participant info", f"BG {self.participant_blood_group or 'N/A'}, {_value_or_na(self.participant_height_cm, '{:.1f}')} cm, "
                  f"{_value_or_na(self.participant_weight_kg, '{:.1f}')} kg, age {_value_or_na(self.participant_age_years, '{:d}', cast=int)}",
@@ -9256,7 +9528,7 @@ class EMGVisualizer(QMainWindow):
                 ("Block break / hand-switch break", f"{self.study_meta['block_break_s']:.0f} / {self.study_meta['hand_switch_s']:.0f} s", "Rest between blocks (3-4 min) and when the armband changes arm (~5 min). 'Skip Break' ends one early."),
                 ("Record Rest / Randomize order", f"{on_off(self.task_record_rest)} / {on_off(self.task_randomize_order)}", "Record the rest period as a class; shuffle gesture order each repetition."),
                 ("CSV save folder", self.record_save_dir, "Where the session CSV and metadata are written; a checkpoint is saved at every break."),
-                ("Live CSV counter", f"{self._recorded_total_samples:,} rows", "Rows captured so far versus the number the protocol should produce."),
+                ("Live CSV counter", f"{self.recorded_sample_count():,} rows", "Rows captured so far versus the number the protocol should produce."),
             ]),
             ("Models", [
                 ("Train Model", "-", "Train a Random Forest from recorded CSV files and review accuracy and the confusion matrix."),

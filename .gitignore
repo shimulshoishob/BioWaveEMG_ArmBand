@@ -5,3 +5,9 @@ __pycache__/
 venv/
 .DS_Store
 *.swp
+
+# Device secrets (never commit)
+ESP32_S3 Setup/secrets.h
+code/device_secret.json
+# Local participant-name mapping (never export)
+code/participant_map.json
