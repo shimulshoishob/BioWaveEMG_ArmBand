@@ -57,6 +57,10 @@
  *     uint16_t reserved
  *   }
  *
+ * USB streaming (USBSTART) sends the SAME v2 packet bytes, followed by a CRC-16/CCITT-FALSE
+ * (poly 0x1021, init 0xFFFF, little endian) over the packet, COBS-encoded and terminated by a
+ * 0x00 delimiter. USBSTARTCSV selects the legacy "e1..e8,roll,pitch,yaw" CSV text stream.
+ *
  * BWIM v1 (frameSize 48, 32-bit microsecond timestamps that wrap every ~71.6
  * minutes) is no longer emitted. Host parsers must keep accepting it.
  */
@@ -151,7 +155,8 @@ TaskHandle_t imuTaskHandle = nullptr;
 portMUX_TYPE imuMutex = portMUX_INITIALIZER_UNLOCKED;
 
 volatile bool targetLocked = false;
-volatile bool usbStreaming = false;           // wired CSV streaming over USB serial
+volatile bool usbStreaming = false;           // wired streaming over USB serial
+volatile bool usbCsvMode = false;             // false: COBS+CRC16 binary BWIM v2, true: legacy CSV text
 volatile unsigned long lastUsbCommandMs = 0;
 volatile unsigned long lastAuthorizedCommandMs = 0;
 volatile unsigned long lastWiFiRetryMs = 0;
@@ -718,12 +723,21 @@ void handleControlPacket() {
   }
 }
 
+// While a binary USB stream is running, a text reply must not glue itself to the next frame:
+// a 0x00 first terminates whatever frame was in flight, so the text parses as its own chunk.
+void writeSerialFrameBreak() {
+  if (usbStreaming && !usbCsvMode) {
+    Serial.write(static_cast<uint8_t>(0));
+  }
+}
+
 void processSerialCommand(const String &line) {
   if (line.length() == 0) {
     return;
   }
 
   if (line == "INFO") {
+    writeSerialFrameBreak();
     Serial.println(
       "INFO|" + deviceId + "|" + deviceName + "|" + String(imuReady ? 1 : 0) + "|" +
       String(hasSavedWiFiCredentials() ? 1 : 0) + "|" + FW_VERSION
@@ -731,11 +745,13 @@ void processSerialCommand(const String &line) {
     return;
   }
 
-  if (line == "USBSTART" || line == "USBPING") {
-    // Wired mode: stream "e1..e8,roll,pitch,yaw" CSV lines (11 values) at 500 Hz.
-    // USBSTART is repeated by the GUI as a keepalive, so only reset on a new session.
-    if (!usbStreaming) {
+  if (line == "USBSTART" || line == "USBSTARTCSV" || line == "USBPING") {
+    // Wired mode. USBSTART streams COBS+CRC16 framed binary BWIM v2 packets; USBSTARTCSV streams the
+    // legacy CSV text. Either is repeated by the GUI as a keepalive (USBPING refreshes only), so the
+    // mode and queue are only reset when a new session starts.
+    if (!usbStreaming && line != "USBPING") {
       flushFrameQueue();
+      usbCsvMode = (line == "USBSTARTCSV");
       usbStreaming = true;
     }
     lastUsbCommandMs = millis();
@@ -771,6 +787,7 @@ void processSerialCommand(const String &line) {
     return;
   }
 
+  writeSerialFrameBreak();
   Serial.println("ERR|UNKNOWN_COMMAND");
 }
 
@@ -858,7 +875,61 @@ void queueFrame(const EmgImuPacket &packet) {
   queueDropsTotal++;
 }
 
-// One CSV line per frame: 8 raw ADC counts, then roll,pitch,yaw in degrees.
+uint16_t crc16Ccitt(const uint8_t *data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; ++i) {
+    crc ^= static_cast<uint16_t>(data[i]) << 8;
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021) : static_cast<uint16_t>(crc << 1);
+    }
+  }
+  return crc;
+}
+
+// Consistent Overhead Byte Stuffing: the output contains no 0x00, so 0x00 can delimit frames.
+size_t cobsEncode(const uint8_t *input, size_t length, uint8_t *output) {
+  size_t readIndex = 0;
+  size_t writeIndex = 1;
+  size_t codeIndex = 0;
+  uint8_t code = 1;
+  while (readIndex < length) {
+    if (input[readIndex] == 0) {
+      output[codeIndex] = code;
+      code = 1;
+      codeIndex = writeIndex++;
+      readIndex++;
+    } else {
+      output[writeIndex++] = input[readIndex++];
+      code++;
+      if (code == 0xFF) {
+        output[codeIndex] = code;
+        code = 1;
+        codeIndex = writeIndex++;
+      }
+    }
+  }
+  output[codeIndex] = code;
+  return writeIndex;
+}
+
+void sendPacketUsbBinary(EmgImuPacket &packet) {
+  stampHeaderCounters(packet);
+  uint8_t raw[sizeof(EmgImuPacket) + 2];
+  memcpy(raw, &packet, sizeof(packet));
+  const uint16_t crc = crc16Ccitt(raw, sizeof(packet));
+  raw[sizeof(packet)] = static_cast<uint8_t>(crc & 0xFF);
+  raw[sizeof(packet) + 1] = static_cast<uint8_t>(crc >> 8);
+  uint8_t encoded[sizeof(raw) + (sizeof(raw) / 254) + 3];
+  size_t n = cobsEncode(raw, sizeof(raw), encoded);
+  encoded[n++] = 0;
+  if (Serial.write(encoded, n) != n) {
+    udpSendFailuresTotal++;   // short write: the transport could not take the whole frame
+    return;
+  }
+  udpPacketsSentThisWindow++;
+}
+
+// Legacy CSV: one line per frame, 8 raw ADC counts, then roll,pitch,yaw in degrees.
 void sendPacketUsb(const EmgImuPacket &packet) {
   char line[96];
   for (uint8_t i = 0; i < packet.header.frameCount; ++i) {
@@ -1079,7 +1150,11 @@ void networkTask(void *parameter) {
       } else {
         // Drain everything queued so USB output never lags behind acquisition.
         while (xQueueReceive(frameQueue, &packet, 0) == pdTRUE) {
-          sendPacketUsb(packet);
+          if (usbCsvMode) {
+            sendPacketUsb(packet);
+          } else {
+            sendPacketUsbBinary(packet);
+          }
         }
       }
     } else if (streamActive) {
