@@ -80,8 +80,9 @@ static const uint16_t STREAM_PORT = 5000;
 static const uint16_t CONTROL_PORT = 5001;
 static const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 static const unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
-static const unsigned long STREAM_KEEPALIVE_TIMEOUT_MS = 5000;
+static const unsigned long STREAM_KEEPALIVE_TIMEOUT_MS = 15000;
 static const unsigned long CHALLENGE_TTL_MS = 30000;
+static const uint8_t CHALLENGE_SLOTS = 4;
 // USB serial baud. Must match the GUI (DEFAULT_BAUD_RATE / USB_SERIAL_BAUD).
 // 500 Hz x 11 channels of CSV text is ~30 KB/s, far beyond 115200 baud.
 static const uint32_t USB_SERIAL_BAUD = 921600;
@@ -160,8 +161,16 @@ uint16_t streamTargetPort = STREAM_PORT;
 
 String deviceId;
 String deviceName;
-String pendingChallenge;
-unsigned long challengeIssuedAt = 0;
+// One outstanding challenge per remote (ip, port) so that a second client asking for a
+// challenge cannot invalidate the first client's.
+struct ChallengeSlot {
+  bool used;
+  uint32_t ip;
+  uint16_t port;
+  unsigned long issuedAt;
+  char challenge[17];
+};
+ChallengeSlot challengeSlots[CHALLENGE_SLOTS] = {};
 bool imuReady = false;
 
 struct LatestImuState {
@@ -540,15 +549,57 @@ void initImu() {
   imuReady = false;
 }
 
-bool verifyAuthorizedCommand(const String &command, const String &challenge, const String &payload, const String &authHex) {
-  if (pendingChallenge.length() == 0) {
+ChallengeSlot *findChallengeSlot(const IPAddress &remoteIp, uint16_t remotePort) {
+  uint32_t ip = static_cast<uint32_t>(remoteIp);
+  for (uint8_t i = 0; i < CHALLENGE_SLOTS; ++i) {
+    if (challengeSlots[i].used && challengeSlots[i].ip == ip && challengeSlots[i].port == remotePort) {
+      return &challengeSlots[i];
+    }
+  }
+  return nullptr;
+}
+
+// Reuse the caller's slot, else a free/expired slot, else evict the oldest one.
+String issueChallenge(const IPAddress &remoteIp, uint16_t remotePort) {
+  ChallengeSlot *slot = findChallengeSlot(remoteIp, remotePort);
+  unsigned long now = millis();
+  if (slot == nullptr) {
+    ChallengeSlot *oldest = &challengeSlots[0];
+    for (uint8_t i = 0; i < CHALLENGE_SLOTS; ++i) {
+      ChallengeSlot &candidate = challengeSlots[i];
+      if (!candidate.used || (now - candidate.issuedAt) > CHALLENGE_TTL_MS) {
+        slot = &candidate;
+        break;
+      }
+      if ((now - candidate.issuedAt) > (now - oldest->issuedAt)) {
+        oldest = &candidate;
+      }
+    }
+    if (slot == nullptr) {
+      slot = oldest;
+    }
+  }
+  String challenge = generateChallenge();
+  slot->used = true;
+  slot->ip = static_cast<uint32_t>(remoteIp);
+  slot->port = remotePort;
+  slot->issuedAt = now;
+  strncpy(slot->challenge, challenge.c_str(), sizeof(slot->challenge) - 1);
+  slot->challenge[sizeof(slot->challenge) - 1] = '\0';
+  return challenge;
+}
+
+bool verifyAuthorizedCommand(const String &command, const String &challenge, const String &payload,
+                             const String &authHex, const IPAddress &remoteIp, uint16_t remotePort) {
+  ChallengeSlot *slot = findChallengeSlot(remoteIp, remotePort);
+  if (slot == nullptr) {
     return false;
   }
-  if ((millis() - challengeIssuedAt) > CHALLENGE_TTL_MS) {
-    pendingChallenge = "";
+  if ((millis() - slot->issuedAt) > CHALLENGE_TTL_MS) {
+    slot->used = false;
     return false;
   }
-  if (challenge != pendingChallenge) {
+  if (!secureEquals(String(slot->challenge), challenge)) {
     return false;
   }
 
@@ -559,7 +610,7 @@ bool verifyAuthorizedCommand(const String &command, const String &challenge, con
 
   String expectedAuth = hmacSha256Hex(message, DEVICE_ACCESS_KEY);
   bool ok = secureEquals(expectedAuth, authHex);
-  pendingChallenge = "";
+  slot->used = false;   // each challenge is single use
 
   if (ok) {
     lastAuthorizedCommandMs = millis();
@@ -578,7 +629,7 @@ void handleStart(const String &message, const IPAddress &remoteIp, uint16_t remo
   String clientPortText = getToken(message, 3);
   String authHex = getToken(message, 4);
 
-  if (!verifyAuthorizedCommand("START", challenge, clientIpText + "|" + clientPortText, authHex)) {
+  if (!verifyAuthorizedCommand("START", challenge, clientIpText + "|" + clientPortText, authHex, remoteIp, remotePort)) {
     sendReply(remoteIp, remotePort, "ERR|AUTH_FAILED");
     return;
   }
@@ -620,7 +671,7 @@ void handleStop(const String &message, const IPAddress &remoteIp, uint16_t remot
   String challenge = getToken(message, 1);
   String authHex = getToken(message, 2);
 
-  if (!verifyAuthorizedCommand("STOP", challenge, "", authHex)) {
+  if (!verifyAuthorizedCommand("STOP", challenge, "", authHex, remoteIp, remotePort)) {
     sendReply(remoteIp, remotePort, "ERR|AUTH_FAILED");
     return;
   }
@@ -638,7 +689,7 @@ void handlePing(const String &message, const IPAddress &remoteIp, uint16_t remot
   String challenge = getToken(message, 1);
   String authHex = getToken(message, 2);
 
-  if (!verifyAuthorizedCommand("PING", challenge, "", authHex)) {
+  if (!verifyAuthorizedCommand("PING", challenge, "", authHex, remoteIp, remotePort)) {
     sendReply(remoteIp, remotePort, "ERR|AUTH_FAILED");
     return;
   }
@@ -673,9 +724,7 @@ void handleControlPacket() {
   }
 
   if (message == "CHALLENGE") {
-    pendingChallenge = generateChallenge();
-    challengeIssuedAt = millis();
-    sendReply(remoteIp, remotePort, "CHALLENGE|" + pendingChallenge);
+    sendReply(remoteIp, remotePort, "CHALLENGE|" + issueChallenge(remoteIp, remotePort));
     return;
   }
 
