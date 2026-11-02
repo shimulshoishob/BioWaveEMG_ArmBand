@@ -161,3 +161,25 @@ def rec_size():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LabelMapTests(unittest.TestCase):
+    def test_every_old_label_maps_to_the_agreed_name_and_code(self):
+        expected = {"Left": ("left", 1), "Right": ("right", 2), "fist_close": ("fist_close", 3), "Up": ("up", 4),
+                    "Down": ("down", 5), "Double_Closed_Fist": ("double_fist_close", 6),
+                    "Victory_Sign": ("victory_sign", 7), "Thumbs_Up": ("thumbs_up", 8),
+                    "Pinch_using_thumb_and_index_finger": ("pinch_thumb_index", 9), "Rest": ("rest", 0),
+                    "Prepare": ("prepare", 99), "Settle": ("settle", 98)}
+        for old, want in expected.items():
+            self.assertEqual(canonical_label(old), want)
+            self.assertEqual(canonical_label(want[0]), want)          # new names are idempotent
+        self.assertEqual(len({c for _, c in expected.values()}), 12)  # codes are unique
+
+    def test_default_task_labels_use_the_dataset_names(self):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        import main
+        names = main.DEFAULT_TASK_LABELS.split(",")
+        self.assertEqual(names, ["left", "right", "fist_close", "up", "down", "double_fist_close", "victory_sign",
+                                 "thumbs_up", "pinch_thumb_index", "rest"])
+        self.assertTrue(all(canonical_label(n)[1] >= 0 for n in names))

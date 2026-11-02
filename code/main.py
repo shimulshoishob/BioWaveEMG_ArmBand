@@ -89,7 +89,7 @@ from app_theme import (
     themed_label_style,
     themed_status_color,
 )
-from session_recording import (ContinuousRecorder, EventLog, MIN_VALID_SAMPLE_RATIO, SIGNAL_COLUMNS,
+from session_recording import (ContinuousRecorder, EventLog, LABEL_CODES, MIN_VALID_SAMPLE_RATIO, SIGNAL_COLUMNS,
                                finalize_session)
 from emg_v4_core import (StreamAssembler, UsbFrameDecoder, WirelessStats, parse_bwim_packet,
                          segments_to_payload)
@@ -174,6 +174,7 @@ GESTURE_IMAGE_FILES = {
     "doublefistclose": "double_fist_close.png",
     "doublefist": "double_fist_close.png",
     "pinch": "pinch.png",
+    "pinchthumbindex": "pinch.png",
     "pinchusingthumbandindexfinger": "pinch.png",
     "indexthumbpinch": "pinch.png",
     "thumbindexpinch": "pinch.png",
@@ -356,7 +357,8 @@ BAND_DEFS = [(20.0, 60.0), (60.0, 120.0), (120.0, 220.0)]
 MAINS_FREQS = [50.0, 60.0]
 MAINS_BAND_HZ = 2.0
 MAX_LAG_SAMPLES = int(0.10 * SAMPLE_RATE)
-DEFAULT_TASK_LABELS ="Left,Right,fist_close,Up,Down,Double_Closed_Fist,Victory_Sign,Thumbs_Up,Pinch_using_thumb_and_index_finger,Rest"
+# Dataset label names (see session_recording.LABEL_MAP for the old names and numeric codes).
+DEFAULT_TASK_LABELS = "left,right,fist_close,up,down,double_fist_close,victory_sign,thumbs_up,pinch_thumb_index,rest"
 # --- STUDY PROTOCOL (defaults follow the approved study procedure) ---
 # One task cycle = 4 s prepare + 3 s perform/hold + 3 s rest = 10 s. The rest period is
 # recorded as its own class. Each day: 9 repetitions per hand (left + right) of every class.
@@ -7300,6 +7302,7 @@ class EMGVisualizer(QMainWindow):
             f"humidity_start_pct={_value_or_na(self.study_meta['humidity_start_pct'], '{:.0f}')}",
             f"agreement={bool(self.contribution_agreed)}",
             f"labels={','.join(labels)}",
+            "label_codes=" + ",".join(f"{name}:{code}" for name, code in sorted(LABEL_CODES.items(), key=lambda kv: kv[1])),
             f"labels_saved={bool(self.task_labels_locked)}",
             f"repeats={int(self.task_repeats)}",
             f"prep_s={float(self.task_prep_s)}",
