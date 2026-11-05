@@ -110,5 +110,22 @@ class WorkflowBarTests(unittest.TestCase):
         win.rf_model = None; win.close()
 
 
+class OptionsContentTests(unittest.TestCase):
+    def test_every_toolbar_button_and_side_panel_control_is_described(self):
+        win = app.EMGVisualizer()
+        sections = win.build_options_info_sections()
+        names = " | ".join([title for title, _ in sections] + [row[0] for _, rows in sections for row in rows]).lower()
+        for btn in (win.btn_port_config, win.btn_disconnect, win.btn_calibrate, win.btn_analysis, win.btn_packet_tracer,
+                    win.btn_options_info, win.btn_data_collection, win.btn_train_model, win.btn_load_trained_model,
+                    win.btn_realtime_classification):
+            self.assertIn(btn.text().lower(), names, f"Options window does not mention the '{btn.text()}' button")
+        for text in ("window", "rms limit", "hz limit", "use hz gate", "auto-scale y axis", "draw live graph",
+                     "room conditions", "electrode placement", "practice / demo mode", "pause / resume"):
+            self.assertIn(text, names)
+        for stale in ("max cycles per block", "settle", "contributor", "toolbar"):
+            self.assertNotIn(stale, [row[0].lower() for _, rows in sections for row in rows] + [t.lower() for t, _ in sections])
+        win.close()
+
+
 if __name__ == "__main__":
     unittest.main()

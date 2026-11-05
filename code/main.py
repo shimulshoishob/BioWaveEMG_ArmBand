@@ -5480,19 +5480,18 @@ class OptionsInfoDialog(QDialog):
     def _build_html(sections):
         c = THEME_COLORS
         parts = [
-            f"<style>h2 {{ color: {c['accent']}; margin-top: 18px; }} "
-            f"table {{ border-collapse: collapse; width: 100%; }} "
-            f"th {{ text-align: left; color: {c['muted']}; padding: 4px 8px; }} "
-            f"td {{ padding: 5px 8px; vertical-align: top; border-top: 1px solid {c['panel']}; }} "
-            f"td.v {{ color: {c['accent']}; font-weight: bold; white-space: nowrap; }}</style>"
+            f"<style>h2 {{ color: {c['accent_hi']}; margin-top: 16px; margin-bottom: 4px; }} "
+            f"th {{ text-align: left; color: {c['muted']}; padding: 4px 8px; font-size: small; }} "
+            f"td {{ padding: 6px 8px; vertical-align: top; border-top: 1px solid {c['border']}; }} "
+            f"td.v {{ color: {c['accent_hi']}; font-weight: bold; }}</style>"
         ]
         for title, rows in sections:
-            parts.append(f"<h2>{html_escape(title)}</h2><table><tr><th>Option</th><th>Current value</th>"
-                         "<th>What it does</th></tr>")
+            parts.append(f"<h2>{html_escape(title)}</h2><table width='100%' cellspacing='0'>"
+                         "<tr><th width='24%'>Option</th><th width='24%'>Current value</th><th width='52%'>What it does</th></tr>")
             for name, value, desc in rows:
                 parts.append(
-                    f"<tr><td><b>{html_escape(name)}</b></td><td class='v'>{html_escape(value)}</td>"
-                    f"<td>{html_escape(desc)}</td></tr>"
+                    f"<tr><td width='24%'><b>{html_escape(name)}</b></td><td class='v' width='24%'>{html_escape(value)}</td>"
+                    f"<td width='52%'>{html_escape(desc)}</td></tr>"
                 )
             parts.append("</table>")
         return "".join(parts)
@@ -9623,61 +9622,95 @@ class EMGVisualizer(QMainWindow):
         self.packet_tracer_window.show()
 
     def build_options_info_sections(self):
+        """Every option of the app with its live value; the text mirrors the buttons and fields as they are labelled."""
         on_off = lambda flag: "On" if flag else "Off"
-        hands = " + ".join(hands_for_order(self.study_meta["hand_order"]))
+        sm = self.study_meta
+        hands = " + ".join(hands_for_order(sm["hand_order"]))
         link = "Disconnected"
         if self.is_connected:
-            link = f"{self.connection_medium.title()} | {self.current_port_name}"
-        model = os.path.basename(self.rf_model_path) if self.rf_model_path else "Not loaded"
+            medium = "Wi-Fi" if self.connection_medium == "wireless" else ("USB" if self.wired_binary else "Simulator (CSV)")
+            link = f"{medium} | {self.current_port_name}"
+        model = self.current_model_label("Not loaded")
+        electrode = sm.get("electrode", {}) or {}
+        electrode_text = ", ".join(str(v) for v in (electrode.get("landmark"), electrode.get("channel1_muscle"),
+                                                    electrode.get("skin_preparation")) if v) or "N/A"
+        rec = self.session_recorder
+        valid_text = f" | {100.0 * rec.valid_rows / rec.rows:.2f}% valid" if rec is not None and rec.rows else ""
         return [
-            ("Connection & calibration", [
-                ("Port Configuration", link, "Choose wired (USB serial / simulator socket) or wireless (Wi-Fi) transport, "
-                 "scan for devices, provision Wi-Fi over USB and connect."),
+            ("Header: status and next step", [
+                ("Step tracker", "Connect > Calibrate > Collect > Train > Classify",
+                 "Shows where you are in the workflow (ticks = done, highlighted = current). Hover it for what to do next."),
+                ("Status pills", "Live",
+                 "Link (USB / Wi-Fi and packets per second), Calibrated, the loaded model, and a red REC counter while recording."),
+            ]),
+            ("Connection and calibration", [
+                ("Port Setup", link, "Choose USB (COM port), Wi-Fi, or the local simulator (socket://127.0.0.1:7000); scan, provision Wi-Fi over USB and connect."),
                 ("Disconnect", "Enabled" if self.is_connected else "Disabled", "Stops the stream and releases the port."),
-                ("Channel Calibration", "Done" if self.is_calibrated else "Required",
-                 f"Captures REST then FLEX ({self.cal_rest_seconds} s / {self.cal_flex_seconds} s) to set baselines "
+                ("Calibrate", "Done" if self.is_calibrated else "Required",
+                 f"Channel Calibration: captures REST then FLEX ({self.cal_rest_seconds} s / {self.cal_flex_seconds} s) to set baselines "
                  "and thresholds. Graph, analysis, recording and classification stay locked until it is done."),
-                ("Channels", str(self.num_channels), "Wired CSV simulator: 2-11 channels (set in the calibration dialog); COM port and Wi-Fi: fixed 11. "
-                 "Wireless: 8 EMG + 3 IMU channels."),
+                ("Channels", str(self.num_channels),
+                 "COM port and Wi-Fi: fixed 8 EMG + Roll/Pitch/Yaw (11). Simulator: 2-11 channels, set in the calibration window."),
             ]),
-            ("Toolbar", [
-                ("Analysis (ms)", f"{self.analysis_ms_spin.value()} ms", "Window length used for MAV / RMS and the live-analysis metrics."),
-                ("RMS Threshold", f"{self.threshold_spin.value():.1f}", "Amplitude level above which a channel counts as active (dashed lines on the graph)."),
-                ("Hz Threshold", f"{self.hz_threshold_spin.value():.1f} Hz", "Minimum dominant frequency for a channel to count as a real contraction."),
-                ("Use Hz Gate", on_off(self.check_use_hz_gate.isChecked()), "Require both RMS and frequency thresholds before a channel is 'active'."),
-                ("Auto Scale Y", on_off(self.check_autoscale.isChecked()), "Fit each channel's vertical range to its live signal; off uses a fixed range."),
-                ("Graph Stream", on_off(self.check_graph_stream.isChecked()), "Draw the live traces. It pauses itself during a recording session for stable capture."),
-                ("Live Analysis", "Available" if self.is_calibrated else "Locked", "Opens the metrics window: time/frequency features, correlation, coherence, fatigue and quality."),
+            ("Tools", [
+                ("Analysis", "Available" if self.is_calibrated else "Locked",
+                 "Live Analysis: time/frequency features, correlation, coherence, fatigue and signal quality."),
+                ("Packets", "Open" if self.packet_tracer_window else "Closed",
+                 "Packet Tracer: packets per second, missing / late / duplicate packets, loss %, jitter, device counters and a 30 s plot."),
+                ("Options", "This window", "Lists every option with its live value."),
             ]),
-            ("Monitoring", [
-                ("Packet Tracer", "Open" if self.packet_tracer_window else "Closed", "Real-time packets per second, missing and out-of-order packets, loss %, jitter and a 30 s plot."),
-                ("Link panel (right side)", "Live", "Compact packets/s, missing packets and CSV row counter beside the graph."),
-                ("UI FPS / Data FPS", f"{self.ui_fps:.0f} / {self.data_fps:.0f}", "Screen refresh rate and the sample rate actually arriving."),
-                ("Options Info", "This window", "Lists every option with its live value."),
+            ("Detection and display (side panel)", [
+                ("Window", f"{self.analysis_ms_spin.value()} ms", "Window length used for MAV / RMS, the live metrics and the classifier."),
+                ("RMS limit", f"{self.threshold_spin.value():.1f}", "Amplitude above which a channel counts as active (dashed lines on the graph)."),
+                ("Hz limit", f"{self.hz_threshold_spin.value():.1f} Hz", "Minimum dominant frequency for a channel to count as a real contraction."),
+                ("Use Hz gate", on_off(self.check_use_hz_gate.isChecked()), "Require both the RMS and the frequency limit before a channel is 'active'."),
+                ("Auto-scale Y axis", on_off(self.check_autoscale.isChecked()), "Fit each channel's vertical range to its live signal; off uses a fixed range."),
+                ("Draw live graph", on_off(self.check_graph_stream.isChecked()), "Draw the live traces. It pauses itself during a recording session for stable capture."),
+                ("Channel status list", "Live", "One line per channel with its signal quality and activity."),
             ]),
-            ("Data Collection", [
-                ("Participant ID", self.participant_id or "-", "Pseudonymous ID (S01...); used in the output folder name. Names are never stored."),
-                ("Agreement", "Yes" if self.contribution_agreed else "No", "Consent to take part; required before a session can start."),
+            ("Status bar (bottom)", [
+                ("Status / Model", "Live", "The last event, and the loaded model with its run folder."),
+                ("Data FPS", f"{self.data_fps:.0f}", "Samples per second actually arriving."),
+                ("Packets / Missing", "Live", "Packet rate against the expected rate, and missing packets with loss %."),
+                ("CSV rows", f"{self.recorded_sample_count():,}", "Frames written by the current or last recording session."),
+            ]),
+            ("Collect (Data Collection)", [
+                ("Participant ID", self.participant_id or "-", "Pseudonymous ID like S01 (letter S + 2-3 digits); used in the folder name. Names are never stored."),
+                ("Agree / Disagree", "Agree" if self.contribution_agreed else "Disagree",
+                 f"Consent to take part; required before a session can start. The consent form version ({CONSENT_FORM_VERSION}) is saved."),
                 ("Participant info", f"BG {self.participant_blood_group or 'N/A'}, {_value_or_na(self.participant_height_cm, '{:.1f}')} cm, "
                  f"{_value_or_na(self.participant_weight_kg, '{:.1f}')} kg, age {_value_or_na(self.participant_age_years, '{:d}', cast=int)}",
-                 "Optional; saved to the metadata file (N/A when empty)."),
-                ("Forearm circumference", f"{_value_or_na(self.participant_forearm_circumference_cm, '{:.2f}')} cm", "Measured around the forearm where the armband sits."),
-                ("Session day", str(self.study_meta["session_day"]), "Study session 1 or 2 (two days, 1-7 days apart)."),
-                ("Hands", hands, "Order of the left/right hand blocks; the armband is moved between them."),
-                ("Class labels", ", ".join(self.task_labels), "Gesture classes recorded; the rest period is its own class."),
+                 "Optional (Additional Information); saved to the metadata, N/A when empty."),
+                ("Electrode placement", electrode_text,
+                 "Optional (Additional Information): landmark and distance, channel 1 muscle, skin preparation, electrode type, photo file and forearm circumference."),
+                ("Room conditions", f"{sm['temp_start_c']:.1f} C / {sm['humidity_start_pct']:.0f} %",
+                 "REQUIRED (Additional Information): temperature and humidity at the start of the session."),
+                ("Session / Hands", f"Day {sm['session_day']} | {hands}",
+                 f"Study day 1 or 2 and the hand order. By default odd participants start left and even participants right "
+                 f"(order source: {sm['hand_order_source']}); you can override it."),
+                ("Practice / demo mode", on_off(sm["practice_mode"]),
+                 "Saves under a 'practice_' folder, outside the dataset. Only in this mode can randomization be switched off."),
+                ("Class labels", ", ".join(self.task_labels), "Gestures recorded (dataset names and codes); the rest period is its own class."),
                 ("Repeats per hand", str(self.task_repeats), "Repetitions of every class per hand (study: 9)."),
-                ("Prepare / Perform / Rest", f"{self.task_prep_s:g} / {self.task_hold_s:g} / {self.task_rest_s:g} s", "One task cycle (study: 4 + 3 + 3 = 10 s)."),
-                ("Settle", f"{self.task_settle_s:g} s", "Optional un-recorded gap after each hold."),
-                ("Max cycles per block", str(self.study_meta["max_cycles_per_block"]), "Longest run without a break (study: 30 cycles, ~5 min)."),
-                ("Block break / hand-switch break", f"{self.study_meta['block_break_s']:.0f} / {self.study_meta['hand_switch_s']:.0f} s", "Rest between blocks (3-4 min) and when the armband changes arm (~5 min). 'Skip Break' ends one early."),
-                ("Record Rest / Randomize order", f"{on_off(self.task_record_rest)} / {on_off(self.task_randomize_order)}", "Record the rest period as a class; shuffle gesture order each repetition."),
-                ("CSV save folder", self.record_save_dir, "Where the session CSV and metadata are written; a checkpoint is saved at every break."),
-                ("Live CSV counter", f"{self.recorded_sample_count():,} rows", "Rows captured so far versus the number the protocol should produce."),
+                ("Prepare / Perform / Rest", f"{self.task_prep_s:g} / {self.task_hold_s:g} / {self.task_rest_s:g} s",
+                 "One task cycle (study: 4 + 3 + 3 = 10 s)."),
+                ("Randomize order", "On (locked)" if not sm["practice_mode"] else on_off(self.task_randomize_order),
+                 f"Gesture order is shuffled each repetition from a per-session seed ({sm['seed'] or 'set at Proceed'}), saved in the metadata."),
+                ("Fixed protocol timing", f"{sm['max_cycles_per_block']} cycles | breaks {sm['block_break_s']:.0f} / {sm['hand_switch_s']:.0f} s",
+                 "At most 30 cycles per block, a 3.5 min break between blocks and 5 min when the armband changes arm. 'Skip Break' ends one early."),
+                ("Pause / Resume", "During a session",
+                 "Pause for any interruption. Recording continues but is labelled 'paused'; a pause mid-cycle restarts that cycle from Prepare (the interrupted attempt is labelled 'aborted')."),
+                ("Save folder", self.record_save_dir, "Each session gets its own folder; a checkpoint is written at every break."),
+                ("Session files", "signals / events / quality / metadata",
+                 "Every frame is recorded continuously (raw ADC counts) and labelled afterwards by device frame ID; gaps are explicit Valid=0 rows."),
+                ("Live recording counter", f"{self.recorded_sample_count():,} rows{valid_text}",
+                 "Frames captured versus expected, with the share of valid frames (a warning appears below 98 %)."),
             ]),
-            ("Models", [
-                ("Train Model", "-", "Train and compare gesture models (Random Forest, SVM, 1D CNN and more) on your recordings; each is saved in its own folder."),
-                ("Load Trained Model", model, "Load a saved model for real-time prediction."),
-                ("Real-time Classification", "Open" if self.realtime_classification_window else "Closed", "Shows the live predicted gesture, confidence and per-class scores."),
+            ("Train and classify", [
+                ("Train", "-", "Train Model: pick recordings, tick one or more models (Random Forest, SVM, k-NN, 1D CNN and more), compare them; each is saved in trained_model/<model name>/."),
+                ("Load", model, "Load a saved model (.joblib) for real-time prediction."),
+                ("Classify", "Open" if self.realtime_classification_window else "Closed",
+                 "Real-time Classification: the predicted gesture with its picture, confidence, latency and per-class scores."),
                 ("Gesture game", "Separate app", f"Run gesture_game_app.py; it listens to this app on UDP {GESTURE_BRIDGE_PORT} (keyboard works without it)."),
             ]),
         ]
