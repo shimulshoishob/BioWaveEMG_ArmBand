@@ -18,6 +18,7 @@ import json
 import os
 import queue
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -63,8 +64,11 @@ RAW_DTYPE = np.dtype([
     ("emg", "<u2", (EMG_CHANNELS,)), ("imu", "<f4", (3,)), ("imu_id", "<i8"), ("host_s", "<f8"),
 ])
 
-_LINE_FORMAT = ("%d,%d,%d,%d,%d," + ",".join(["%g"] * EMG_CHANNELS)
-                + ",%.3f,%.3f,%.3f,%d,%d,%.6f,%s,%d,%s,%s,%d\n")
+def _line_format(emg_channels: int) -> str:
+    """Row format; EMG columns beyond the channels in use are written empty (like older recordings)."""
+    n = max(1, min(EMG_CHANNELS, int(emg_channels)))
+    emg = ",".join(["%g"] * n + [""] * (EMG_CHANNELS - n))
+    return "%d,%d,%d,%d,%d," + emg + ",%.3f,%.3f,%.3f,%d,%d,%.6f,%s,%d,%s,%s,%d\n"
 
 
 def canonical_label(name: str) -> tuple:
@@ -174,8 +178,9 @@ def payload_to_raw(payload: dict, synth_state: Optional[dict] = None, fs: float 
     raw = np.zeros(n, dtype=RAW_DTYPE)
     valid = payload.get("valid")
     raw["valid"] = np.ones(n, dtype=np.uint8) if valid is None else np.asarray(valid, dtype=np.uint8)
-    emg = batch[:, :EMG_CHANNELS]
-    raw["emg"] = np.where(np.isfinite(emg), emg, 0).clip(0, 65535).astype(np.uint16)
+    n_emg = min(EMG_CHANNELS, batch.shape[1])      # simulators / wired CSV may have fewer than 8 channels
+    emg = batch[:, :n_emg]
+    raw["emg"][:, :n_emg] = np.where(np.isfinite(emg), emg, 0).clip(0, 65535).astype(np.uint16)
     if batch.shape[1] >= EMG_CHANNELS + 3:
         raw["imu"] = batch[:, EMG_CHANNELS:EMG_CHANNELS + 3]
     else:
@@ -188,7 +193,7 @@ def payload_to_raw(payload: dict, synth_state: Optional[dict] = None, fs: float 
         state["next"] += n
         raw["seq"] = -1
         raw["imu_id"] = -1
-        raw["host_s"] = float(payload.get("host_received_monotonic", np.nan))
+        raw["host_s"] = float(payload.get("host_received_monotonic", time.monotonic()))
         return raw
     raw["frame_id"] = np.asarray(ids, dtype=np.int64)
     raw["ts_us"] = np.asarray(payload.get("emg_timestamps", np.full(n, -1)), dtype=np.int64)
@@ -199,15 +204,16 @@ def payload_to_raw(payload: dict, synth_state: Optional[dict] = None, fs: float 
             raw[field] = np.asarray(payload[key], dtype=np.uint8)
     host = payload.get("host_received_s")
     raw["host_s"] = (np.asarray(host, dtype=np.float64) if host is not None
-                     else float(payload.get("host_received_monotonic", np.nan)))
+                     else float(payload.get("host_received_monotonic", time.monotonic())))
     return raw
 
 
 class ContinuousRecorder:
     """Appends every frame to ``raw_path`` from a writer thread; ``append`` never touches the disk."""
 
-    def __init__(self, raw_path: str, fs: float = SAMPLE_RATE_HZ) -> None:
+    def __init__(self, raw_path: str, fs: float = SAMPLE_RATE_HZ, emg_channels: int = EMG_CHANNELS) -> None:
         self.raw_path, self.fs = raw_path, float(fs)
+        self.emg_channels = max(1, min(EMG_CHANNELS, int(emg_channels)))
         os.makedirs(os.path.dirname(raw_path) or ".", exist_ok=True)
         self._fh = open(raw_path, "wb", buffering=1 << 20)
         self._queue: queue.Queue = queue.Queue()
@@ -275,16 +281,22 @@ class ContinuousRecorder:
             self.rows += raw.size
             self.valid_rows += int(ok.sum())
             self.late_rows += int(raw["late"][ok].sum())
-            emg = raw["emg"][ok]
+            emg = raw["emg"][ok][:, :self.emg_channels]
             if emg.size:
-                self.clip_counts += ((emg <= CLIP_LOW) | (emg >= CLIP_HIGH)).sum(axis=0)
+                self.clip_counts[:self.emg_channels] += ((emg <= CLIP_LOW) | (emg >= CLIP_HIGH)).sum(axis=0)
             if payload.get("device_counters"):
                 self.device_counters = dict(payload["device_counters"])
             if ok.any():
+                # One arrival entry per burst of frames that reached the host together (same packet / same batch):
+                # the NEWEST frame of the burst is the latest one received at that time. Streams without packet
+                # numbers (the CSV simulator) are grouped by arrival time alone.
                 v = raw[ok]
-                first_of_packet = np.concatenate(([True], v["seq"][1:] != v["seq"][:-1])) if len(v) > 1 else np.array([True])
-                pick = v[first_of_packet]
-                self._arrival.append(pick[["host_s", "frame_id", "ts_us"]].copy())
+                if len(v) > 1:
+                    change = (v["seq"][1:] != v["seq"][:-1]) | (v["host_s"][1:] != v["host_s"][:-1])
+                    last = np.concatenate((np.flatnonzero(change), [len(v) - 1]))
+                else:
+                    last = np.array([0])
+                self._arrival.append(v[last][["host_s", "frame_id", "ts_us"]].copy())
 
 
 # ---------------------------------------------------------------------------------------------
@@ -294,7 +306,7 @@ def finalize_session(raw_path: str, rows: int, events: list, arrival: tuple, out
                      fs: float = SAMPLE_RATE_HZ, transport: Optional[dict] = None,
                      recorder_stats: Optional[dict] = None, keepalive_restarts: Optional[list] = None,
                      host_origin_s: Optional[float] = None, extra_quality: Optional[dict] = None,
-                     chunk_rows: int = 50_000) -> dict:
+                     chunk_rows: int = 50_000, emg_channels: int = EMG_CHANNELS) -> dict:
     """Write signals_/events_/quality_ files for the first ``rows`` raw frames. Safe to call repeatedly."""
     os.makedirs(out_dir, exist_ok=True)
     host_s, arr_frames, arr_ts = arrival
@@ -323,6 +335,8 @@ def finalize_session(raw_path: str, rows: int, events: list, arrival: tuple, out
     ts0 = int(mm["ts_us"][first_valid[0]]) if len(first_valid) else 0
     origin = float(host_origin_s) if host_origin_s is not None else (float(host_s[0]) if len(host_s) else 0.0)
 
+    line_format = _line_format(emg_channels)
+    n_emg = max(1, min(EMG_CHANNELS, int(emg_channels)))
     phase_actual: dict = {}
     phase_valid: dict = {}
     gaps: list = []
@@ -340,12 +354,12 @@ def finalize_session(raw_path: str, rows: int, events: list, arrival: tuple, out
             phase_col = [phases[k] if len(phases) else "" for k in ev.tolist()]
             lines = []
             cols = zip(c["frame_id"].tolist(), ts.tolist(), c["seq"].tolist(), valid.astype(int).tolist(),
-                       c["late"].astype(int).tolist(), *[emg[:, j].tolist() for j in range(EMG_CHANNELS)],
+                       c["late"].astype(int).tolist(), *[emg[:, j].tolist() for j in range(n_emg)],
                        c["imu"][:, 0].tolist(), c["imu"][:, 1].tolist(), c["imu"][:, 2].tolist(),
                        c["imu_id"].tolist(), c["fresh"].astype(int).tolist(), host_rel.tolist(), ev.tolist())
             for row in cols:
                 k = row[-1]
-                lines.append(_LINE_FORMAT % (*row[:-1], names[k] if names else "", codes[k] if codes else -1,
+                lines.append(line_format % (*row[:-1], names[k] if names else "", codes[k] if codes else -1,
                                             phases[k] if phases else "", hands[k] if hands else "",
                                             trials[k] if trials else 0))
             fh.write("".join(lines))
@@ -381,7 +395,8 @@ def finalize_session(raw_path: str, rows: int, events: list, arrival: tuple, out
         "device_counters": stats.get("device_counters", {}),
         "late_frames": int(stats.get("late_rows", 0)),
         "keepalive_restarts": list(keepalive_restarts or []),
-        "clipping_pct_per_channel": ([round(100.0 * float(x) / max(1, valid_total), 4) for x in clip]
+        "emg_channels_recorded": n_emg,
+        "clipping_pct_per_channel": ([round(100.0 * float(x) / max(1, valid_total), 4) for x in clip][:n_emg]
                                      if clip is not None else []),
         "phases": {p: {"expected_frames": int(round(expected.get(p, 0))), "actual_frames": phase_actual.get(p, 0),
                        "valid_frames": phase_valid.get(p, 0)} for p in sorted(set(expected) | set(phase_actual))},

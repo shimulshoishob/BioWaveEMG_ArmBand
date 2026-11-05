@@ -183,3 +183,29 @@ class LabelMapTests(unittest.TestCase):
         self.assertEqual(names, ["left", "right", "fist_close", "up", "down", "double_fist_close", "victory_sign",
                                  "thumbs_up", "pinch_thumb_index", "rest"])
         self.assertTrue(all(canonical_label(n)[1] >= 0 for n in names))
+
+
+class FewerChannelsTests(unittest.TestCase):
+    """The EMG simulator / wired CSV can have 2-8 channels; the recording must still work."""
+
+    def test_four_channel_stream_records_and_labels_with_blank_unused_columns(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = ContinuousRecorder(os.path.join(d, "raw.bin"), FS, emg_channels=4)
+            p = payload(0, 300, 0.0)
+            p["batch"] = p["batch"][:, :4]                       # no IMU, 4 channels
+            rec.append(p); rec.checkpoint()
+            self.assertIsNone(rec.error)
+            log = EventLog(); log.add("Perform", "Left", "Left", 1, 1, 1, 0.0, 600)
+            out = finalize_session(rec.raw_path, rec.rows, log.events, rec.arrival_index(), d, "sim", FS,
+                                   recorder_stats={"valid_rows": rec.valid_rows, "clip_counts": rec.clip_counts},
+                                   host_origin_s=0.0, emg_channels=4)
+            rows = list(csv.DictReader(open(out["signals_path"])))
+            self.assertEqual(len(rows), 300)
+            self.assertEqual((rows[0]["Ch1"], rows[0]["Ch4"], rows[0]["Ch5"], rows[0]["Ch8"]), ("100", "103", "", ""))
+            self.assertEqual(rows[0]["IMU_roll"], "nan")
+            q = json.load(open(out["quality_path"]))
+            self.assertEqual((q["emg_channels_recorded"], len(q["clipping_pct_per_channel"])), (4, 4))
+            import ml_models
+            segs, ch = ml_models.load_segments(out["signals_path"])    # and it trains: blank columns are not channels
+            self.assertEqual((ch, segs[0][1].shape), (4, (300, 4)))
+            rec.close()

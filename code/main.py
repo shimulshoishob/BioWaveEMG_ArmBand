@@ -639,7 +639,8 @@ class SerialWorker(QThread):
         packet_no = int(self._packet_sequence_counter)
         self._packet_sequence_counter += 1
         packet_numbers = np.full(arr.shape[0], packet_no, dtype=np.int64)
-        self.batch_received.emit({"batch": arr, "packet_numbers": packet_numbers, "source": "serial"})
+        self.batch_received.emit({"batch": arr, "packet_numbers": packet_numbers, "source": "serial",
+                                  "host_received_monotonic": time.monotonic()})
 
     def _close_serial(self, send_stop=False):
         try:
@@ -1735,7 +1736,8 @@ class SessionFinalizeWorker(QThread):
                      "device_counters": dict(recorder.device_counters), "late_rows": recorder.late_rows}
             result = finalize_session(recorder.raw_path, rows, events, recorder.arrival_index(), out_dir, session,
                                       fs=fs, transport=transport, recorder_stats=stats,
-                                      keepalive_restarts=restarts, host_origin_s=origin)
+                                      keepalive_restarts=restarts, host_origin_s=origin,
+                                      emg_channels=recorder.emg_channels)
             with open(self._metadata_path, "w", encoding="utf-8") as fh:
                 fh.write("\n".join(self._metadata_builder(rows, result["quality"])) + "\n")
             if self._json_builder is not None:
@@ -6078,6 +6080,7 @@ class EMGVisualizer(QMainWindow):
             f"}}"
         )
 
+    @staticmethod
     def connected_port_button_stylesheet():
         ok = THEME_COLORS["ok"]
         return (
@@ -7953,7 +7956,8 @@ class EMGVisualizer(QMainWindow):
         self._session_name = os.path.basename(self._session_dir)
         try:
             self.session_recorder = ContinuousRecorder(
-                os.path.join(self._session_dir, f"raw_{self._session_name}.bin"), SAMPLE_RATE)
+                os.path.join(self._session_dir, f"raw_{self._session_name}.bin"), SAMPLE_RATE,
+                emg_channels=self.active_emg_channel_count())
         except OSError as exc:
             QMessageBox.warning(self, "Recording", f"Cannot create the session files:\\n{exc}")
             return
