@@ -100,13 +100,13 @@ class WorkflowBarTests(unittest.TestCase):
     def test_hint_follows_the_state(self):
         win = app.EMGVisualizer()
         win.refresh_workflow_hint()
-        self.assertIn("Port Configuration", win.lbl_workflow_hint.text())
+        self.assertIn("Port Setup", win.lbl_workflow_hint.toolTip())
         win.is_connected = True; win.refresh_workflow_hint()
-        self.assertIn("Channel Calibration", win.lbl_workflow_hint.text())
+        self.assertIn("Calibrate", win.lbl_workflow_hint.toolTip())
         win.is_calibrated = True; win.refresh_workflow_hint()
-        self.assertIn("Train Model", win.lbl_workflow_hint.text())
+        self.assertIn("Data Collection", win.lbl_workflow_hint.toolTip())
         win.rf_model = object(); win.refresh_workflow_hint()
-        self.assertIn("Real-time Classification", win.lbl_workflow_hint.text())
+        self.assertIn("Classify", win.lbl_workflow_hint.toolTip())
         win.rf_model = None; win.close()
 
 

@@ -2771,7 +2771,7 @@ class TrainResultsDialog(QDialog):
 
         report = QTextEdit()
         report.setReadOnly(True)
-        report.setStyleSheet("QTextEdit { font-family: Consolas; font-size: 15px; }")
+        report.setStyleSheet("QTextEdit { font-family: Menlo, Consolas, monospace; font-size: 15px; }")
         report.setPlainText(report_text)
         layout.addWidget(report)
 
@@ -2786,7 +2786,7 @@ class TrainResultsDialog(QDialog):
         table.verticalHeader().setSectionResizeMode(QHeaderView.Stretch)
         table.setHorizontalHeaderLabels(class_names)
         table.setVerticalHeaderLabels(class_names)
-        table.setStyleSheet("QTableWidget { font-family: Consolas; font-size: 15px; }")
+        table.setStyleSheet("QTableWidget { font-family: Menlo, Consolas, monospace; font-size: 15px; }")
 
         max_val = max(1, int(np.max(cm)))
         for r in range(cm.shape[0]):
@@ -5730,97 +5730,102 @@ class EMGVisualizer(QMainWindow):
         central_widget = QWidget()
         wrap_in_scroll_area(self, central_widget)
         self.main_layout = QVBoxLayout(central_widget)
-        self.main_layout.setSpacing(8)
-        self.main_layout.setContentsMargins(14, 12, 14, 8)
+        self.main_layout.setSpacing(6)
+        self.main_layout.setContentsMargins(12, 8, 12, 6)
 
         # Selected channel count is configured via the Channel Calibration dialog.
         self.channel_count = 4
 
-        # ===== HEADER: brand + live status pills =====
+        # ===== ROW 1: brand + step tracker + live status pills =====
         header = QFrame()
         header.setObjectName("header")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(16, 10, 16, 10)
-        header_layout.setSpacing(12)
+        header_layout.setContentsMargins(12, 6, 12, 6)
+        header_layout.setSpacing(10)
         icon = get_app_icon()
         if icon is not None and not icon.isNull():
             logo = QLabel()
-            logo.setPixmap(icon.pixmap(38, 38))
-            logo.setFixedSize(42, 42)
+            logo.setPixmap(icon.pixmap(26, 26))
+            logo.setFixedSize(28, 28)
             header_layout.addWidget(logo)
-        brand = QVBoxLayout()
-        brand.setSpacing(0)
-        lbl_brand = QLabel(f'<span style="font-size:22px; font-weight:800;">BioWave '
+        lbl_brand = QLabel(f'<span style="font-size:18px; font-weight:800;">BioWave '
                            f'<span style="color:{THEME_COLORS["accent_hi"]};">EMG</span></span>')
         lbl_brand.setTextFormat(Qt.RichText)
-        brand.addWidget(lbl_brand)
-        lbl_tag = QLabel("8-channel armband  •  EMG + IMU studio")
-        lbl_tag.setStyleSheet(f"color: {THEME_COLORS['muted']};")
-        brand.addWidget(lbl_tag)
-        header_layout.addLayout(brand)
+        lbl_brand.setToolTip("8-channel armband: EMG + IMU studio")
+        header_layout.addWidget(lbl_brand)
+        header_layout.addSpacing(8)
+        self.lbl_workflow = StableLabel("")             # step tracker: Connect > Calibrate > Collect > Train > Classify
+        self.lbl_workflow.setTextFormat(Qt.RichText)
+        self.lbl_workflow.setWordWrap(False)
+        header_layout.addWidget(self.lbl_workflow)
         header_layout.addStretch(1)
         self.pill_link = self._make_pill("Disconnected")
         self.pill_cal = self._make_pill("Not calibrated")
         self.pill_model = self._make_pill("No model")
-        self.pill_rec = self._make_pill("Not recording")
+        self.pill_rec = self._make_pill("Idle")
         for pill in (self.pill_link, self.pill_cal, self.pill_model, self.pill_rec):
             header_layout.addWidget(pill)
         self.main_layout.addWidget(header)
 
-        # ===== COMMAND CARDS =====
-        def card(title, widgets):
-            frame = QFrame()
-            frame.setObjectName("card")
-            box = QVBoxLayout(frame)
-            box.setContentsMargins(12, 8, 12, 10)
-            box.setSpacing(6)
-            lbl = QLabel(title.upper())
-            lbl.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px; font-weight: 800; letter-spacing: 1px;")
-            box.addWidget(lbl)
-            row = QHBoxLayout()
-            row.setSpacing(8)
-            for w in widgets:
-                row.addWidget(w)
-            row.addStretch(1)
-            box.addLayout(row)
-            return frame
+        # ===== ROW 2: one compact toolbar =====
+        def tool_button(text, kind, tip, slot, enabled=True):
+            btn = QPushButton(text)
+            btn.setStyleSheet(themed_button_style(kind) + " QPushButton { padding: 2px 8px; min-height: 18px; }")
+            btn.setToolTip(tip)
+            btn.setEnabled(enabled)
+            btn.clicked.connect(slot)
+            return btn
 
-        self.btn_port_config = QPushButton("Port Configuration")
-        self.btn_port_config.setStyleSheet(themed_button_style("accent"))
-        self.btn_port_config.setToolTip("Connect the armband over USB or Wi-Fi.")
-        self.btn_port_config.clicked.connect(self.open_port_configuration_dialog)
+        def divider():
+            line = QFrame()
+            line.setFixedWidth(1)
+            line.setStyleSheet(f"background-color: {THEME_COLORS['border']}; border: none;")
+            return line
 
-        self.btn_disconnect = QPushButton("Disconnect")
-        self.btn_disconnect.setEnabled(False)
-        self.btn_disconnect.setStyleSheet(self.disconnect_button_stylesheet())
-        self.btn_disconnect.clicked.connect(self.disconnect_serial)
+        self.btn_port_config = tool_button("Port Setup", "accent", "Connect the armband over USB or Wi-Fi (Port Configuration).",
+                                           self.open_port_configuration_dialog)
+        self.btn_disconnect = tool_button("Disconnect", "muted", "Disconnect from the armband.", self.disconnect_serial, False)
+        self.btn_disconnect.setStyleSheet(self.disconnect_button_stylesheet() + " QPushButton { padding: 2px 8px; min-height: 18px; }")
+        self.btn_calibrate = tool_button("Calibrate", "accent", "Channel Calibration: record a relaxed and a flexed phase so every channel is scaled correctly.",
+                                         self.open_calibration_dialog)
+        self.btn_analysis = tool_button("Analysis", "muted", "Live Analysis: spectra, band power, correlation and more for the live signal.",
+                                        self.open_analysis_window, False)
+        self.btn_packet_tracer = tool_button("Packets", "muted", "Packet Tracer: live packet rate, missing packets and loss.",
+                                             self.open_packet_tracer_window)
+        self.btn_options_info = tool_button("Options", "muted", "Options Info: every option in the app with its current value and what it does.",
+                                            self.open_options_info_dialog)
+        self.btn_data_collection = tool_button("Collect", "accent", "Data Collection: record labelled gesture data with the guided study protocol.",
+                                               self.open_data_collection_dialog)
+        self.btn_train_model = tool_button("Train", "accent", "Train Model: train and compare gesture models (Random Forest, SVM, 1D CNN, ...) on recorded data.",
+                                           self.train_rf_from_app)
+        self.btn_load_trained_model = tool_button("Load", "accent", "Load a saved model (.joblib) from trained_model/<model name>/.",
+                                                  self.load_rf_model_dialog)
+        self.btn_realtime_classification = tool_button("Classify", "accent", "Real-time Classification: live gesture predictions from the loaded model.",
+                                                       self.open_realtime_classification_window)
 
-        self.btn_calibrate = QPushButton("Channel Calibration")
-        self.btn_calibrate.setStyleSheet(themed_button_style("accent"))
-        self.btn_calibrate.setToolTip("Record a relaxed and a flexed phase so every channel is scaled correctly.")
-        self.btn_calibrate.clicked.connect(self.open_calibration_dialog)
-
-        self.btn_analysis = QPushButton("Live Analysis")
-        self.btn_analysis.setEnabled(False)
-        self.btn_analysis.setStyleSheet(themed_button_style("muted"))
-        self.btn_analysis.setToolTip("Spectra, band power, correlation and more for the live signal.")
-        self.btn_analysis.clicked.connect(self.open_analysis_window)
-
-        self.btn_packet_tracer = QPushButton("Packet Tracer")
-        self.btn_packet_tracer.setStyleSheet(themed_button_style("muted"))
-        self.btn_packet_tracer.setToolTip("Live packet rate, missing packets and loss.")
-        self.btn_packet_tracer.clicked.connect(self.open_packet_tracer_window)
-
-        self.btn_options_info = QPushButton("Options Info")
-        self.btn_options_info.setStyleSheet(themed_button_style("muted"))
-        self.btn_options_info.setToolTip("Every option in the app with its current value and what it does.")
-        self.btn_options_info.clicked.connect(self.open_options_info_dialog)
-
-        top_row = QHBoxLayout()
-        top_row.setSpacing(10)
-        top_row.addWidget(card("Connection", [self.btn_port_config, self.btn_disconnect, self.btn_calibrate]), 5)
-        top_row.addWidget(card("Tools", [self.btn_analysis, self.btn_packet_tracer, self.btn_options_info]), 4)
-        self.main_layout.addLayout(top_row)
+        toolbar = QFrame()
+        toolbar.setObjectName("card")
+        tool_layout = QHBoxLayout(toolbar)
+        tool_layout.setContentsMargins(8, 5, 8, 5)
+        tool_layout.setSpacing(5)
+        for group in ((self.btn_port_config, self.btn_disconnect, self.btn_calibrate),
+                      (self.btn_analysis, self.btn_packet_tracer, self.btn_options_info),
+                      (self.btn_data_collection, self.btn_train_model, self.btn_load_trained_model,
+                       self.btn_realtime_classification)):
+            for btn in group:
+                tool_layout.addWidget(btn)
+            if group is not (self.btn_data_collection, self.btn_train_model, self.btn_load_trained_model,
+                             self.btn_realtime_classification):
+                tool_layout.addSpacing(4)
+                tool_layout.addWidget(divider())
+                tool_layout.addSpacing(4)
+        self.lbl_workflow_hint = QLabel("")             # one short line: what to do next (full text in the tooltip)
+        self.lbl_workflow_hint.setTextFormat(Qt.RichText)
+        self.lbl_workflow_hint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.lbl_workflow_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        tool_layout.addStretch(1)
+        self.lbl_workflow_hint.hide()                   # the hint is the step tracker's tooltip; no room for it inline
+        self.main_layout.addWidget(toolbar)
 
         # ===== DETECTION SETTINGS (shown in the side panel) =====
         self.analysis_ms_spin = QSpinBox()
@@ -5872,52 +5877,6 @@ class EMGVisualizer(QMainWindow):
         for chk in (self.check_use_hz_gate, self.check_autoscale, self.check_graph_stream):
             det.addWidget(chk)
 
-        # ===== PIPELINE BANNER: where you are + the four stage buttons =====
-        self.lbl_workflow = StableLabel("")
-        self.lbl_workflow.setTextFormat(Qt.RichText)
-        self.lbl_workflow.setWordWrap(True)
-
-        self.btn_data_collection = QPushButton("Data Collection")
-        self.btn_data_collection.setToolTip("Record labelled gesture data with the guided study protocol.")
-        self.btn_data_collection.setStyleSheet(themed_button_style("accent"))
-        self.btn_data_collection.clicked.connect(self.open_data_collection_dialog)
-
-        self.btn_train_model = QPushButton("Train Model")
-        self.btn_train_model.setToolTip("Train and compare gesture models (Random Forest, SVM, 1D CNN, ...) on recorded data.")
-        self.btn_train_model.setStyleSheet(themed_button_style("accent"))
-        self.btn_train_model.clicked.connect(self.train_rf_from_app)
-
-        self.btn_load_trained_model = QPushButton("Load Model")
-        self.btn_load_trained_model.setToolTip("Load a saved model (.joblib) from trained_model/<model name>/.")
-        self.btn_load_trained_model.setStyleSheet(themed_button_style("accent"))
-        self.btn_load_trained_model.clicked.connect(self.load_rf_model_dialog)
-
-        self.btn_realtime_classification = QPushButton("Classification")
-        self.btn_realtime_classification.setToolTip("Show live gesture predictions from the loaded model.")
-        self.btn_realtime_classification.setStyleSheet(themed_button_style("accent"))
-        self.btn_realtime_classification.clicked.connect(self.open_realtime_classification_window)
-
-        self.lbl_workflow_hint = QLabel("")
-        self.lbl_workflow_hint.setTextFormat(Qt.RichText)
-        self.lbl_workflow_hint.setWordWrap(True)
-        self.lbl_workflow_hint.setMinimumHeight(self.lbl_workflow_hint.fontMetrics().height() * 2 + 4)
-        self.lbl_workflow.setWordWrap(False)
-
-        pipeline = QFrame()
-        pipeline.setObjectName("card")
-        pipe_layout = QVBoxLayout(pipeline)
-        pipe_layout.setContentsMargins(14, 8, 12, 10)
-        pipe_layout.setSpacing(4)
-        pipe_layout.addWidget(self.lbl_workflow)
-        pipe_row = QHBoxLayout()
-        pipe_row.setSpacing(8)
-        pipe_row.addWidget(self.lbl_workflow_hint, 1)
-        for btn in (self.btn_data_collection, self.btn_train_model, self.btn_load_trained_model,
-                    self.btn_realtime_classification):
-            pipe_row.addWidget(btn)
-        pipe_layout.addLayout(pipe_row)
-        self.main_layout.addWidget(pipeline)
-
         # ===== STATUS BAR (bottom): current status + loaded model =====
         self.lbl_status = StableLabel("Status: Disconnected")
         self.lbl_status.setStyleSheet(themed_label_style("muted"))
@@ -5926,7 +5885,7 @@ class EMGVisualizer(QMainWindow):
         self.statusBar().setSizeGripEnabled(False)
         self.statusBar().addWidget(self.lbl_status, 1)
         self.statusBar().addPermanentWidget(self.lbl_rf)
-        self.main_layout.addSpacing(2)
+        self.main_layout.addSpacing(0)
 
         # --- GRAPH + SIDE STATUS AREA ---
         self.graph_side_layout = QHBoxLayout()
@@ -6592,13 +6551,15 @@ class EMGVisualizer(QMainWindow):
             item = self.metrics_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                widget.hide()               # deleteLater alone leaves the old label visible until the next event pass
+                widget.setParent(None)
                 widget.deleteLater()
 
         self.metrics_labels = []
         for i in range(num_channels):
             label = QLabel(f"{self.channel_display_name(i)} | Waiting calibration")
             label.setWordWrap(True)
-            label.setStyleSheet("color: #B7C6CC; font-family: Consolas; font-size: 15px;")
+            label.setStyleSheet("color: #B7C6CC; font-family: Menlo, Consolas, monospace; font-size: 12px;")
             self.metrics_layout.addWidget(label)
             self.metrics_labels.append(label)
         self.metrics_layout.addStretch()
@@ -6607,7 +6568,7 @@ class EMGVisualizer(QMainWindow):
     def set_waiting_for_calibration_labels(self):
         for i in range(len(self.metrics_labels)):
             self.metrics_labels[i].setText(f"{self.channel_display_name(i)} | Waiting calibration")
-            self.metrics_labels[i].setStyleSheet("color: #B7C6CC; font-family: Consolas; font-size: 15px;")
+            self.metrics_labels[i].setStyleSheet("color: #B7C6CC; font-family: Menlo, Consolas, monospace; font-size: 12px;")
         self.analysis_idle_labels_active = False
 
     def set_analysis_idle_labels(self):
@@ -6615,7 +6576,7 @@ class EMGVisualizer(QMainWindow):
             return
         for i in range(len(self.metrics_labels)):
             self.metrics_labels[i].setText(f"{self.channel_display_name(i)} | Stream ready | Live Analysis OFF")
-            self.metrics_labels[i].setStyleSheet("color: #B7C6CC; font-family: Consolas; font-size: 15px;")
+            self.metrics_labels[i].setStyleSheet("color: #B7C6CC; font-family: Menlo, Consolas, monospace; font-size: 12px;")
         self.analysis_idle_labels_active = True
 
     def setup_plots(self, num_channels):
@@ -9024,7 +8985,7 @@ class EMGVisualizer(QMainWindow):
                 )
             if self._metrics_color_cache.get(i) != color:
                 self.metrics_labels[i].setStyleSheet(
-                    f"color: {color}; font-family: Consolas; font-size: 15px; font-weight: bold;"
+                    f"color: {color}; font-family: Menlo, Consolas, monospace; font-size: 15px; font-weight: bold;"
                 )
                 self._metrics_color_cache[i] = color
             if self.threshold_lines_pos[i] is not None and self.threshold_lines_neg[i] is not None:
@@ -9548,8 +9509,8 @@ class EMGVisualizer(QMainWindow):
     def _pill_style(kind):
         c = THEME_COLORS
         color = {"ok": c["ok"], "warn": c["warn"], "bad": c["special"], "info": c["accent_hi"]}.get(kind, c["muted"])
-        return (f"color: {color}; background-color: {c['bg']}; border: 1px solid {color}; border-radius: 13px; "
-                "padding: 3px 12px; font-weight: 700;")
+        return (f"color: {color}; background-color: {c['bg']}; border: 1px solid {color}; border-radius: 11px; "
+                "padding: 1px 10px; font-weight: 700; font-size: 12px;")
 
     def _set_pill(self, pill, text, kind):
         pill.setText(text)
@@ -9563,20 +9524,22 @@ class EMGVisualizer(QMainWindow):
             medium = "Wi-Fi" if self.connection_medium == "wireless" else "USB"
             snap = self.packet_tracer.snapshot()
             kind = {"ok": "ok", "warn": "warn", "bad": "bad"}.get(packet_health_kind(snap), "info")
-            rate = f" \u00b7 {snap['pkt_rate']:.0f} pkt/s" if snap.get("received") else ""
+            rate = f" {snap['pkt_rate']:.0f}/s" if snap.get("received") else ""
             self._set_pill(self.pill_link, f"\u25cf {medium}{rate}", kind)
         else:
             self._set_pill(self.pill_link, "\u25cb Disconnected", "idle")
         self._set_pill(self.pill_cal, "\u2713 Calibrated" if self.is_calibrated else "Not calibrated",
                        "ok" if self.is_calibrated else "idle")
-        if self.rf_model is not None:
-            self._set_pill(self.pill_model, f"Model \u00b7 {self.rf_model_type_name or 'loaded'}", "info")
-        else:
-            self._set_pill(self.pill_model, "No model", "idle")
-        if self.session_recorder is not None:
+        # model and recording pills only appear when there is something to show (saves header width)
+        has_model = self.rf_model is not None
+        self.pill_model.setVisible(has_model)
+        if has_model:
+            name = (self.rf_model_type_name or "Model").split(" (")[0]
+            self._set_pill(self.pill_model, name, "info")
+        recording = self.session_recorder is not None
+        self.pill_rec.setVisible(recording)
+        if recording:
             self._set_pill(self.pill_rec, f"\u25cf REC {self.recorded_sample_count():,}", "bad")
-        else:
-            self._set_pill(self.pill_rec, "Not recording", "idle")
 
     def refresh_workflow_hint(self):
         """Update the workflow bar from the current connection / calibration / model state."""
@@ -9588,30 +9551,31 @@ class EMGVisualizer(QMainWindow):
         training = bool(self.training_dialog is not None and getattr(self.training_dialog, "_is_training", False))
         done = [connected, calibrated, self._last_session_quality is not None or collecting, has_model, False]
         if not connected:
-            current, hint = 0, "Click <b>Port Configuration</b> to connect the armband over USB or Wi-Fi."
+            current, short, hint = 0, "Next: connect", "Click <b>Port Setup</b> to connect the armband over USB or Wi-Fi."
         elif not calibrated:
-            current, hint = 1, "Run <b>Channel Calibration</b>: relax for a few seconds, then flex."
+            current, short, hint = 1, "Next: calibrate", "Run <b>Calibrate</b>: relax for a few seconds, then flex."
         elif collecting:
-            current, hint = 2, "Recording in progress. Follow the on-screen cues in the Data Collection window."
+            current, short, hint = 2, "Recording...", "Recording in progress. Follow the cues in the Data Collection window."
         elif training:
-            current, hint = 3, "Training in progress. You can follow it in the Model Training window."
+            current, short, hint = 3, "Training...", "Training in progress; follow it in the Model Training window."
         elif not has_model:
-            current, hint = 2, ("Record gestures with <b>Data Collection</b>, or train on existing recordings with "
-                                "<b>Train Model</b>.")
+            current, short, hint = 2, "Next: collect or train", "Record gestures with <b>Data Collection</b>, or train on existing recordings with <b>Train</b>."
         else:
-            current, hint = 4, "A model is loaded. Open <b>Real-time Classification</b> to see live predictions."
+            current, short, hint = 4, "Ready: open Classify", "A model is loaded. Open <b>Classify</b> to see live predictions."
         names = ["Connect", "Calibrate", "Collect", "Train", "Classify"]
         chips = []
         for i, name in enumerate(names):
             if i == current:
-                chips.append(f'<span style="background-color:{THEME_COLORS["accent"]}; color:#ffffff;"> <b>{i + 1}  {name}</b> </span>')
+                chips.append(f'<span style="background-color:{THEME_COLORS["accent"]}; color:#06201D;">&nbsp;<b>{name}</b>&nbsp;</span>')
             elif done[i]:
                 chips.append(f'<span style="color:{THEME_COLORS["accent"]};">\u2713 {name}</span>')
             else:
-                chips.append(f'<span style="color:{THEME_COLORS["disabled"]};">{i + 1}  {name}</span>')
-        sep = f'<span style="color:{THEME_COLORS["disabled"]};">  \u203a  </span>'
+                chips.append(f'<span style="color:{THEME_COLORS["disabled"]};">{name}</span>')
+        sep = f'<span style="color:{THEME_COLORS["disabled"]};">&nbsp;\u203a&nbsp;</span>'
         self.lbl_workflow.setText(sep.join(chips))
-        self.lbl_workflow_hint.setText(f'<span style="color:{THEME_COLORS["muted"]};">{hint}</span>')
+        self.lbl_workflow_hint.setText(f'<span style="color:{THEME_COLORS["muted"]};">{short}</span>')
+        self.lbl_workflow_hint.setToolTip(hint)
+        self.lbl_workflow.setToolTip(hint)
         self.refresh_header_pills()
 
     def on_packet_tick(self):
