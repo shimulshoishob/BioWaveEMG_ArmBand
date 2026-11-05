@@ -79,11 +79,13 @@ from PyQt5.QtWidgets import (
 )
 
 from app_theme import (
+    CHANNEL_COLORS,
     THEME_COLORS,
     apply_dark_theme,
     apply_dark_title_bar,
     clamp_minimum_size,
     configure_high_dpi,
+    scrolling_layout,
     fit_window_to_screen,
     install_screen_fit_filter,
     recommended_font_px,
@@ -1247,7 +1249,7 @@ class ConnectionModeDialog(QDialog):
         apply_dark_title_bar(self)
         self.selected_medium = ""
 
-        layout = QVBoxLayout(self)
+        layout = scrolling_layout(self)
         layout.setSpacing(12)
 
         lbl_title = QLabel("Choose how this BioWave session will connect.")
@@ -1294,7 +1296,7 @@ class USBProvisionDialog(QDialog):
         self.selected_port = ""
         self.device_info = None
 
-        layout = QVBoxLayout(self)
+        layout = scrolling_layout(self)
         layout.setSpacing(8)
 
         intro = QLabel(
@@ -1443,7 +1445,7 @@ class WirelessConfigDialog(QDialog):
         self.devices = []
         self.connected_ok = False
 
-        layout = QVBoxLayout(self)
+        layout = scrolling_layout(self)
         layout.setSpacing(8)
 
         intro = QLabel(
@@ -1805,13 +1807,13 @@ class CalibrationDialog(QDialog):
         self.is_running = False
         self.is_calibrated = False
 
-        layout = QVBoxLayout(self)
+        layout = scrolling_layout(self)
         layout.setSpacing(6)
         cal_spin_style = (
             f"QSpinBox {{ "
             f"background-color: {THEME_COLORS['panel']}; "
             f"color: {THEME_COLORS['text']}; "
-            f"border: 1px solid {THEME_COLORS['accent']}; "
+            f"border: 1px solid {THEME_COLORS['border']}; "
             "border-radius: 6px; font-weight: 700; padding: 4px 6px; min-width: 72px; }"
         )
 
@@ -1948,7 +1950,7 @@ class CalibrationDialog(QDialog):
 
         self.lock_overlay = QWidget(self)
         self.lock_overlay.setStyleSheet(
-            f"background-color: rgba(10, 24, 44, 225); border: 1px solid {THEME_COLORS['accent']}; border-radius: 8px;"
+            f"background-color: rgba(10, 24, 44, 225); border: 1px solid {THEME_COLORS['border']}; border-radius: 8px;"
         )
         overlay_layout = QVBoxLayout(self.lock_overlay)
         overlay_layout.setContentsMargins(20, 20, 20, 20)
@@ -2670,7 +2672,7 @@ class PortConfigDialog(QDialog):
         self.resize(640, 320)
         apply_dark_title_bar(self)
 
-        layout = QVBoxLayout(self)
+        layout = scrolling_layout(self)
         layout.setSpacing(6)
 
         lbl_title = QLabel("Instructions:")
@@ -2759,7 +2761,7 @@ class TrainResultsDialog(QDialog):
         self.setWindowTitle("RF Training Results")
         self.resize(980, 720)
 
-        layout = QVBoxLayout(self)
+        layout = scrolling_layout(self)
         lbl = QLabel(summary_text)
         lbl.setWordWrap(True)
         lbl.setStyleSheet("font-weight: bold;")
@@ -2826,7 +2828,7 @@ class ModelTrainingDialog(QDialog):
         self.resize(1120, 800)
         apply_dark_title_bar(self)
 
-        layout = QVBoxLayout(self)
+        layout = scrolling_layout(self, footer=True)
         layout.setSpacing(8)
         intro = QLabel("Pick recordings, pick one or more models, then train. Each model is saved in its own folder "
                        "and the results are compared side by side.")
@@ -2844,7 +2846,7 @@ class ModelTrainingDialog(QDialog):
         self.progress.setRange(0, 100)
         self.progress.setTextVisible(True)
         self.progress.setFormat("%p%")
-        layout.addWidget(self.progress)
+        self._footer_layout.addWidget(self.progress)
 
         row = QHBoxLayout()
         self.btn_train = QPushButton("Train Selected Models")
@@ -2865,11 +2867,11 @@ class ModelTrainingDialog(QDialog):
         self.btn_close.setStyleSheet(themed_button_style("muted"))
         self.btn_close.clicked.connect(self.close)
         row.addWidget(self.btn_close)
-        layout.addLayout(row)
+        self._footer_layout.addLayout(row)
 
         self.lbl_status = QLabel("Status: Ready")
         self.lbl_status.setStyleSheet(themed_label_style("muted"))
-        layout.addWidget(self.lbl_status)
+        self._footer_layout.addWidget(self.lbl_status)
         self._refresh_data_summary()
 
     # ---- shared helpers --------------------------------------------------------------------
@@ -2891,11 +2893,11 @@ class ModelTrainingDialog(QDialog):
     @staticmethod
     def _table_style():
         return (f"QTableWidget {{ background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
-                f"gridline-color: {THEME_COLORS['accent']}; border: 1px solid {THEME_COLORS['accent']}; }} "
+                f"gridline-color: {THEME_COLORS['border']}; border: 1px solid {THEME_COLORS['border']}; }} "
                 f"QHeaderView::section {{ background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
-                f"border: 1px solid {THEME_COLORS['accent']}; padding: 4px; font-weight: bold; }} "
+                f"border: 1px solid {THEME_COLORS['border']}; padding: 4px; font-weight: bold; }} "
                 f"QTableCornerButton::section {{ background-color: {THEME_COLORS['panel']}; "
-                f"border: 1px solid {THEME_COLORS['accent']}; }}")
+                f"border: 1px solid {THEME_COLORS['border']}; }}")
 
     @staticmethod
     def _section(text, hint=""):
@@ -3366,7 +3368,7 @@ class ModelTrainingDialog(QDialog):
         self.report_text.setStyleSheet(
             f"QPlainTextEdit#rfReportText {{ font-family: {MONO_FONT_CSS}; font-size: 13px; "
             f"background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
-            f"border: 1px solid {THEME_COLORS['accent']}; border-radius: 6px; padding: 4px 6px; }}")
+            f"border: 1px solid {THEME_COLORS['border']}; border-radius: 6px; padding: 4px 6px; }}")
         lay.addWidget(self.report_text, 1)
 
         lay.addLayout(self._section("Confusion matrix", "Rows are the true gesture, columns the prediction."))
@@ -3655,7 +3657,7 @@ class ClassLabelEditorDialog(QDialog):
         self.saved_labels = []
         self.rows = []
 
-        layout = QVBoxLayout(self)
+        layout = scrolling_layout(self)
         layout.setSpacing(8)
 
         self.rows_widget = QWidget()
@@ -3782,7 +3784,7 @@ class StudyProcedureDialog(QDialog):
         self.setWindowTitle("Study Procedure")
         self.resize(720, 640)
         apply_dark_title_bar(self)
-        layout = QVBoxLayout(self)
+        layout = scrolling_layout(self)
         view = QTextBrowser()
         view.setOpenExternalLinks(False)
         view.setHtml(STUDY_PROCEDURE_HTML)
@@ -4493,12 +4495,12 @@ class AnalysisWindow(QMainWindow):
             f"QWidget {{ background: {THEME_COLORS['bg']}; color: {THEME_COLORS['text']}; }} "
             f"QLabel {{ color: {THEME_COLORS['text']}; font-size: 18px; }} "
             f"QPushButton#sectionNav {{ background: {THEME_COLORS['panel']}; color: {THEME_COLORS['muted']}; "
-            f"padding: 10px 16px; border: 1px solid {THEME_COLORS['accent']}; font-size: 17px; font-weight: 600; "
+            f"padding: 10px 16px; border: 1px solid {THEME_COLORS['border']}; font-size: 17px; font-weight: 600; "
             f"min-height: 26px; min-width: 120px; border-radius: 6px; }} "
             f"QPushButton#sectionNav:checked {{ background: {THEME_COLORS['accent']}; color: {THEME_COLORS['text']}; }} "
             f"QPushButton#sectionNav:hover:!checked {{ background: {THEME_COLORS['bg']}; color: {THEME_COLORS['text']}; }} "
             f"QHeaderView::section {{ background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
-            f"border: 1px solid {THEME_COLORS['accent']}; padding: 6px; font-size: 16px; font-weight: 600; }}"
+            f"border: 1px solid {THEME_COLORS['border']}; padding: 6px; font-size: 16px; font-weight: 600; }}"
         )
         layout = QVBoxLayout(central)
 
@@ -4550,7 +4552,7 @@ class AnalysisWindow(QMainWindow):
             swatch = QLabel("   ")
             swatch.setFixedSize(18, 18)
             swatch.setStyleSheet(
-                f"background: {self.freq_band_colors[idx]}; border: 1px solid {THEME_COLORS['accent']}; border-radius: 3px;"
+                f"background: {self.freq_band_colors[idx]}; border: 1px solid {THEME_COLORS['border']}; border-radius: 3px;"
             )
             txt = QLabel(band_text)
             txt.setStyleSheet(f"color: {THEME_COLORS['text']}; font-size: 15px;")
@@ -4605,12 +4607,12 @@ class AnalysisWindow(QMainWindow):
         self.corr_table.horizontalHeader().setStyleSheet(
             f"QHeaderView {{ background-color: {THEME_COLORS['panel']}; }}"
             f"QHeaderView::section {{ background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
-            f"border: 1px solid {THEME_COLORS['accent']}; padding: 6px; font-size: 16px; font-weight: 600; }}"
+            f"border: 1px solid {THEME_COLORS['border']}; padding: 6px; font-size: 16px; font-weight: 600; }}"
         )
         self.corr_table.setStyleSheet(
             "QTableWidget { font-size: 17px; "
-            f"background: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; border: 1px solid {THEME_COLORS['accent']}; }} "
-            f"QTableCornerButton::section {{ background-color: {THEME_COLORS['panel']}; border: 1px solid {THEME_COLORS['accent']}; }} "
+            f"background: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; border: 1px solid {THEME_COLORS['border']}; }} "
+            f"QTableCornerButton::section {{ background-color: {THEME_COLORS['panel']}; border: 1px solid {THEME_COLORS['border']}; }} "
             f"QScrollBar:vertical {{ border: none; background: {THEME_COLORS['bg']}; width: 12px; margin: 0; }} "
             f"QScrollBar::handle:vertical {{ background: {THEME_COLORS['accent']}; min-height: 28px; border-radius: 6px; }} "
             f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; border: none; background: transparent; }} "
@@ -4757,7 +4759,7 @@ class AnalysisWindow(QMainWindow):
         table.horizontalHeader().setStyleSheet(
             f"QHeaderView {{ background-color: {THEME_COLORS['panel']}; }}"
             f"QHeaderView::section {{ background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
-            f"border: 1px solid {THEME_COLORS['accent']}; padding: 6px; font-size: 16px; font-weight: 600; }}"
+            f"border: 1px solid {THEME_COLORS['border']}; padding: 6px; font-size: 16px; font-weight: 600; }}"
         )
         for c in range(len(columns)):
             mode = QHeaderView.ResizeToContents
@@ -4765,8 +4767,8 @@ class AnalysisWindow(QMainWindow):
         table.setHorizontalHeaderLabels(columns)
         table.setStyleSheet(
             "QTableWidget { font-size: 17px; "
-            f"background: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; border: 1px solid {THEME_COLORS['accent']}; }} "
-            f"QTableCornerButton::section {{ background-color: {THEME_COLORS['panel']}; border: 1px solid {THEME_COLORS['accent']}; }} "
+            f"background: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; border: 1px solid {THEME_COLORS['border']}; }} "
+            f"QTableCornerButton::section {{ background-color: {THEME_COLORS['panel']}; border: 1px solid {THEME_COLORS['border']}; }} "
             f"QScrollBar:vertical {{ border: none; background: {THEME_COLORS['bg']}; width: 12px; margin: 0; }} "
             f"QScrollBar::handle:vertical {{ background: {THEME_COLORS['accent']}; min-height: 28px; border-radius: 6px; }} "
             f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; border: none; background: transparent; }} "
@@ -4816,17 +4818,11 @@ class AnalysisWindow(QMainWindow):
         self._update_band_power_plot(np.zeros((self.num_channels, len(BAND_DEFS)), dtype=np.float32))
 
     def color_for_corr(self, value):
+        """Neutral panel colour -> teal for positive, red for negative correlation."""
         v = float(np.clip(value, -1.0, 1.0))
-        if v >= 0.0:
-            r = int(22 + 37 * v)   # #16476A -> #3B9797
-            g = int(71 + 80 * v)
-            b = int(106 + 45 * v)
-        else:
-            a = abs(v)
-            r = int(22 + 169 * a)  # #16476A -> #BF092F
-            g = int(71 - 62 * a)
-            b = int(106 - 59 * a)
-        return pg.mkColor((r, g, b))
+        base, target = (21, 37, 63), ((27, 181, 166) if v >= 0.0 else (229, 72, 77))
+        t = abs(v)
+        return pg.mkColor(tuple(int(base[k] + (target[k] - base[k]) * t) for k in range(3)))
 
     def update_analysis_view(self, m):
         n_ch = self.num_channels
@@ -4974,7 +4970,7 @@ class AnalysisWindow(QMainWindow):
                     self.corr_table.setItem(r, c, item)
                 item.setText(f"{value:+.2f}")
                 item.setBackground(self.color_for_corr(value))
-                item.setForeground(pg.mkColor("#E8EEF0"))
+                item.setForeground(pg.mkColor(THEME_COLORS["text"]))
 
 
 class RealtimeClassificationWindow(QMainWindow):
@@ -4989,53 +4985,73 @@ class RealtimeClassificationWindow(QMainWindow):
         apply_dark_title_bar(self)
 
         central = QWidget()
-        self.setCentralWidget(central)
+        wrap_in_scroll_area(self, central)
         layout = QVBoxLayout(central)
         layout.setSpacing(10)
 
+        layout.setContentsMargins(14, 12, 14, 12)
         self.lbl_model_status = QLabel("Model: Not loaded")
         self.lbl_model_status.setStyleSheet(themed_label_style("muted"))
         layout.addWidget(self.lbl_model_status)
 
+        # Hero card: the predicted gesture (picture + name + confidence)
+        hero = QFrame()
+        hero.setObjectName("card")
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(16, 14, 16, 14)
+        hero_layout.setSpacing(18)
+        self.lbl_gesture_image = QLabel()
+        self.lbl_gesture_image.setFixedSize(220, 130)
+        self.lbl_gesture_image.setAlignment(Qt.AlignCenter)
+        self.lbl_gesture_image.setStyleSheet(f"background-color: {THEME_COLORS['bg']}; border: 1px solid {THEME_COLORS['border']}; border-radius: 12px;")
+        hero_layout.addWidget(self.lbl_gesture_image)
+        hero_text = QVBoxLayout()
+        hero_text.setSpacing(6)
+        cap = QLabel("PREDICTED GESTURE")
+        cap.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px; font-weight: 800; letter-spacing: 1px;")
+        hero_text.addWidget(cap)
+        self.lbl_pred = QLabel("N/A")
+        self.lbl_pred.setStyleSheet(f"font-size: 40px; font-weight: 800; color: {THEME_COLORS['accent_hi']};")
+        hero_text.addWidget(self.lbl_pred)
+        self.conf_bar = QProgressBar()
+        self.conf_bar.setRange(0, 1000)
+        self.conf_bar.setTextVisible(False)
+        self.conf_bar.setFixedHeight(14)
+        hero_text.addWidget(self.conf_bar)
+        chips = QHBoxLayout()
+        chips.setSpacing(8)
+        self.lbl_conf = QLabel("Confidence 0.0%")
+        self.lbl_latency = QLabel("Latency N/A")
+        self.lbl_rate = QLabel("0.0 / sec")
+        for chip in (self.lbl_conf, self.lbl_latency, self.lbl_rate):
+            chip.setStyleSheet(f"color: {THEME_COLORS['text']}; background-color: {THEME_COLORS['bg']}; "
+                               f"border: 1px solid {THEME_COLORS['border']}; border-radius: 11px; padding: 2px 10px; font-weight: 600;")
+            chips.addWidget(chip)
+        chips.addStretch(1)
+        hero_text.addLayout(chips)
+        hero_layout.addLayout(hero_text, 1)
+        layout.addWidget(hero)
+
         self.meta_box = QPlainTextEdit()
         self.meta_box.setReadOnly(True)
-        self.meta_box.setMaximumHeight(130)
-        self.meta_box.setStyleSheet(
-            "QPlainTextEdit { font-family: Consolas, 'Courier New', monospace; font-size: 13px; }"
-        )
+        self.meta_box.setMaximumHeight(110)
+        self.meta_box.setStyleSheet(f"QPlainTextEdit {{ font-family: {MONO_FONT_CSS}; font-size: 12px; }}")
         layout.addWidget(self.meta_box)
 
-        self.lbl_pred = QLabel("Classification: N/A")
-        self.lbl_pred.setStyleSheet("font-size: 22px; font-weight: bold; color: #E8EEF0;")
-        layout.addWidget(self.lbl_pred)
-
-        self.lbl_conf = QLabel("Confidence: 0.0%")
-        self.lbl_conf.setStyleSheet("font-size: 18px; font-weight: 600; color: #A9C2CF;")
-        layout.addWidget(self.lbl_conf)
-
-        self.lbl_latency = QLabel("Classification Latency: N/A")
-        self.lbl_latency.setStyleSheet("font-size: 17px; font-weight: 600; color: #A9C2CF;")
-        layout.addWidget(self.lbl_latency)
-
-        self.lbl_rate = QLabel("Classification Rate: 0.0/sec")
-        self.lbl_rate.setStyleSheet("font-size: 17px; font-weight: 600; color: #A9C2CF;")
-        layout.addWidget(self.lbl_rate)
-
         self.bar_plot = pg.PlotWidget()
-        self.bar_plot.setBackground(THEME_COLORS["bg"])
-        self.bar_plot.showGrid(x=True, y=True, alpha=0.2)
+        self.bar_plot.setBackground("#070E1C")
+        self.bar_plot.showGrid(x=False, y=True, alpha=0.18)
         self.bar_plot.setMouseEnabled(x=False, y=False)
         self.bar_plot.setMenuEnabled(False)
         self.bar_plot.hideButtons()
         self.bar_plot.setYRange(0.0, 100.0, padding=0.02)
         self.bar_plot.setLabel("left", "Confidence (%)")
-        self.bar_plot.setLabel("bottom", "Class")
-        self.bar_plot.getAxis("left").setPen(pg.mkPen(THEME_COLORS["text"]))
-        self.bar_plot.getAxis("bottom").setPen(pg.mkPen(THEME_COLORS["text"]))
-        self.bar_plot.getAxis("left").setTextPen(pg.mkPen(THEME_COLORS["text"]))
-        self.bar_plot.getAxis("bottom").setTextPen(pg.mkPen(THEME_COLORS["text"]))
+        for axis in ("left", "bottom"):
+            self.bar_plot.getAxis(axis).setPen(pg.mkPen(THEME_COLORS["border"]))
+            self.bar_plot.getAxis(axis).setTextPen(pg.mkPen(THEME_COLORS["muted"]))
         self.bar_plot.getViewBox().setMouseEnabled(x=False, y=False)
         self.bar_plot.getViewBox().setMenuEnabled(False)
+        self.bar_plot.setMinimumHeight(200)
         layout.addWidget(self.bar_plot, 1)
 
         self._bar_item = None
@@ -5079,16 +5095,24 @@ class RealtimeClassificationWindow(QMainWindow):
         conf_pct = float(p.get("pred_conf_pct", 0.0))
         latency_ms = float(p.get("classification_latency_ms", 0.0))
         rate_hz = float(p.get("classification_rate_hz", 0.0))
-        self._set_text_cached(self.lbl_pred, "pred", f"Classification: {pred_label}")
-        self._set_text_cached(self.lbl_conf, "conf", f"Confidence: {conf_pct:.1f}%")
+        self._set_text_cached(self.lbl_pred, "pred", pred_label.replace("_", " "))
+        self._set_text_cached(self.lbl_conf, "conf", f"Confidence {conf_pct:.1f}%")
+        self.conf_bar.setValue(int(max(0.0, min(100.0, conf_pct)) * 10))
         if model_loaded and pred_label != "N/A" and latency_ms > 0.0:
-            self._set_text_cached(self.lbl_latency, "latency", f"Classification Latency: {latency_ms:.2f} ms")
+            self._set_text_cached(self.lbl_latency, "latency", f"Latency {latency_ms:.2f} ms")
         else:
-            self._set_text_cached(self.lbl_latency, "latency", "Classification Latency: N/A")
+            self._set_text_cached(self.lbl_latency, "latency", "Latency N/A")
         if model_loaded and pred_label != "N/A":
-            self._set_text_cached(self.lbl_rate, "rate", f"Classification Rate: {max(0.0, rate_hz):.1f}/sec")
+            self._set_text_cached(self.lbl_rate, "rate", f"{max(0.0, rate_hz):.1f} / sec")
         else:
-            self._set_text_cached(self.lbl_rate, "rate", "Classification Rate: 0.0/sec")
+            self._set_text_cached(self.lbl_rate, "rate", "0.0 / sec")
+        if self._view_text_cache.get("image") != pred_label:
+            self._view_text_cache["image"] = pred_label
+            pix = get_gesture_pixmap(pred_label, max_w=210, max_h=120, dpr=self.devicePixelRatioF()) if pred_label != "N/A" else None
+            if pix is not None:
+                self.lbl_gesture_image.setPixmap(pix)
+            else:
+                self.lbl_gesture_image.clear()
 
         classes = [str(x) for x in list(p.get("classes", []))]
         scores = np.asarray(list(p.get("class_confidences_pct", [])), dtype=np.float32)
@@ -5112,8 +5136,8 @@ class RealtimeClassificationWindow(QMainWindow):
                 x=x,
                 height=heights,
                 width=0.62,
-                brush=pg.mkBrush(THEME_COLORS["accent"]),
-                pen=pg.mkPen(THEME_COLORS["accent"]),
+                brushes=[pg.mkBrush(CHANNEL_COLORS[i % len(CHANNEL_COLORS)]) for i in range(len(classes))],
+                pen=pg.mkPen(THEME_COLORS["bg"]),
             )
             self.bar_plot.addItem(self._bar_item)
             ticks = [(i + 1, classes[i]) for i in range(len(classes))]
@@ -5283,7 +5307,7 @@ class PacketTracerWindow(QMainWindow):
         apply_dark_title_bar(self)
 
         central = QWidget()
-        self.setCentralWidget(central)
+        wrap_in_scroll_area(self, central)
         layout = QVBoxLayout(central)
         layout.setSpacing(8)
 
@@ -5308,7 +5332,7 @@ class PacketTracerWindow(QMainWindow):
             card.setObjectName("pktCard")
             card.setStyleSheet(
                 f"QFrame#pktCard {{ background-color: {THEME_COLORS['panel']}; "
-                f"border: 1px solid {THEME_COLORS['accent']}; border-radius: 8px; }} "
+                f"border: 1px solid {THEME_COLORS['border']}; border-radius: 8px; }} "
                 "QFrame#pktCard QLabel { background: transparent; border: none; }"
             )
             card_layout = QVBoxLayout(card)
@@ -5330,7 +5354,7 @@ class PacketTracerWindow(QMainWindow):
         layout.addWidget(self.lbl_note)
 
         self.rate_plot = pg.PlotWidget()
-        self.rate_plot.setBackground("k")
+        self.rate_plot.setBackground("#070E1C")
         self.rate_plot.setMinimumHeight(140)
         self.rate_plot.showGrid(x=False, y=True, alpha=0.3)
         self.rate_plot.setLabel("left", "packets / s")
@@ -5432,7 +5456,7 @@ class OptionsInfoDialog(QDialog):
         self.setWindowTitle("Options Info")
         self.resize(880, 720)
         apply_dark_title_bar(self)
-        layout = QVBoxLayout(self)
+        layout = scrolling_layout(self)
         intro = QLabel("Every option in BioWave EMG, grouped by where you find it. "
                        "'Current value' shows your live setting.")
         intro.setWordWrap(True)
@@ -5704,222 +5728,203 @@ class EMGVisualizer(QMainWindow):
         central_widget = QWidget()
         wrap_in_scroll_area(self, central_widget)
         self.main_layout = QVBoxLayout(central_widget)
-        self.main_layout.setSpacing(4)
+        self.main_layout.setSpacing(8)
+        self.main_layout.setContentsMargins(14, 12, 14, 8)
 
-        # --- TOP CONTROLS BAR ---
-        controls_layout = QHBoxLayout()
-        controls_layout.setSpacing(12)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
+        # Selected channel count is configured via the Channel Calibration dialog.
+        self.channel_count = 4
+
+        # ===== HEADER: brand + live status pills =====
+        header = QFrame()
+        header.setObjectName("header")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(16, 10, 16, 10)
+        header_layout.setSpacing(12)
+        icon = get_app_icon()
+        if icon is not None and not icon.isNull():
+            logo = QLabel()
+            logo.setPixmap(icon.pixmap(38, 38))
+            logo.setFixedSize(42, 42)
+            header_layout.addWidget(logo)
+        brand = QVBoxLayout()
+        brand.setSpacing(0)
+        lbl_brand = QLabel(f'<span style="font-size:22px; font-weight:800;">BioWave '
+                           f'<span style="color:{THEME_COLORS["accent_hi"]};">EMG</span></span>')
+        lbl_brand.setTextFormat(Qt.RichText)
+        brand.addWidget(lbl_brand)
+        lbl_tag = QLabel("8-channel armband  •  EMG + IMU studio")
+        lbl_tag.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+        brand.addWidget(lbl_tag)
+        header_layout.addLayout(brand)
+        header_layout.addStretch(1)
+        self.pill_link = self._make_pill("Disconnected")
+        self.pill_cal = self._make_pill("Not calibrated")
+        self.pill_model = self._make_pill("No model")
+        self.pill_rec = self._make_pill("Not recording")
+        for pill in (self.pill_link, self.pill_cal, self.pill_model, self.pill_rec):
+            header_layout.addWidget(pill)
+        self.main_layout.addWidget(header)
+
+        # ===== COMMAND CARDS =====
+        def card(title, widgets):
+            frame = QFrame()
+            frame.setObjectName("card")
+            box = QVBoxLayout(frame)
+            box.setContentsMargins(12, 8, 12, 10)
+            box.setSpacing(6)
+            lbl = QLabel(title.upper())
+            lbl.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px; font-weight: 800; letter-spacing: 1px;")
+            box.addWidget(lbl)
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            for w in widgets:
+                row.addWidget(w)
+            row.addStretch(1)
+            box.addLayout(row)
+            return frame
 
         self.btn_port_config = QPushButton("Port Configuration")
         self.btn_port_config.setStyleSheet(themed_button_style("accent"))
+        self.btn_port_config.setToolTip("Connect the armband over USB or Wi-Fi.")
         self.btn_port_config.clicked.connect(self.open_port_configuration_dialog)
-        controls_layout.addWidget(self.btn_port_config)
-        controls_layout.addStretch(1)
 
         self.btn_disconnect = QPushButton("Disconnect")
         self.btn_disconnect.setEnabled(False)
         self.btn_disconnect.setStyleSheet(self.disconnect_button_stylesheet())
         self.btn_disconnect.clicked.connect(self.disconnect_serial)
-        controls_layout.addWidget(self.btn_disconnect)
-        controls_layout.addStretch(1)
 
         self.btn_calibrate = QPushButton("Channel Calibration")
         self.btn_calibrate.setStyleSheet(themed_button_style("accent"))
+        self.btn_calibrate.setToolTip("Record a relaxed and a flexed phase so every channel is scaled correctly.")
         self.btn_calibrate.clicked.connect(self.open_calibration_dialog)
-        controls_layout.addWidget(self.btn_calibrate)
-        controls_layout.addStretch(1)
 
         self.btn_analysis = QPushButton("Live Analysis")
         self.btn_analysis.setEnabled(False)
-        self.btn_analysis.setStyleSheet(themed_button_style("accent"))
+        self.btn_analysis.setStyleSheet(themed_button_style("muted"))
+        self.btn_analysis.setToolTip("Spectra, band power, correlation and more for the live signal.")
         self.btn_analysis.clicked.connect(self.open_analysis_window)
-        controls_layout.addWidget(self.btn_analysis)
 
         self.btn_packet_tracer = QPushButton("Packet Tracer")
-        self.btn_packet_tracer.setStyleSheet(themed_button_style("accent"))
+        self.btn_packet_tracer.setStyleSheet(themed_button_style("muted"))
         self.btn_packet_tracer.setToolTip("Live packet rate, missing packets and loss.")
         self.btn_packet_tracer.clicked.connect(self.open_packet_tracer_window)
-        controls_layout.addWidget(self.btn_packet_tracer)
 
         self.btn_options_info = QPushButton("Options Info")
-        self.btn_options_info.setStyleSheet(themed_button_style("accent"))
+        self.btn_options_info.setStyleSheet(themed_button_style("muted"))
         self.btn_options_info.setToolTip("Every option in the app with its current value and what it does.")
         self.btn_options_info.clicked.connect(self.open_options_info_dialog)
-        controls_layout.addWidget(self.btn_options_info)
-        self.main_layout.addLayout(controls_layout)
-        self.main_layout.addSpacing(4)
 
-        # Second row: analysis parameters and display switches.
-        controls_layout = QHBoxLayout()
-        controls_layout.setSpacing(12)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
+        top_row.addWidget(card("Connection", [self.btn_port_config, self.btn_disconnect, self.btn_calibrate]), 5)
+        top_row.addWidget(card("Tools", [self.btn_analysis, self.btn_packet_tracer, self.btn_options_info]), 4)
+        self.main_layout.addLayout(top_row)
 
-        # Selected channel count is configured via the Channel Calibration dialog.
-        self.channel_count = 4
-
-        selector_label_style = (
-            f"background-color: {THEME_COLORS['panel']}; "
-            f"color: {THEME_COLORS['text']}; "
-            f"border: 1px solid {THEME_COLORS['accent']}; "
-            "border-top-left-radius: 6px; border-bottom-left-radius: 6px; "
-            "border-top-right-radius: 0px; border-bottom-right-radius: 0px; "
-            "font-weight: 700; padding: 0 10px;"
-        )
-        selector_spin_style = (
-            f"QSpinBox, QDoubleSpinBox {{ "
-            f"background-color: {THEME_COLORS['panel']}; "
-            f"color: {THEME_COLORS['text']}; "
-            f"border: 1px solid {THEME_COLORS['accent']}; "
-            "border-left: 0px; "
-            "border-top-left-radius: 0px; border-bottom-left-radius: 0px; "
-            "border-top-right-radius: 6px; border-bottom-right-radius: 6px; "
-            "font-weight: 700; padding: 4px 6px; }"
-        )
-
-        self.lbl_analysis_ms = QLabel("Analysis (ms)")
-        self.lbl_analysis_ms.setStyleSheet(selector_label_style)
-        self.lbl_analysis_ms.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        analysis_pair_layout = QHBoxLayout()
-        analysis_pair_layout.setContentsMargins(0, 0, 0, 0)
-        analysis_pair_layout.setSpacing(0)
-        analysis_pair_layout.addWidget(self.lbl_analysis_ms)
+        # ===== DETECTION SETTINGS (shown in the side panel) =====
         self.analysis_ms_spin = QSpinBox()
         self.analysis_ms_spin.setRange(50, 2000)
         self.analysis_ms_spin.setValue(DEFAULT_ANALYSIS_MS)
-        self.analysis_ms_spin.setStyleSheet(selector_spin_style)
-        self.analysis_ms_spin.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
-        analysis_pair_layout.addWidget(self.analysis_ms_spin)
-        controls_layout.addLayout(analysis_pair_layout)
-        controls_layout.addStretch(1)
-
-        self.lbl_rms_threshold = QLabel("RMS Threshold")
-        self.lbl_rms_threshold.setStyleSheet(selector_label_style)
-        self.lbl_rms_threshold.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        rms_pair_layout = QHBoxLayout()
-        rms_pair_layout.setContentsMargins(0, 0, 0, 0)
-        rms_pair_layout.setSpacing(0)
-        rms_pair_layout.addWidget(self.lbl_rms_threshold)
+        self.analysis_ms_spin.setSuffix(" ms")
+        self.analysis_ms_spin.setToolTip("Window used for RMS / MAV and the live classifier.")
         self.threshold_spin = QDoubleSpinBox()
         self.threshold_spin.setRange(0.0, 4095.0)
         self.threshold_spin.setDecimals(1)
         self.threshold_spin.setSingleStep(1.0)
         self.threshold_spin.setValue(DEFAULT_THRESHOLD)
-        self.threshold_spin.setStyleSheet(selector_spin_style)
-        self.threshold_spin.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
+        self.threshold_spin.setToolTip("Muscle counts as active above this RMS.")
         self.threshold_spin.valueChanged.connect(self.update_threshold_overlays)
-        rms_pair_layout.addWidget(self.threshold_spin)
-        controls_layout.addLayout(rms_pair_layout)
-        controls_layout.addStretch(1)
-
-        self.lbl_hz_threshold = QLabel("Hz Threshold")
-        self.lbl_hz_threshold.setStyleSheet(selector_label_style)
-        self.lbl_hz_threshold.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        hz_pair_layout = QHBoxLayout()
-        hz_pair_layout.setContentsMargins(0, 0, 0, 0)
-        hz_pair_layout.setSpacing(0)
-        hz_pair_layout.addWidget(self.lbl_hz_threshold)
         self.hz_threshold_spin = QDoubleSpinBox()
         self.hz_threshold_spin.setRange(0.0, SAMPLE_RATE / 2.0)
         self.hz_threshold_spin.setDecimals(1)
         self.hz_threshold_spin.setSingleStep(1.0)
+        self.hz_threshold_spin.setSuffix(" Hz")
         self.hz_threshold_spin.setValue(DEFAULT_HZ_THRESHOLD)
-        self.hz_threshold_spin.setStyleSheet(selector_spin_style)
-        self.hz_threshold_spin.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
-        hz_pair_layout.addWidget(self.hz_threshold_spin)
-        controls_layout.addLayout(hz_pair_layout)
-        controls_layout.addStretch(1)
-
-        selector_height = max(
-            self.analysis_ms_spin.sizeHint().height(),
-            self.threshold_spin.sizeHint().height(),
-            self.hz_threshold_spin.sizeHint().height(),
-        )
-        self.lbl_analysis_ms.setFixedHeight(selector_height)
-        self.lbl_rms_threshold.setFixedHeight(selector_height)
-        self.lbl_hz_threshold.setFixedHeight(selector_height)
-        selector_width = max(
-            self.analysis_ms_spin.sizeHint().width(),
-            self.threshold_spin.sizeHint().width(),
-            self.hz_threshold_spin.sizeHint().width(),
-        )
-        self.analysis_ms_spin.setFixedWidth(selector_width)
-        self.threshold_spin.setFixedWidth(selector_width)
-        self.hz_threshold_spin.setFixedWidth(selector_width)
-
-        self.check_use_hz_gate = QCheckBox("Use Hz Gate")
+        self.hz_threshold_spin.setToolTip("Dominant frequency must exceed this for a channel to count as active (if the Hz gate is on).")
+        self.check_use_hz_gate = QCheckBox("Use Hz gate")
         self.check_use_hz_gate.setChecked(True)
-        controls_layout.addWidget(self.check_use_hz_gate)
-        controls_layout.addStretch(1)
-
-        self.check_autoscale = QCheckBox("Auto Scale Y")
+        self.check_autoscale = QCheckBox("Auto-scale Y axis")
         self.check_autoscale.setChecked(True)
         self.check_autoscale.toggled.connect(self.toggle_autoscale)
-        controls_layout.addWidget(self.check_autoscale)
-        controls_layout.addStretch(1)
-
-        self.check_graph_stream = QCheckBox("Graph Stream")
+        self.check_graph_stream = QCheckBox("Draw live graph")
         self.check_graph_stream.setChecked(True)
-        controls_layout.addWidget(self.check_graph_stream)
-        controls_layout.addStretch(1)
 
-        self.main_layout.addLayout(controls_layout)
-        self.main_layout.addSpacing(6)
+        self.detection_card = QFrame()
+        self.detection_card.setObjectName("card")
+        det = QVBoxLayout(self.detection_card)
+        det.setContentsMargins(12, 8, 12, 10)
+        det.setSpacing(6)
+        det_title = QLabel("DETECTION & DISPLAY")
+        det_title.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px; font-weight: 800; letter-spacing: 1px;")
+        det.addWidget(det_title)
+        det_grid = QGridLayout()
+        det_grid.setHorizontalSpacing(8)
+        det_grid.setVerticalSpacing(6)
+        for row, (text, spin) in enumerate((("Window", self.analysis_ms_spin), ("RMS limit", self.threshold_spin),
+                                            ("Hz limit", self.hz_threshold_spin))):
+            lbl = QLabel(text)
+            lbl.setStyleSheet(f"color: {THEME_COLORS['muted']};")
+            det_grid.addWidget(lbl, row, 0)
+            det_grid.addWidget(spin, row, 1)
+        det_grid.setColumnStretch(1, 1)
+        det.addLayout(det_grid)
+        for chk in (self.check_use_hz_gate, self.check_autoscale, self.check_graph_stream):
+            det.addWidget(chk)
 
-        # Workflow bar: shows where you are (connect > calibrate > collect > train > classify) and what to do next.
+        # ===== PIPELINE BANNER: where you are + the four stage buttons =====
         self.lbl_workflow = StableLabel("")
         self.lbl_workflow.setTextFormat(Qt.RichText)
         self.lbl_workflow.setWordWrap(True)
-        self.main_layout.addWidget(self.lbl_workflow)
-        self.main_layout.addSpacing(4)
-
-        info_actions_layout = QHBoxLayout()
-        info_actions_layout.setSpacing(12)
-        info_actions_layout.setAlignment(Qt.AlignTop)
-
-        info_text_layout = QVBoxLayout()
-        info_text_layout.setContentsMargins(0, 0, 0, 0)
-        info_text_layout.setSpacing(2)
-        self.lbl_status = StableLabel("Status: Disconnected")
-        self.lbl_status.setStyleSheet(themed_label_style("muted"))
-        info_text_layout.addWidget(self.lbl_status)
-
-        self.lbl_rf = StableLabel("Model: Not loaded")
-        self.lbl_rf.setStyleSheet(themed_label_style("muted"))
-        info_text_layout.addWidget(self.lbl_rf)
-        info_actions_layout.addLayout(info_text_layout, 0)
-
-        info_actions_layout.addStretch()
-        buttons_layout = QHBoxLayout()
-        buttons_layout.setContentsMargins(0, 2, 0, 0)
-        buttons_layout.setSpacing(12)
 
         self.btn_data_collection = QPushButton("Data Collection")
         self.btn_data_collection.setToolTip("Record labelled gesture data with the guided study protocol.")
         self.btn_data_collection.setStyleSheet(themed_button_style("accent"))
         self.btn_data_collection.clicked.connect(self.open_data_collection_dialog)
-        buttons_layout.addWidget(self.btn_data_collection)
 
         self.btn_train_model = QPushButton("Train Model")
         self.btn_train_model.setToolTip("Train and compare gesture models (Random Forest, SVM, 1D CNN, ...) on recorded data.")
         self.btn_train_model.setStyleSheet(themed_button_style("accent"))
         self.btn_train_model.clicked.connect(self.train_rf_from_app)
-        buttons_layout.addWidget(self.btn_train_model)
 
-        self.btn_load_trained_model = QPushButton("Load Trained Model")
+        self.btn_load_trained_model = QPushButton("Load Model")
         self.btn_load_trained_model.setToolTip("Load a saved model (.joblib) from trained_model/<model name>/.")
         self.btn_load_trained_model.setStyleSheet(themed_button_style("accent"))
         self.btn_load_trained_model.clicked.connect(self.load_rf_model_dialog)
-        buttons_layout.addWidget(self.btn_load_trained_model)
 
-        self.btn_realtime_classification = QPushButton("Real-time Classification")
+        self.btn_realtime_classification = QPushButton("Classification")
         self.btn_realtime_classification.setToolTip("Show live gesture predictions from the loaded model.")
         self.btn_realtime_classification.setStyleSheet(themed_button_style("accent"))
         self.btn_realtime_classification.clicked.connect(self.open_realtime_classification_window)
-        buttons_layout.addWidget(self.btn_realtime_classification)
-        info_actions_layout.addLayout(buttons_layout, 0)
-        self.main_layout.addLayout(info_actions_layout)
-        self.main_layout.addSpacing(8)
+
+        self.lbl_workflow_hint = QLabel("")
+        self.lbl_workflow_hint.setTextFormat(Qt.RichText)
+        self.lbl_workflow_hint.setWordWrap(True)
+        self.lbl_workflow_hint.setMinimumHeight(self.lbl_workflow_hint.fontMetrics().height() * 2 + 4)
+        self.lbl_workflow.setWordWrap(False)
+
+        pipeline = QFrame()
+        pipeline.setObjectName("card")
+        pipe_layout = QVBoxLayout(pipeline)
+        pipe_layout.setContentsMargins(14, 8, 12, 10)
+        pipe_layout.setSpacing(4)
+        pipe_layout.addWidget(self.lbl_workflow)
+        pipe_row = QHBoxLayout()
+        pipe_row.setSpacing(8)
+        pipe_row.addWidget(self.lbl_workflow_hint, 1)
+        for btn in (self.btn_data_collection, self.btn_train_model, self.btn_load_trained_model,
+                    self.btn_realtime_classification):
+            pipe_row.addWidget(btn)
+        pipe_layout.addLayout(pipe_row)
+        self.main_layout.addWidget(pipeline)
+
+        # ===== STATUS BAR (bottom): current status + loaded model =====
+        self.lbl_status = StableLabel("Status: Disconnected")
+        self.lbl_status.setStyleSheet(themed_label_style("muted"))
+        self.lbl_rf = StableLabel("Model: Not loaded")
+        self.lbl_rf.setStyleSheet(themed_label_style("muted"))
+        self.statusBar().setSizeGripEnabled(False)
+        self.statusBar().addWidget(self.lbl_status, 1)
+        self.statusBar().addPermanentWidget(self.lbl_rf)
+        self.main_layout.addSpacing(2)
 
         # --- GRAPH + SIDE STATUS AREA ---
         self.graph_side_layout = QHBoxLayout()
@@ -5929,7 +5934,7 @@ class EMGVisualizer(QMainWindow):
         self.plot_container.setObjectName("mainPlotContainer")
         self.plot_container.setStyleSheet(
             f"QWidget#mainPlotContainer {{ "
-            f"background-color: #000000; border: 1px solid {THEME_COLORS['accent']}; border-radius: 10px; }}"
+            f"background-color: #000000; border: 1px solid {THEME_COLORS['border']}; border-radius: 10px; }}"
         )
         plot_container_layout = QVBoxLayout(self.plot_container)
         plot_container_layout.setContentsMargins(1, 1, 1, 1)
@@ -5937,32 +5942,28 @@ class EMGVisualizer(QMainWindow):
 
         self.plot_widget = pg.GraphicsLayoutWidget()
         self.plot_widget.setObjectName("mainPlotWidget")
-        self.plot_widget.setBackground("k")
+        self.plot_widget.setBackground("#070E1C")
         self.plot_widget.setStyleSheet(
-            "QGraphicsView#mainPlotWidget { background-color: #000000; border: 0px; border-radius: 9px; }"
+            "QGraphicsView#mainPlotWidget { background-color: #070E1C; border: 0px; border-radius: 9px; }"
         )
         self.plot_widget.viewport().setStyleSheet(
-            "background-color: #000000; border: 0px; border-radius: 9px;"
+            "background-color: #070E1C; border: 0px; border-radius: 9px;"
         )
         plot_container_layout.addWidget(self.plot_widget)
         self.graph_side_layout.addWidget(self.plot_container, 4)  # ~80% width
 
-        self.status_panel = QWidget()
-        self.status_panel.setObjectName("channelStatusPanel")
-        self.status_panel.setStyleSheet(
-            f"QWidget#channelStatusPanel {{ "
-            f"background-color: {THEME_COLORS['panel']}; border: 1px solid {THEME_COLORS['accent']}; border-radius: 10px; }} "
-            f"QWidget#channelStatusPanel QLabel {{ background: transparent; border: none; }}"
-        )
-        self.status_panel.setMinimumWidth(260)
+        self.status_panel = QFrame()
+        self.status_panel.setObjectName("card")
+        self.status_panel.setMinimumWidth(250)
         self.status_panel.setMaximumWidth(420)
         self.status_panel_layout = QVBoxLayout(self.status_panel)
         self.status_panel_layout.setContentsMargins(10, 10, 10, 10)
         self.status_panel_layout.setSpacing(8)
 
-        self.lbl_side_title = QLabel("Channel Status")
+        self.lbl_side_title = QLabel("CHANNEL STATUS")
         self.lbl_side_title.setStyleSheet(
-            f"font-weight: bold; color: {THEME_COLORS['text']}; background: transparent; border: none;"
+            f"color: {THEME_COLORS['muted']}; font-size: 11px; font-weight: 800; letter-spacing: 1px; "
+            "background: transparent; border: none;"
         )
         self.status_panel_layout.addWidget(self.lbl_side_title)
 
@@ -5970,17 +5971,17 @@ class EMGVisualizer(QMainWindow):
         self.metrics_scroll.setObjectName("metricsScroll")
         self.metrics_scroll.setStyleSheet(
             f"QScrollArea#metricsScroll {{ "
-            f"border: 1px solid {THEME_COLORS['accent']}; border-radius: 8px; background-color: {THEME_COLORS['panel']}; }}"
+            f"border: 1px solid {THEME_COLORS['border']}; border-radius: 8px; background-color: {THEME_COLORS['bg']}; }}"
         )
         self.metrics_scroll.setWidgetResizable(True)
         self.metrics_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.metrics_scroll.viewport().setStyleSheet(
-            f"background-color: {THEME_COLORS['panel']}; border-radius: 8px;"
+            f"background-color: {THEME_COLORS['bg']}; border-radius: 8px;"
         )
         self.metrics_scroll_content = QWidget()
         self.metrics_scroll_content.setObjectName("metricsScrollContent")
         self.metrics_scroll_content.setStyleSheet(
-            f"QWidget#metricsScrollContent {{ background-color: {THEME_COLORS['panel']}; border: none; }}"
+            f"QWidget#metricsScrollContent {{ background-color: {THEME_COLORS['bg']}; border: none; }}"
         )
         self.metrics_layout = QVBoxLayout(self.metrics_scroll_content)
         self.metrics_layout.setContentsMargins(8, 8, 8, 8)
@@ -5989,15 +5990,13 @@ class EMGVisualizer(QMainWindow):
         self.status_panel_layout.addWidget(self.metrics_scroll, 1)
 
         self.fps_panel = QWidget()
-        self.fps_panel.setStyleSheet(
-            f"QWidget {{ background: {THEME_COLORS['panel']}; border: none; }}"
-        )
+        self.fps_panel.setStyleSheet("QWidget { background: transparent; border: none; }")
         fps_layout = QVBoxLayout(self.fps_panel)
         fps_layout.setContentsMargins(4, 2, 4, 2)
         fps_layout.setSpacing(2)
 
-        self.lbl_perf_title = QLabel("Performance")
-        self.lbl_perf_title.setStyleSheet(f"font-weight: bold; color: {THEME_COLORS['text']};")
+        self.lbl_perf_title = QLabel("PERFORMANCE")
+        self.lbl_perf_title.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px; font-weight: 800; letter-spacing: 1px;")
         fps_layout.addWidget(self.lbl_perf_title)
 
         mono_style = f"color: {THEME_COLORS['muted']}; font-family: {MONO_FONT_CSS};"
@@ -6009,8 +6008,8 @@ class EMGVisualizer(QMainWindow):
         self.lbl_data_fps.setStyleSheet(mono_style)
         fps_layout.addWidget(self.lbl_data_fps)
 
-        self.lbl_link_title = QLabel("Link")
-        self.lbl_link_title.setStyleSheet(f"font-weight: bold; color: {THEME_COLORS['text']};")
+        self.lbl_link_title = QLabel("LINK")
+        self.lbl_link_title.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-size: 11px; font-weight: 800; letter-spacing: 1px;")
         fps_layout.addWidget(self.lbl_link_title)
         self.lbl_pkt_rate = StableLabel("Packets: -- /s")
         self.lbl_pkt_rate.setStyleSheet(mono_style)
@@ -6022,7 +6021,17 @@ class EMGVisualizer(QMainWindow):
         self.lbl_csv_rows.setStyleSheet(mono_style)
         fps_layout.addWidget(self.lbl_csv_rows)
 
-        self.status_panel_layout.addWidget(self.fps_panel, 0)
+        self.status_panel_layout.addWidget(self.detection_card, 0)
+        # live statistics live in the status bar so the side panel keeps its room for the channel list
+        self.lbl_ui_fps.hide()
+        for lbl in (self.lbl_data_fps, self.lbl_pkt_rate, self.lbl_pkt_loss, self.lbl_csv_rows):
+            lbl.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-family: {MONO_FONT_CSS}; font-size: 12px;")
+            lbl.setContentsMargins(8, 0, 0, 0)
+            self.statusBar().addPermanentWidget(lbl)
+        self.lbl_perf_title.hide()
+        self.lbl_link_title.hide()
+        self.lbl_rf.setContentsMargins(12, 0, 8, 0)
+        self.lbl_status.setContentsMargins(10, 0, 0, 0)
 
         self.graph_side_layout.addWidget(self.status_panel, 1)  # ~20% width
         self.main_layout.addLayout(self.graph_side_layout, 1)
@@ -6057,32 +6066,27 @@ class EMGVisualizer(QMainWindow):
     def disconnect_button_stylesheet():
         return (
             f"QPushButton {{ "
-            f"background-color: {THEME_COLORS['accent']}; "
-            f"color: {THEME_COLORS['text']}; "
-            f"font-weight: bold; "
-            f"border: 1px solid {THEME_COLORS['accent']}; "
-            f"border-radius: 6px; padding: 5px 12px; "
+            f"background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; font-weight: bold; "
+            f"border: 1px solid {THEME_COLORS['border']}; border-radius: 8px; padding: 4px 14px; "
             f"}} "
             f"QPushButton:hover:!disabled {{ "
-            f"background-color: {THEME_COLORS['special']}; "
-            f"border-color: {THEME_COLORS['special']}; "
+            f"background-color: {THEME_COLORS['special']}; border-color: {THEME_COLORS['special']}; color: #ffffff; "
             f"}} "
             f"QPushButton:disabled {{ "
-            f"background-color: {THEME_COLORS['panel']}; "
-            f"color: {THEME_COLORS['disabled']}; "
-            f"border-color: {THEME_COLORS['panel']}; "
+            f"background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['disabled']}; "
+            f"border-color: {THEME_COLORS['border']}; "
             f"}}"
         )
 
-    @staticmethod
     def connected_port_button_stylesheet():
+        ok = THEME_COLORS["ok"]
         return (
-            "QPushButton { background-color: #78A083; color: #132440; font-weight: bold; "
-            "border: 1px solid #78A083; border-radius: 6px; padding: 5px 12px; } "
-            "QPushButton:hover:!disabled { background-color: #8DB596; border-color: #8DB596; } "
-            "QPushButton:pressed:!disabled { background-color: #5F8A6A; border-color: #5F8A6A; } "
+            f"QPushButton {{ background-color: {ok}; color: #06201D; font-weight: bold; "
+            f"border: 1px solid {ok}; border-radius: 8px; padding: 4px 14px; }} "
+            "QPushButton:hover:!disabled { background-color: #5FE3B2; border-color: #5FE3B2; } "
+            "QPushButton:pressed:!disabled { background-color: #26A97A; border-color: #26A97A; } "
             f"QPushButton:disabled {{ background-color: {THEME_COLORS['panel']}; "
-            f"color: {THEME_COLORS['disabled']}; border-color: {THEME_COLORS['panel']}; }}"
+            f"color: {THEME_COLORS['disabled']}; border-color: {THEME_COLORS['border']}; }}"
         )
 
     def layout_has_imu(self):
@@ -6623,17 +6627,7 @@ class EMGVisualizer(QMainWindow):
         self._threshold_line_color_cache = {}
         self._threshold_line_value_cache = None
 
-        colors = [
-            "#3B9797",
-            "#BF092F",
-            "#5CC8FF",
-            "#FFB703",
-            "#A8E6CF",
-            "#C77DFF",
-            "#FF6B6B",
-            "#4DD0E1",
-            "#FFD166",
-        ]
+        colors = list(CHANNEL_COLORS)
         threshold = self.threshold_spin.value()
         x_min = float(self.x_axis[0])
         x_max = float(self.x_axis[-1])
@@ -6641,7 +6635,7 @@ class EMGVisualizer(QMainWindow):
 
         def configure_plot(plot_item, left_label, show_bottom, is_imu=False):
             plot_item.showGrid(x=False, y=True, alpha=0.3)
-            plot_item.setLabel("left", left_label)
+            plot_item.setLabel("left", left_label, **{"font-size": "9pt"})
             left_axis = plot_item.getAxis("left")
             left_axis.setStyle(autoExpandTextSpace=False, tickTextWidth=Y_AXIS_TICK_TEXT_WIDTH, showValues=False)
             left_axis.setWidth(Y_AXIS_FIXED_WIDTH)
@@ -6731,9 +6725,9 @@ class EMGVisualizer(QMainWindow):
                 pass
             p.addLegend(offset=(8, 8))
             imu_curves = [
-                p.plot(pen=pg.mkPen("#d32f2f", width=2), name="Roll"),
-                p.plot(pen=pg.mkPen("#2e7d32", width=2), name="Pitch"),
-                p.plot(pen=pg.mkPen("#1565c0", width=2), name="Yaw"),
+                p.plot(pen=pg.mkPen("#FF7A90", width=2), name="Roll"),
+                p.plot(pen=pg.mkPen("#A5E36B", width=2), name="Pitch"),
+                p.plot(pen=pg.mkPen("#7AA2FF", width=2), name="Yaw"),
             ]
             zero_line = pg.InfiniteLine(
                 pos=0.0,
@@ -9539,6 +9533,47 @@ class EMGVisualizer(QMainWindow):
         for lbl in (self.lbl_pkt_rate, self.lbl_pkt_loss):
             lbl.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-family: {MONO_FONT_CSS};")
 
+    @staticmethod
+    def _make_pill(text):
+        pill = StableLabel(text)
+        pill.setAlignment(Qt.AlignCenter)
+        pill.setStyleSheet(EMGVisualizer._pill_style("idle"))
+        return pill
+
+    @staticmethod
+    def _pill_style(kind):
+        c = THEME_COLORS
+        color = {"ok": c["ok"], "warn": c["warn"], "bad": c["special"], "info": c["accent_hi"]}.get(kind, c["muted"])
+        return (f"color: {color}; background-color: {c['bg']}; border: 1px solid {color}; border-radius: 13px; "
+                "padding: 3px 12px; font-weight: 700;")
+
+    def _set_pill(self, pill, text, kind):
+        pill.setText(text)
+        pill.setStyleSheet(self._pill_style(kind))
+
+    def refresh_header_pills(self):
+        """Header pills: link, calibration, model and recording, updated 4x per second."""
+        if not hasattr(self, "pill_link"):
+            return
+        if self.is_connected:
+            medium = "Wi-Fi" if self.connection_medium == "wireless" else "USB"
+            snap = self.packet_tracer.snapshot()
+            kind = {"ok": "ok", "warn": "warn", "bad": "bad"}.get(packet_health_kind(snap), "info")
+            rate = f" \u00b7 {snap['pkt_rate']:.0f} pkt/s" if snap.get("received") else ""
+            self._set_pill(self.pill_link, f"\u25cf {medium}{rate}", kind)
+        else:
+            self._set_pill(self.pill_link, "\u25cb Disconnected", "idle")
+        self._set_pill(self.pill_cal, "\u2713 Calibrated" if self.is_calibrated else "Not calibrated",
+                       "ok" if self.is_calibrated else "idle")
+        if self.rf_model is not None:
+            self._set_pill(self.pill_model, f"Model \u00b7 {self.rf_model_type_name or 'loaded'}", "info")
+        else:
+            self._set_pill(self.pill_model, "No model", "idle")
+        if self.session_recorder is not None:
+            self._set_pill(self.pill_rec, f"\u25cf REC {self.recorded_sample_count():,}", "bad")
+        else:
+            self._set_pill(self.pill_rec, "Not recording", "idle")
+
     def refresh_workflow_hint(self):
         """Update the workflow bar from the current connection / calibration / model state."""
         if not hasattr(self, "lbl_workflow"):
@@ -9561,7 +9596,7 @@ class EMGVisualizer(QMainWindow):
                                 "<b>Train Model</b>.")
         else:
             current, hint = 4, "A model is loaded. Open <b>Real-time Classification</b> to see live predictions."
-        names = ["Connect", "Calibrate", "Collect data", "Train model", "Classify"]
+        names = ["Connect", "Calibrate", "Collect", "Train", "Classify"]
         chips = []
         for i, name in enumerate(names):
             if i == current:
@@ -9571,7 +9606,9 @@ class EMGVisualizer(QMainWindow):
             else:
                 chips.append(f'<span style="color:{THEME_COLORS["disabled"]};">{i + 1}  {name}</span>')
         sep = f'<span style="color:{THEME_COLORS["disabled"]};">  \u203a  </span>'
-        self.lbl_workflow.setText(sep.join(chips) + f'<span style="color:{THEME_COLORS["muted"]};">&nbsp;&nbsp;&nbsp;{hint}</span>')
+        self.lbl_workflow.setText(sep.join(chips))
+        self.lbl_workflow_hint.setText(f'<span style="color:{THEME_COLORS["muted"]};">{hint}</span>')
+        self.refresh_header_pills()
 
     def on_packet_tick(self):
         """4 Hz: update packet statistics, the tracer window and the live CSV counter."""
@@ -9581,7 +9618,7 @@ class EMGVisualizer(QMainWindow):
             color = PACKET_KIND_COLORS[packet_health_kind(snap)]
             self.lbl_pkt_rate.setText(f"Packets: {snap['pkt_rate']:.0f}/{snap['expected_pkt_rate']:.0f} /s")
             self.lbl_pkt_loss.setText(f"Missing: {snap['missing']:,} ({snap['loss_pct']:.2f}%)")
-            style = f"color: {color}; font-family: {MONO_FONT_CSS};"
+            style = f"color: {color}; font-family: {MONO_FONT_CSS}; font-size: 12px;"
             self.lbl_pkt_rate.setStyleSheet(style)
             self.lbl_pkt_loss.setStyleSheet(style)
             if self.packet_tracer_window is not None and self.packet_tracer_window.isVisible():

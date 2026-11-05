@@ -290,6 +290,12 @@ The real-time window runs the loaded model at most 12 times per second, smooths 
 
 Note: holding out whole recordings gives an honest estimate of how a model behaves on a new session; holding out segments from the same recording is optimistic.
 
+### 4.9a User interface
+
+* **Layout.** A branded header with four live status pills (link and packet rate, calibration, loaded model, recording), command cards (Connection, Tools), a pipeline banner that shows where you are (Connect, Calibrate, Collect, Train, Classify) with the next action and the four stage buttons, the colour-coded channel plots, a side panel (channel status, detection and display settings) and a status bar with the live statistics.
+* **Laptop screens.** Windows size themselves to the usable screen (menu bar, dock and taskbar excluded) and the base font scales with the screen height. Every dialog has a scrollable body, and dialogs with primary actions (for example Model Training) keep those buttons pinned at the bottom, so no option can be pushed off-screen on a 13" MacBook, a 1366x768 laptop or a 150 %-scaled Windows laptop. Inputs and buttons have a guaranteed minimum height derived from the font.
+* **Checking it.** `python code/tools/ui_audit.py --profile mac13 --shots out/` opens every window at an emulated laptop screen (`mac13`, `mac_small`, `win125`, `win150`, `win_hd`), reports clipped or off-screen controls and saves screenshots. The automated tests run it for the main profiles.
+
 ### 4.10 Pilot-data repair
 
 ```bash

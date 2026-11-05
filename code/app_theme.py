@@ -2,17 +2,27 @@ import os
 
 
 THEME_COLORS = {
-    "special": "#BF092F",
-    "bg": "#132440",
-    "title_bar": "#0D1B33",
-    "panel": "#16476A",
-    "accent": "#3B9797",
-    "success": "#3B9797",
-    "graph_bg": "#132440",
-    "text": "#E8EEF0",
-    "muted": "#A9C2CF",
-    "disabled": "#6F8A99",
+    "special": "#E5484D",      # errors, pressed state, destructive actions
+    "bg": "#0B1426",           # window background
+    "title_bar": "#070E1C",
+    "panel": "#15253F",        # inputs, tables, raised surfaces
+    "card": "#101E36",         # cards on top of the window background
+    "border": "#27446E",       # quiet borders
+    "accent": "#1BB5A6",       # primary teal
+    "accent_hi": "#4FE0D0",    # highlights, focus rings
+    "accent_dim": "#136F69",   # selected rows, pressed tabs
+    "success": "#1BB5A6",
+    "warn": "#F5A524",
+    "ok": "#36D399",
+    "graph_bg": "#0B1426",
+    "text": "#E8EFF7",
+    "muted": "#93A9C2",
+    "disabled": "#5C7189",
 }
+
+# One colour per EMG channel (distinct on a dark background, colour-blind friendly order).
+CHANNEL_COLORS = ["#4FE0D0", "#F5A524", "#7AA2FF", "#FF7A90", "#A5E36B", "#C792EA", "#FFD166", "#5AC8FA",
+                  "#FF9F6E", "#9AA8FF", "#6EE7B7"]
 
 
 def apply_dark_title_bar(window):
@@ -119,114 +129,343 @@ def recommended_font_px(default=16, lo=12, hi=18):
         return default
 
 
+def ensure_ui_icons():
+    """Draw the small glyphs the stylesheet needs (tick, arrows) once into a cache folder and return it.
+
+    Qt style sheets can only show images from files, so they are rendered with QPainter at start-up. Returns
+    ``None`` if drawing is not possible (the stylesheet then simply omits the images).
+    """
+    try:
+        import tempfile
+        from PyQt5.QtCore import QPointF, Qt
+        from PyQt5.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF
+
+        folder = os.path.join(tempfile.gettempdir(), "biowave_ui_icons_v2")
+        os.makedirs(folder, exist_ok=True)
+
+        def draw(name, painter_fn, size=40):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                return
+            pm = QPixmap(size, size)
+            pm.fill(Qt.transparent)
+            painter = QPainter(pm)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter_fn(painter, size)
+            painter.end()
+            pm.save(path, "PNG")
+
+        def tick(p, n):
+            p.setPen(QPen(QColor("#06201D"), n * 0.13, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            p.drawPolyline(QPolygonF([QPointF(n * .24, n * .52), QPointF(n * .43, n * .70), QPointF(n * .76, n * .30)]))
+
+        def arrow(color, up):
+            def fn(p, n):
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(color))
+                y0, y1 = (n * .66, n * .32) if up else (n * .34, n * .68)
+                p.drawPolygon(QPolygonF([QPointF(n * .22, y0), QPointF(n * .78, y0), QPointF(n * .50, y1)]))
+            return fn
+
+        draw("check.png", tick)
+        draw("arrow_up.png", arrow(THEME_COLORS["muted"], True))
+        draw("arrow_down.png", arrow(THEME_COLORS["muted"], False))
+        return folder.replace("\\", "/")
+    except Exception:
+        return None
+
+
+def control_height(font_size):
+    """Outer height (px) used for buttons and inputs, derived from the base font so nothing is ever clipped."""
+    return int(round(int(font_size) * 2.25))
+
+
 def app_stylesheet(font_size=16):
     c = THEME_COLORS
+    f = int(font_size)
     default_font = default_font_family()
+    h = control_height(f)
+    content_h = max(14, h - 10)                       # min-height is the content box: + padding + border = h
+    icons = ensure_ui_icons()
+    check_img = f"image: url({icons}/check.png);" if icons else ""
+    up_img = f"image: url({icons}/arrow_up.png);" if icons else ""
+    down_img = f"image: url({icons}/arrow_down.png);" if icons else ""
     return f"""
 QWidget {{
-    background-color: {c['bg']};
     color: {c['text']};
     font-family: "{default_font}";
-    font-size: {int(font_size)}px;
+    font-size: {f}px;
 }}
 QMainWindow, QDialog {{
     background-color: {c['bg']};
 }}
-QLabel {{
-    color: {c['text']};
+QLabel, QCheckBox, QRadioButton, QGroupBox {{
+    background: transparent;
 }}
-QPushButton {{
-    background-color: {c['accent']};
+QToolTip {{
+    background-color: {c['title_bar']};
     color: {c['text']};
     border: 1px solid {c['accent']};
     border-radius: 6px;
-    padding: 6px 12px;
-    font-weight: 600;
+    padding: 6px 8px;
 }}
-QPushButton:hover {{
-    background-color: {c['panel']};
+QPushButton {{
+    background-color: {c['accent']};
+    color: #06201D;
+    border: 1px solid {c['accent']};
+    border-radius: 8px;
+    padding: 4px 14px;
+    min-height: {content_h}px;
+    font-weight: 700;
+}}
+QPushButton:hover:!disabled {{
+    background-color: {c['accent_hi']};
+    border-color: {c['accent_hi']};
+}}
+QPushButton:pressed:!disabled {{
+    background-color: {c['accent_dim']};
+    border-color: {c['accent_dim']};
     color: {c['text']};
-}}
-QPushButton:pressed {{
-    background-color: {c['special']};
-    border-color: {c['special']};
 }}
 QPushButton:disabled {{
     background-color: {c['panel']};
     color: {c['disabled']};
-    border-color: {c['accent']};
+    border-color: {c['border']};
+}}
+QPushButton:focus {{
+    border: 1px solid {c['accent_hi']};
 }}
 QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     background-color: {c['panel']};
     color: {c['text']};
-    border: 1px solid {c['accent']};
-    border-radius: 6px;
-    padding: 4px 6px;
-    selection-background-color: {c['accent']};
+    border: 1px solid {c['border']};
+    border-radius: 8px;
+    padding: 4px 8px;
+    selection-background-color: {c['accent_dim']};
+    selection-color: {c['text']};
+}}
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
+    min-height: {content_h}px;
+}}
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
+    border-color: {c['accent']};
+}}
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+    border: 1px solid {c['accent_hi']};
+}}
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
+    color: {c['disabled']};
+    background-color: {c['card']};
+}}
+QSpinBox, QDoubleSpinBox {{
+    padding-right: 24px;
+}}
+QSpinBox::up-button, QDoubleSpinBox::up-button {{
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 22px;
+    border: none;
+    background: transparent;
+}}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 22px;
+    border: none;
+    background: transparent;
+}}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+    {up_img}
+    width: 10px;
+    height: 10px;
+}}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+    {down_img}
+    width: 10px;
+    height: 10px;
+}}
+QComboBox {{
+    padding-right: 26px;
+}}
+QComboBox::drop-down {{
+    subcontrol-origin: padding;
+    subcontrol-position: center right;
+    width: 24px;
+    border: none;
+}}
+QComboBox::down-arrow {{
+    {down_img}
+    width: 10px;
+    height: 10px;
 }}
 QComboBox QAbstractItemView {{
     background-color: {c['panel']};
     color: {c['text']};
-    selection-background-color: {c['accent']};
-    border: 1px solid {c['accent']};
+    selection-background-color: {c['accent_dim']};
+    border: 1px solid {c['border']};
+    outline: none;
 }}
-QCheckBox {{
-    spacing: 6px;
+QCheckBox, QRadioButton {{
+    spacing: 8px;
 }}
 QCheckBox::indicator {{
+    width: 18px;
+    height: 18px;
+    border: 1px solid {c['border']};
+    border-radius: 5px;
+    background: {c['panel']};
+}}
+QCheckBox::indicator:hover {{
+    border-color: {c['accent']};
+}}
+QCheckBox::indicator:checked {{
+    background: {c['accent']};
+    border-color: {c['accent']};
+    {check_img}
+}}
+QCheckBox::indicator:disabled {{
+    background: {c['card']};
+    border-color: {c['border']};
+}}
+QRadioButton::indicator {{
     width: 16px;
     height: 16px;
+    border: 1px solid {c['border']};
+    border-radius: 9px;
+    background: {c['panel']};
+}}
+QRadioButton::indicator:checked {{
+    background: {c['accent']};
+    border: 4px solid {c['panel']};
+    outline: 1px solid {c['accent']};
+}}
+QGroupBox {{
+    border: 1px solid {c['border']};
+    border-radius: 10px;
+    margin-top: {f + 6}px;
+    padding: 10px;
+    font-weight: 700;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+    color: {c['accent_hi']};
 }}
 QTabWidget::pane {{
-    border: 1px solid {c['accent']};
-    background: {c['panel']};
+    border: 1px solid {c['border']};
+    border-radius: 10px;
+    background: {c['card']};
+    top: -1px;
+}}
+QTabBar {{
+    font-weight: 600;
 }}
 QTabBar::tab {{
-    background: {c['panel']};
+    background: transparent;
     color: {c['muted']};
-    border: 1px solid {c['accent']};
-    padding: 6px 12px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 7px 18px;
+    margin: 0 4px 4px 0;
+}}
+QTabBar::tab:hover:!selected {{
+    color: {c['text']};
+    background: {c['panel']};
 }}
 QTabBar::tab:selected {{
-    background: {c['accent']};
-    color: {c['text']};
+    background: {c['accent_dim']};
+    color: #ffffff;
+    border-color: {c['accent']};
 }}
 QHeaderView::section {{
     background-color: {c['panel']};
-    color: {c['text']};
-    border: 1px solid {c['accent']};
-    padding: 4px;
+    color: {c['muted']};
+    border: none;
+    border-right: 1px solid {c['border']};
+    border-bottom: 1px solid {c['border']};
+    padding: 6px 8px;
+    font-weight: 700;
 }}
-QTableWidget {{
-    background-color: {c['panel']};
+QTableWidget, QListWidget, QTreeWidget {{
+    background-color: {c['card']};
+    alternate-background-color: {c['panel']};
     color: {c['text']};
-    gridline-color: {c['accent']};
-    border: 1px solid {c['accent']};
+    gridline-color: {c['border']};
+    border: 1px solid {c['border']};
+    border-radius: 8px;
+    outline: none;
+}}
+QTableWidget::item, QListWidget::item {{
+    padding: 4px 6px;
+}}
+QTableWidget::item:selected, QListWidget::item:selected {{
+    background-color: {c['accent_dim']};
+    color: #ffffff;
+}}
+QListWidget::item:hover {{
+    background-color: {c['panel']};
 }}
 QProgressBar {{
-    border: 1px solid {c['accent']};
-    border-radius: 5px;
+    border: 1px solid {c['border']};
+    border-radius: 8px;
     text-align: center;
     background-color: {c['panel']};
     color: {c['text']};
+    min-height: {max(16, f + 4)}px;
 }}
 QProgressBar::chunk {{
-    background-color: {c['success']};
+    border-radius: 7px;
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {c['accent']}, stop:1 {c['accent_hi']});
+}}
+QFrame#card {{
+    background-color: {c['card']};
+    border: 1px solid {c['border']};
+    border-radius: 12px;
+}}
+QFrame#card QLabel, QFrame#card QCheckBox {{
+    background: transparent;
+    border: none;
+}}
+QFrame#header {{
+    background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #10294D, stop:1 {c['bg']});
+    border: 1px solid {c['border']};
+    border-radius: 12px;
+}}
+QFrame#header QLabel {{
+    background: transparent;
+    border: none;
 }}
 QScrollArea {{
-    border: 1px solid {c['accent']};
-    background-color: {c['panel']};
+    border: none;
+    background-color: transparent;
+}}
+QScrollArea > QWidget > QWidget {{
+    background-color: transparent;
+}}
+QStatusBar {{
+    background-color: {c['title_bar']};
+    border-top: 1px solid {c['border']};
+}}
+QStatusBar::item {{
+    border: none;
+}}
+QSplitter::handle {{
+    background-color: {c['border']};
 }}
 QScrollBar:vertical {{
     border: none;
-    background: {c['bg']};
-    width: 10px;
-    margin: 0;
+    background: transparent;
+    width: 12px;
+    margin: 2px;
 }}
 QScrollBar::handle:vertical {{
+    background: {c['border']};
+    min-height: 28px;
+    border-radius: 4px;
+}}
+QScrollBar::handle:vertical:hover {{
     background: {c['accent']};
-    min-height: 24px;
-    border-radius: 5px;
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0px;
@@ -234,23 +473,21 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     border: none;
 }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
-    background: {c['bg']};
-}}
-QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {{
     background: transparent;
-    width: 0px;
-    height: 0px;
 }}
 QScrollBar:horizontal {{
     border: none;
-    background: {c['bg']};
-    height: 10px;
-    margin: 0;
+    background: transparent;
+    height: 12px;
+    margin: 2px;
 }}
 QScrollBar::handle:horizontal {{
+    background: {c['border']};
+    min-width: 28px;
+    border-radius: 4px;
+}}
+QScrollBar::handle:horizontal:hover {{
     background: {c['accent']};
-    min-width: 24px;
-    border-radius: 5px;
 }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
     width: 0px;
@@ -258,12 +495,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
     border: none;
 }}
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
-    background: {c['bg']};
-}}
-QScrollBar::left-arrow:horizontal, QScrollBar::right-arrow:horizontal {{
     background: transparent;
-    width: 0px;
-    height: 0px;
 }}
 """
 
@@ -387,6 +619,41 @@ def wrap_in_scroll_area(window, central_widget):
     return scroll
 
 
+def scrolling_layout(dialog, layout_cls=None, footer=False):
+    """Give ``dialog`` a scrollable body and return the layout to fill it.
+
+    Use in place of ``QVBoxLayout(self)``. On a small laptop screen (13" MacBook, 1366x768 or a 150 %-scaled
+    Windows laptop) a dialog taller than the screen then scrolls instead of cutting off its buttons.
+    """
+    from PyQt5.QtWidgets import QFrame, QScrollArea, QVBoxLayout, QWidget
+    from PyQt5.QtCore import Qt
+
+    outer = QVBoxLayout(dialog)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
+    scroll = QScrollArea(dialog)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    outer.addWidget(scroll, 1)
+    body = QWidget()
+    scroll.setWidget(body)
+    dialog._scroll_body = body
+    dialog._scroll_area = scroll
+    layout = (layout_cls or QVBoxLayout)(body)
+    layout.setContentsMargins(16, 14, 16, 14)
+    if footer:
+        # A footer that never scrolls away: put the primary action buttons here (``dialog._footer_layout``).
+        bar = QFrame(dialog)
+        bar.setObjectName("card")
+        bar.setStyleSheet("QFrame#card { border-left: none; border-right: none; border-bottom: none; border-radius: 0; }")
+        dialog._footer_layout = QVBoxLayout(bar)
+        dialog._footer_layout.setContentsMargins(16, 10, 16, 12)
+        dialog._footer_layout.setSpacing(6)
+        outer.addWidget(bar, 0)
+    return layout
+
+
 def apply_dark_theme(app, font_size=16):
     font = app.font()
     if os.name == "nt":
@@ -403,68 +670,49 @@ def apply_dark_theme(app, font_size=16):
 
 
 def themed_button_style(kind="accent"):
+    """Per-button style. kinds: accent (primary), success, muted (secondary), danger, ghost (outlined)."""
     c = THEME_COLORS
     if kind == "danger":
-        bg = c["special"]
-        text = c["text"]
-        border = c["special"]
-        hover_bg = c["panel"]
-        hover_border = c["panel"]
-    elif kind == "success":
-        bg = c["success"]
-        text = c["text"]
-        border = c["accent"]
-        hover_bg = c["panel"]
-        hover_border = c["accent"]
+        bg, text, border, hover_bg = c["special"], "#ffffff", c["special"], "#F26B70"
     elif kind == "muted":
-        bg = c["panel"]
-        text = c["text"]
-        border = c["accent"]
-        hover_bg = c["bg"]
-        hover_border = c["accent"]
-    else:
-        bg = c["accent"]
-        text = c["text"]
-        border = c["accent"]
-        hover_bg = c["panel"]
-        hover_border = c["accent"]
+        bg, text, border, hover_bg = c["panel"], c["text"], c["border"], c["border"]
+    elif kind == "ghost":
+        bg, text, border, hover_bg = "transparent", c["accent_hi"], c["accent"], c["accent_dim"]
+    else:                                   # accent / success
+        bg, text, border, hover_bg = c["accent"], "#06201D", c["accent"], c["accent_hi"]
+    hover_text = "#ffffff" if kind == "ghost" else text
     return (
         f"QPushButton {{ "
         f"background-color: {bg}; color: {text}; font-weight: bold; "
-        f"border: 1px solid {border}; border-radius: 6px; padding: 5px 12px; "
+        f"border: 1px solid {border}; border-radius: 8px; padding: 4px 14px; "
         f"}} "
         f"QPushButton:hover:!disabled {{ "
-        f"background-color: {hover_bg}; border-color: {hover_border}; "
+        f"background-color: {hover_bg}; border-color: {c['accent_hi'] if kind != 'danger' else hover_bg}; color: {hover_text}; "
         f"}} "
         f"QPushButton:pressed:!disabled {{ "
-        f"background-color: {c['special']}; border-color: {c['special']}; color: {c['text']}; "
+        f"background-color: {c['accent_dim']}; border-color: {c['accent_dim']}; color: #ffffff; "
         f"}} "
         f"QPushButton:disabled {{ "
-        f"background-color: {c['panel']}; color: {c['disabled']}; border-color: {c['panel']}; "
+        f"background-color: {c['panel']}; color: {c['disabled']}; border-color: {c['border']}; "
         f"}}"
     )
 
 
 def themed_label_style(kind="muted"):
     c = THEME_COLORS
-    if kind == "danger":
-        color = c["special"]
-    elif kind == "success":
-        color = c["success"]
-    else:
-        color = c["muted"]
+    color = {"danger": c["special"], "warn": c["warn"], "success": c["ok"]}.get(kind, c["muted"])
     return f"color: {color}; font-weight: bold;"
 
 
 def themed_status_color(color_hint=None):
     hint = (color_hint or "").strip().lower()
-    success_hints = {"#2e7d32", "#00c853", "#4caf50", "#78a083", "#3b9797"}
+    success_hints = {"#2e7d32", "#00c853", "#4caf50", "#78a083", "#3b9797", "#00897b"}
     warning_hints = {"#ff9800", "#f57c00"}
     error_hints = {"#f44336", "#c62828", "#bf092f"}
     if hint in error_hints:
         return THEME_COLORS["special"]
     if hint in warning_hints:
-        return THEME_COLORS["special"]
+        return THEME_COLORS["warn"]
     if hint in success_hints:
-        return THEME_COLORS["success"]
+        return THEME_COLORS["ok"]
     return THEME_COLORS["muted"]
