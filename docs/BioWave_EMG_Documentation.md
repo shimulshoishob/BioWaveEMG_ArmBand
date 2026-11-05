@@ -263,9 +263,32 @@ Folder: `<ID>_day<NN>_<hand-order>_<UTC>`, for example `S03_day01_left-right_202
 
 Break and hand-switch phases carry label `rest`; the `Phase` column distinguishes them. Training uses only `perform` and `rest` rows with `Valid=1`; a gap ends the current segment.
 
-### 4.9 Classification
+### 4.9 Model training and classification
 
-The *RF Training* dialog builds window features (`rf_features.py`) from recorded CSV files and trains a Random Forest; the result is saved under `trained_model/`. The real-time window runs the model on a cadence of at most 12 Hz, smooths with a 5-window majority vote, and can publish the predicted gesture to the demo game over localhost UDP (port 5005). Note that files recorded with this version contain 8 EMG columns, so models trained on them have 8 input channels.
+*Train Model* opens a three-step window.
+
+1. **Recordings.** *Scan Dataset Folder* lists every `signals_*.csv` (current) and `emg_data_*.csv` (pilot) under the dataset folder with participant, hand, frames, valid share and channel count. Current recordings are ticked, pilot files are listed unticked. Only `perform` and `rest` frames with `Valid=1` are used; a gap ends the current segment, so gaps are never bridged. All ticked files must have the same channel count (current files have 8 EMG channels, pilot files have 11).
+2. **Models.** Tick any number of models and adjust their settings. Data preparation: window length, stride, edge trim (cuts the reaction-time onset from each segment), test share, and whether to hold out segments or whole recordings.
+3. **Results.** All models are trained on the same windows and split and compared side by side (accuracy, balanced accuracy, macro F1, training time, time for one live prediction), with the per-class report and a confusion matrix whose off-diagonal cells are shown in red.
+
+| Model | Folder | Input |
+|---|---|---|
+| Random Forest | `random_forest` | features |
+| Extra Trees | `extra_trees` | features |
+| SVM (RBF kernel) | `svm_rbf` | features, standardised |
+| SVM (linear) | `svm_linear` | features, standardised |
+| k-Nearest Neighbours | `knn` | features, standardised |
+| Logistic Regression | `logistic_regression` | features, standardised |
+| Linear Discriminant Analysis | `lda` | features |
+| Gradient Boosting | `gradient_boosting` | features |
+| Neural Network (MLP) | `mlp` | features, standardised |
+| 1D CNN | `cnn_1d` | raw window (needs PyTorch) |
+
+Each trained model is saved in its own folder: `trained_model/<model folder>/<run name>_<date_time>/` containing `<model folder>_model.joblib`, `training_setup.json`, `training_results.json`, `classification_report.txt`, `confusion_matrix.csv` and `training_summary.txt`. Classical models learn from the window feature vector of `rf_features.py`; the 1D CNN learns from the mean-centred raw window. SVM probabilities are a softmax of the decision scores (not calibrated).
+
+The real-time window runs the loaded model at most 12 times per second, smooths with a 5-window majority vote, and can publish the predicted gesture to the demo game over localhost UDP (port 5005). The main window shows a workflow bar (connect, calibrate, collect, train, classify) with the next step.
+
+Note: holding out whole recordings gives an honest estimate of how a model behaves on a new session; holding out segments from the same recording is optimistic.
 
 ### 4.10 Pilot-data repair
 

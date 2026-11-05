@@ -102,7 +102,7 @@ static const uint8_t BWIM_VERSION = 2;
 static const char *FW_VERSION = "emg-imu-2.0.0";
 
 // The access key lives in the gitignored secrets.h (see secrets.example.h).
-static const char *DEVICE_ACCESS_KEY = CHANGE_THIS_TO_A_LONG_RANDOM_KEY;
+static const char *DEVICE_ACCESS_KEY = DEVICE_ACCESS_KEY_VALUE;
 
 
 // ---------- EMG ----------
@@ -1241,16 +1241,6 @@ void setup() {
   diagnosticsWindowStartMs = millis();
 
   xTaskCreatePinnedToCore(
-    acquisitionTask,
-    "AcquisitionTask",
-    8192,
-    nullptr,
-    ACQUISITION_PRIORITY,
-    &acquisitionTaskHandle,
-    ACQUISITION_CORE
-  );
-
-  xTaskCreatePinnedToCore(
     imuTask,
     "ImuTask",
     6144,
@@ -1268,6 +1258,18 @@ void setup() {
     NETWORK_PRIORITY,
     &networkTaskHandle,
     NETWORK_CORE
+  );
+
+  // Start acquisition LAST. It runs on core 1 at a higher priority than the Arduino loop task that is
+  // executing setup(), and it never yields, so anything created after it would never be started.
+  xTaskCreatePinnedToCore(
+    acquisitionTask,
+    "AcquisitionTask",
+    8192,
+    nullptr,
+    ACQUISITION_PRIORITY,
+    &acquisitionTaskHandle,
+    ACQUISITION_CORE
   );
 }
 

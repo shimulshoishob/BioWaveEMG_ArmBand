@@ -11,3 +11,4 @@ ESP32_S3 Setup/secrets.h
 code/device_secret.json
 # Local participant-name mapping (never export)
 code/participant_map.json
+ESP32_S3 Setup/EMG_IMU_WIFI_SETUP_V2/secrets.h

@@ -26,6 +26,7 @@ os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt5")
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
 import joblib
 import pyqtgraph as pg
+import ml_models
 from PyQt5.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import (
     QBrush,
@@ -57,6 +58,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -1570,12 +1572,14 @@ class RFRealtimeInferenceWorker(QThread):
         self._lock = threading.Lock()
         self._pending_event = threading.Event()
         self._model = None
+        self._input_kind = "features"
         self._class_names = []
         self._window_batch = None
 
-    def set_model(self, model, class_names, sample_rate=None):
+    def set_model(self, model, class_names, sample_rate=None, input_kind="features"):
         with self._lock:
             self._model = model
+            self._input_kind = str(input_kind or "features")
             self._class_names = [str(x) for x in list(class_names or [])]
             if sample_rate is not None:
                 self.sample_rate = int(max(1, sample_rate))
@@ -1615,18 +1619,22 @@ class RFRealtimeInferenceWorker(QThread):
 
             with self._lock:
                 model = self._model
+                input_kind = self._input_kind
                 class_names = list(self._class_names)
                 window_batch = self._window_batch
                 self._window_batch = None
 
             if model is None or window_batch is None:
                 continue
-            if not HAS_RF_FEATURES or rf_extract_window_features is None:
+            if input_kind != "window" and (not HAS_RF_FEATURES or rf_extract_window_features is None):
                 continue
 
             try:
                 t0 = time.perf_counter()
-                feats = rf_extract_window_features(window_batch, sample_rate=self.sample_rate).reshape(1, -1)
+                if input_kind == "window":
+                    feats = np.asarray(window_batch, dtype=np.float32)[None]     # raw window for the 1D CNN
+                else:
+                    feats = rf_extract_window_features(window_batch, sample_rate=self.sample_rate).reshape(1, -1)
 
                 confidences = np.zeros(len(class_names), dtype=np.float32)
                 conf = 0.0
@@ -1739,7 +1747,9 @@ class SessionFinalizeWorker(QThread):
 
 
 class RFTrainingWorker(QThread):
+    """Runs the (possibly multi-model) training off the GUI thread."""
     status_updated = pyqtSignal(str, str)
+    progress_updated = pyqtSignal(int, str)
     training_completed = pyqtSignal(object)
     training_failed = pyqtSignal(str)
 
@@ -1747,6 +1757,10 @@ class RFTrainingWorker(QThread):
         super().__init__(parent)
         self._visualizer = visualizer
         self._config = dict(config or {})
+        self._cancel = threading.Event()
+
+    def cancel(self):
+        self._cancel.set()
 
     def _emit_status(self, text, color="#999999"):
         self.status_updated.emit(str(text), str(color))
@@ -1755,6 +1769,8 @@ class RFTrainingWorker(QThread):
         try:
             cfg = dict(self._config)
             cfg["_status_callback"] = self._emit_status
+            cfg["_progress_callback"] = lambda fraction, text: self.progress_updated.emit(int(round(100 * fraction)), text)
+            cfg["_cancel_event"] = self._cancel
             cfg["_defer_auto_load"] = True
             result = self._visualizer.train_rf_with_config(cfg)
             self.training_completed.emit(result)
@@ -2784,7 +2800,13 @@ class TrainResultsDialog(QDialog):
         layout.addWidget(btn_close)
 
 
-class RFTrainingDialog(QDialog):
+class ModelTrainingDialog(QDialog):
+    """Train and compare gesture models in three steps: recordings, models, results.
+
+    Every selected model is trained on the same windows and split, and saved in its own folder
+    (``trained_model/<model folder>/<run>_<time>/``).
+    """
+
     def __init__(self, visualizer, parent=None):
         super().__init__(parent)
         apply_app_icon(self)
@@ -2792,231 +2814,65 @@ class RFTrainingDialog(QDialog):
         self.current_model_path = ""
         self.current_run_dir = ""
         self._is_destroying = False
+        self._is_training = False
         self.training_worker = None
-        self.dataset_channel_counts = {}
-        self.dataset_channel_errors = {}
-        self._dataset_signature = tuple()
+        self._rows = []             # one dict per recording in the table
+        self._runs = []             # results of the last training
+        self._param_widgets = {}    # model key -> {param key: widget}
 
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
-        self.setWindowTitle("RF Training")
+        self.setWindowTitle("Model Training")
         self.setModal(False)
-        self.resize(1080, 760)
+        self.resize(1120, 800)
         apply_dark_title_bar(self)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
+        intro = QLabel("Pick recordings, pick one or more models, then train. Each model is saved in its own folder "
+                       "and the results are compared side by side.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet(themed_label_style("muted"))
+        layout.addWidget(intro)
 
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, 1)
+        self._build_data_tab()
+        self._build_model_tab()
+        self._build_results_tab()
 
-        dataset_tab = QWidget()
-        dataset_layout = QVBoxLayout(dataset_tab)
-        dataset_layout.setSpacing(8)
-        lbl_data = QLabel("Select one or more dataset CSV files")
-        lbl_data.setStyleSheet("font-weight: bold;")
-        dataset_layout.addWidget(lbl_data)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setTextVisible(True)
+        self.progress.setFormat("%p%")
+        layout.addWidget(self.progress)
 
-        self.dataset_list = QListWidget()
-        self.dataset_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.dataset_list.setMinimumHeight(260)
-        dataset_layout.addWidget(self.dataset_list, 1)
-        self.dataset_model = self.dataset_list.model()
-        self.dataset_model.rowsInserted.connect(self._on_dataset_model_changed)
-        self.dataset_model.rowsRemoved.connect(self._on_dataset_model_changed)
-        self.dataset_model.modelReset.connect(self._on_dataset_model_changed)
-        self.lbl_dataset_channel_info = QLabel("Detected channels per file: n/a")
-        self.lbl_dataset_channel_info.setWordWrap(True)
-        self.lbl_dataset_channel_info.setStyleSheet(themed_label_style("muted"))
-        dataset_layout.addWidget(self.lbl_dataset_channel_info)
-
-        row_data_actions = QHBoxLayout()
-        self.btn_add_files = QPushButton("Add CSV Files")
-        self.btn_add_files.setStyleSheet(themed_button_style("accent"))
-        self.btn_add_files.clicked.connect(self.on_add_dataset_files)
-        row_data_actions.addWidget(self.btn_add_files)
-
-        self.btn_add_folder = QPushButton("Add Folder")
-        self.btn_add_folder.setStyleSheet(themed_button_style("accent"))
-        self.btn_add_folder.clicked.connect(self.on_add_dataset_folder)
-        row_data_actions.addWidget(self.btn_add_folder)
-
-        self.btn_remove_selected = QPushButton("Remove Selected")
-        self.btn_remove_selected.setStyleSheet(themed_button_style("muted"))
-        self.btn_remove_selected.clicked.connect(self.on_remove_selected_datasets)
-        row_data_actions.addWidget(self.btn_remove_selected)
-
-        self.btn_clear_datasets = QPushButton("Clear")
-        self.btn_clear_datasets.setStyleSheet(themed_button_style("muted"))
-        self.btn_clear_datasets.clicked.connect(self.on_clear_datasets)
-        row_data_actions.addWidget(self.btn_clear_datasets)
-        row_data_actions.addStretch()
-        dataset_layout.addLayout(row_data_actions)
-        self.tabs.addTab(dataset_tab, "1) Datasets")
-
-        self.train_model_tab = QWidget()
-        setup_layout = QVBoxLayout(self.train_model_tab)
-        setup_layout.setSpacing(8)
-        lbl_train = QLabel("Configure model, split parameters, and output folder")
-        lbl_train.setStyleSheet("font-weight: bold;")
-        setup_layout.addWidget(lbl_train)
-
-        form = QFormLayout()
-        form.setSpacing(8)
-
-        self.spin_window_ms = QSpinBox()
-        self.spin_window_ms.setRange(20, 4000)
-        self.spin_window_ms.setValue(int(max(20, self.visualizer.analysis_ms_spin.value())))
-        form.addRow("Window (ms):", self.spin_window_ms)
-
-        self.spin_stride_ms = QSpinBox()
-        self.spin_stride_ms.setRange(5, 2000)
-        self.spin_stride_ms.setValue(50)
-        form.addRow("Stride (ms):", self.spin_stride_ms)
-
-        self.spin_estimators = QSpinBox()
-        self.spin_estimators.setRange(50, 5000)
-        self.spin_estimators.setValue(RF_DEFAULT_N_ESTIMATORS)
-        self.spin_estimators.setToolTip("Fewer trees = faster live prediction. 100-150 is usually enough.")
-        form.addRow("RF Trees:", self.spin_estimators)
-
-        self.spin_max_depth = QSpinBox()
-        self.spin_max_depth.setRange(0, 200)
-        self.spin_max_depth.setValue(RF_DEFAULT_MAX_DEPTH)
-        self.spin_max_depth.setToolTip("0 means no max depth. A bound like 16 keeps trees fast and reduces overfitting.")
-        form.addRow("Max Depth:", self.spin_max_depth)
-
-        self.spin_test_size = QDoubleSpinBox()
-        self.spin_test_size.setRange(0.05, 0.5)
-        self.spin_test_size.setDecimals(2)
-        self.spin_test_size.setSingleStep(0.05)
-        self.spin_test_size.setValue(0.20)
-        form.addRow("Test Split:", self.spin_test_size)
-
-        self.spin_seed = QSpinBox()
-        self.spin_seed.setRange(0, 99999)
-        self.spin_seed.setValue(42)
-        form.addRow("Random Seed:", self.spin_seed)
-
-        self.check_balanced = QCheckBox("Use balanced class weights")
-        self.check_balanced.setChecked(True)
-        form.addRow("", self.check_balanced)
-
-        self.check_auto_load_model = QCheckBox("Load trained model after save")
-        self.check_auto_load_model.setChecked(True)
-        form.addRow("", self.check_auto_load_model)
-        setup_layout.addLayout(form)
-        row_output_dir = QHBoxLayout()
-        self.output_dir_edit = QLineEdit("trained_model")
-        row_output_dir.addWidget(self.output_dir_edit)
-        self.btn_browse_output_dir = QPushButton("Browse")
-        self.btn_browse_output_dir.setStyleSheet(themed_button_style("accent"))
-        self.btn_browse_output_dir.clicked.connect(self.on_browse_output_dir)
-        row_output_dir.addWidget(self.btn_browse_output_dir)
-        form.addRow("Output Folder:", self._wrap_layout_widget(row_output_dir))
-
-        self.run_name_edit = QLineEdit("rf_training")
-        form.addRow("Run Name:", self.run_name_edit)
-        setup_layout.addStretch()
-        self.tabs.addTab(self.train_model_tab, "2) Train Model")
-
-        self.results_tab = QWidget()
-        results_layout = QVBoxLayout(self.results_tab)
-        results_layout.setSpacing(8)
-
-        lbl_summary = QLabel("Run Summary")
-        lbl_summary.setStyleSheet("font-weight: bold;")
-        results_layout.addWidget(lbl_summary)
-        self.summary_text = QTextEdit()
-        self.summary_text.setReadOnly(True)
-        self.summary_text.setMinimumHeight(120)
-        self.summary_text.setStyleSheet(
-            "QTextEdit { font-family: Consolas, 'Courier New', monospace; font-size: 14px; }"
-        )
-        results_layout.addWidget(self.summary_text)
-
-        lbl_report = QLabel("Classification Report")
-        lbl_report.setStyleSheet("font-weight: bold;")
-        results_layout.addWidget(lbl_report)
-        self.report_text = QPlainTextEdit()
-        self.report_text.setObjectName("rfReportText")
-        self.report_text.setReadOnly(True)
-        self.report_text.setMinimumHeight(190)
-        fixed_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-        fixed_font.setPointSize(12)
-        self.report_text.setFont(fixed_font)
-        self.report_text.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.report_text.setStyleSheet(
-            f"QPlainTextEdit#rfReportText {{ "
-            f"font-family: Consolas, 'Courier New', monospace; "
-            f"font-size: 14px; "
-            f"background-color: {THEME_COLORS['panel']}; "
-            f"color: {THEME_COLORS['text']}; "
-            f"border: 1px solid {THEME_COLORS['accent']}; "
-            f"border-radius: 6px; "
-            f"padding: 4px 6px; "
-            f"}}"
-        )
-        results_layout.addWidget(self.report_text)
-
-        lbl_cm = QLabel("Confusion Matrix")
-        lbl_cm.setStyleSheet("font-weight: bold;")
-        results_layout.addWidget(lbl_cm)
-
-        self.cm_table = QTableWidget(0, 0)
-        self.cm_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.cm_table.setSelectionMode(QAbstractItemView.NoSelection)
-        self.cm_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.cm_table.verticalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.cm_table.setMinimumHeight(220)
-        self.cm_table.setStyleSheet(
-            f"QTableWidget {{ "
-            f"font-family: Consolas, 'Courier New', monospace; font-size: 14px; "
-            f"background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
-            f"gridline-color: {THEME_COLORS['accent']}; border: 1px solid {THEME_COLORS['accent']}; "
-            f"}} "
-            f"QHeaderView::section {{ "
-            f"background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
-            f"border: 1px solid {THEME_COLORS['accent']}; padding: 4px; "
-            f"}} "
-            f"QTableCornerButton::section {{ "
-            f"background-color: {THEME_COLORS['panel']}; border: 1px solid {THEME_COLORS['accent']}; "
-            f"}}"
-        )
-        results_layout.addWidget(self.cm_table, 1)
-        self.tabs.addTab(self.results_tab, "3) Results")
-
-        row_actions = QHBoxLayout()
-        self.btn_train = QPushButton("Train And Save")
+        row = QHBoxLayout()
+        self.btn_train = QPushButton("Train Selected Models")
         self.btn_train.setStyleSheet(themed_button_style("success"))
         self.btn_train.clicked.connect(self.on_train_clicked)
-        row_actions.addWidget(self.btn_train)
-
-        self.btn_load_previous = QPushButton("Load Previous Run")
+        row.addWidget(self.btn_train)
+        self.btn_stop = QPushButton("Stop After Current Model")
+        self.btn_stop.setStyleSheet(themed_button_style("muted"))
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.on_stop_clicked)
+        row.addWidget(self.btn_stop)
+        self.btn_load_previous = QPushButton("Open Previous Run...")
         self.btn_load_previous.setStyleSheet(themed_button_style("accent"))
         self.btn_load_previous.clicked.connect(self.on_load_previous_run)
-        row_actions.addWidget(self.btn_load_previous)
-
-        row_actions.addStretch()
+        row.addWidget(self.btn_load_previous)
+        row.addStretch()
         self.btn_close = QPushButton("Close")
         self.btn_close.setStyleSheet(themed_button_style("muted"))
         self.btn_close.clicked.connect(self.close)
-        row_actions.addWidget(self.btn_close)
-        layout.addLayout(row_actions)
+        row.addWidget(self.btn_close)
+        layout.addLayout(row)
 
         self.lbl_status = QLabel("Status: Ready")
         self.lbl_status.setStyleSheet(themed_label_style("muted"))
         layout.addWidget(self.lbl_status)
+        self._refresh_data_summary()
 
-        self._is_training = False
-        self.tabs.currentChanged.connect(self.on_tab_changed)
-        self.update_action_button_states()
-
-    @staticmethod
-    def _wrap_layout_widget(layout):
-        w = QWidget()
-        w.setLayout(layout)
-        return w
-
+    # ---- shared helpers --------------------------------------------------------------------
     @staticmethod
     def _hex_to_rgb(hex_color, fallback=(22, 71, 106)):
         value = str(hex_color or "").strip().lstrip("#")
@@ -3029,238 +2885,655 @@ class RFTrainingDialog(QDialog):
 
     @staticmethod
     def _blend_rgb(c1, c2, t):
-        alpha = max(0.0, min(1.0, float(t)))
-        return (
-            int(round(c1[0] + (c2[0] - c1[0]) * alpha)),
-            int(round(c1[1] + (c2[1] - c1[1]) * alpha)),
-            int(round(c1[2] + (c2[2] - c1[2]) * alpha)),
-        )
+        a = max(0.0, min(1.0, float(t)))
+        return tuple(int(round(c1[i] + (c2[i] - c1[i]) * a)) for i in range(3))
+
+    @staticmethod
+    def _table_style():
+        return (f"QTableWidget {{ background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
+                f"gridline-color: {THEME_COLORS['accent']}; border: 1px solid {THEME_COLORS['accent']}; }} "
+                f"QHeaderView::section {{ background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
+                f"border: 1px solid {THEME_COLORS['accent']}; padding: 4px; font-weight: bold; }} "
+                f"QTableCornerButton::section {{ background-color: {THEME_COLORS['panel']}; "
+                f"border: 1px solid {THEME_COLORS['accent']}; }}")
+
+    @staticmethod
+    def _section(text, hint=""):
+        box = QVBoxLayout()
+        title = QLabel(text)
+        title.setStyleSheet("font-weight: bold; font-size: 15px;")
+        box.addWidget(title)
+        if hint:
+            sub = QLabel(hint)
+            sub.setWordWrap(True)
+            sub.setStyleSheet(themed_label_style("muted"))
+            box.addWidget(sub)
+        return box
 
     def set_status(self, text, color="#999999"):
         self.lbl_status.setText(f"Status: {text}")
-        self.lbl_status.setStyleSheet(
-            f"color: {themed_status_color(color)}; font-weight: bold;"
-        )
+        self.lbl_status.setStyleSheet(f"color: {themed_status_color(color)}; font-weight: bold;")
 
-    def on_tab_changed(self, _idx):
-        self.update_action_button_states()
+    # ---- step 1: recordings ----------------------------------------------------------------
+    DATA_COLUMNS = ["", "Recording", "Participant", "Hand", "Day", "Frames", "Valid", "Channels", "Format", "Size"]
 
-    def _on_dataset_model_changed(self, *_args):
-        self.refresh_dataset_channel_info()
-        self.update_action_button_states()
+    def _build_data_tab(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setSpacing(8)
+        lay.addLayout(self._section("Recordings", "Tick the recordings to train on. Only perform and rest frames with "
+                                    "Valid = 1 are used; prepare, break, pause and gap frames are ignored automatically."))
+        bar = QHBoxLayout()
+        for text, slot, kind in (("Scan Dataset Folder", self.on_scan_dataset, "accent"),
+                                 ("Add Files...", self.on_add_dataset_files, "accent"),
+                                 ("Add Folder...", self.on_add_dataset_folder, "accent"),
+                                 ("Select All", lambda: self._set_all_checked(True), "muted"),
+                                 ("Select None", lambda: self._set_all_checked(False), "muted"),
+                                 ("Remove Unticked", self.on_remove_unchecked, "muted")):
+            btn = QPushButton(text)
+            btn.setStyleSheet(themed_button_style(kind))
+            btn.clicked.connect(slot)
+            bar.addWidget(btn)
+        bar.addStretch()
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Filter (name, participant, hand)")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.setFixedWidth(240)
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        bar.addWidget(self.filter_edit)
+        lay.addLayout(bar)
 
-    @staticmethod
-    def _short_basename(path):
-        try:
-            return os.path.basename(str(path or "").strip()) or str(path or "").strip()
-        except Exception:
-            return str(path or "")
+        self.data_table = QTableWidget(0, len(self.DATA_COLUMNS))
+        self.data_table.setHorizontalHeaderLabels(self.DATA_COLUMNS)
+        self.data_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.data_table.verticalHeader().setVisible(False)
+        self.data_table.setAlternatingRowColors(False)
+        header = self.data_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        self.data_table.setStyleSheet(self._table_style())
+        self.data_table.itemChanged.connect(self._on_data_item_changed)
+        lay.addWidget(self.data_table, 1)
 
-    def refresh_dataset_channel_info(self, force=False):
-        paths = self.dataset_paths()
-        signature = tuple(os.path.normcase(os.path.abspath(p)) for p in paths)
-        if (not force) and signature == self._dataset_signature:
-            return
-        self._dataset_signature = signature
-        self.dataset_channel_counts = {}
-        self.dataset_channel_errors = {}
-        for path in paths:
-            try:
-                ch_count = int(self.visualizer.detect_training_csv_channel_count(path))
-                if ch_count <= 0:
-                    raise ValueError("No channel columns found.")
-                self.dataset_channel_counts[path] = ch_count
-            except Exception as e:
-                self.dataset_channel_errors[path] = str(e)
-        self._render_dataset_channel_info()
-
-    def _render_dataset_channel_info(self):
-        if self.dataset_list.count() == 0:
-            self.lbl_dataset_channel_info.setText("Detected channels per file: n/a")
-            self.lbl_dataset_channel_info.setStyleSheet(themed_label_style("muted"))
-            return
-
-        if len(self.dataset_channel_errors) > 0:
-            first_path = next(iter(self.dataset_channel_errors.keys()))
-            msg = self.dataset_channel_errors[first_path]
-            self.lbl_dataset_channel_info.setText(
-                "Detected channels per file: failed. "
-                f"{self._short_basename(first_path)} -> {msg}. "
-                "Training is disabled until dataset headers are valid."
-            )
-            self.lbl_dataset_channel_info.setStyleSheet(themed_label_style("danger"))
-            return
-
-        items = list(self.dataset_channel_counts.items())
-        preview = ", ".join(
-            [f"{self._short_basename(path)}:{count}" for path, count in items[:6]]
-        )
-        if len(items) > 6:
-            preview = f"{preview}, +{len(items) - 6} more"
-        uniq = sorted(set(int(v) for v in self.dataset_channel_counts.values()))
-        if len(uniq) == 1:
-            self.lbl_dataset_channel_info.setText(
-                f"Detected channels per file: {preview} | Using: {uniq[0]}"
-            )
-            self.lbl_dataset_channel_info.setStyleSheet(themed_label_style("success"))
-        else:
-            self.lbl_dataset_channel_info.setText(
-                f"Detected channels per file: {preview} | Mismatch detected ({uniq}). "
-                "All selected files must have the same channel count. Training is disabled."
-            )
-            self.lbl_dataset_channel_info.setStyleSheet(themed_label_style("danger"))
-
-    def update_action_button_states(self):
-        if self._is_destroying:
-            return
-        try:
-            self.refresh_dataset_channel_info()
-            if self._is_training:
-                self.btn_train.setEnabled(False)
-                self.btn_load_previous.setEnabled(False)
-                return
-
-            in_train_model_tab = self.tabs.currentWidget() is self.train_model_tab
-            has_dataset = self.dataset_list.count() > 0
-            has_channel_errors = len(self.dataset_channel_errors) > 0
-            unique_counts = sorted(set(int(v) for v in self.dataset_channel_counts.values()))
-            is_channel_compatible = (not has_channel_errors) and (len(unique_counts) <= 1) and has_dataset
-
-            # Train button is only available in Train Model tab.
-            self.btn_train.setEnabled(in_train_model_tab and has_dataset and is_channel_compatible)
-            # Load actions are locked in Train Model tab.
-            self.btn_load_previous.setEnabled(not in_train_model_tab)
-        except RuntimeError:
-            # Qt may emit model signals while dialog widgets are being destroyed.
-            return
-
-    def closeEvent(self, event):
-        if self._is_training:
-            QMessageBox.information(self, "Training Running", "Wait for RF training to finish before closing this window.")
-            event.ignore()
-            return
-        self._is_destroying = True
-        try:
-            if getattr(self, "dataset_model", None) is not None:
-                self.dataset_model.rowsInserted.disconnect(self._on_dataset_model_changed)
-                self.dataset_model.rowsRemoved.disconnect(self._on_dataset_model_changed)
-                self.dataset_model.modelReset.disconnect(self._on_dataset_model_changed)
-        except Exception:
-            pass
-        super().closeEvent(event)
+        self.lbl_data_summary = QLabel("")
+        self.lbl_data_summary.setWordWrap(True)
+        lay.addWidget(self.lbl_data_summary)
+        self.tabs.addTab(tab, "1  Recordings")
 
     def dataset_paths(self):
-        return [self.dataset_list.item(i).text() for i in range(self.dataset_list.count())]
+        return [r["path"] for r in self._rows if r["item"].checkState() == Qt.Checked]
 
-    def add_dataset_paths(self, paths, clear=False):
+    def add_dataset_paths(self, paths, clear=False, check=True, check_legacy=True):
         if clear:
-            self.dataset_list.clear()
-        existing = {os.path.normcase(os.path.abspath(p)) for p in self.dataset_paths()}
+            self._rows = []
+            self.data_table.setRowCount(0)
+        existing = {os.path.normcase(os.path.abspath(r["path"])) for r in self._rows}
+        self.data_table.blockSignals(True)
         for path in list(paths or []):
             p = os.path.abspath(str(path).strip())
-            if not p or not os.path.isfile(p):
+            if not p or not os.path.isfile(p) or os.path.normcase(p) in existing:
                 continue
-            key = os.path.normcase(p)
-            if key in existing:
-                continue
-            self.dataset_list.addItem(p)
-            existing.add(key)
-        self.refresh_dataset_channel_info(force=True)
+            existing.add(os.path.normcase(p))
+            try:
+                info = ml_models.describe_session(p)
+            except Exception:
+                info = {"session": os.path.basename(p), "participant": "", "hand": "", "day": "", "rows": 0,
+                        "valid_pct": None, "format": "?", "size_mb": 0.0, "labels": ""}
+            channels, error = 0, ""
+            try:
+                channels = int(self.visualizer.detect_training_csv_channel_count(p))
+            except Exception as exc:
+                error = str(exc)
+            row = self.data_table.rowCount()
+            self.data_table.insertRow(row)
+            item = QTableWidgetItem("")
+            item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            is_new = info.get("format") == "continuous"
+            item.setCheckState(Qt.Checked if (check and not error and (is_new or check_legacy)) else Qt.Unchecked)
+            self.data_table.setItem(row, 0, item)
+            valid = info.get("valid_pct")
+            cells = [info.get("session", ""), info.get("participant", "") or "-", info.get("hand", "") or "-",
+                     str(info.get("day", "") or "-"), f"{int(info.get('rows', 0)):,}" if info.get("rows") else "-",
+                     f"{valid:.1f}%" if valid is not None else "-", str(channels) if channels else "error",
+                     "continuous" if is_new else "legacy pilot", f"{info.get('size_mb', 0.0):.1f} MB"]
+            for col, text in enumerate(cells, start=1):
+                cell = QTableWidgetItem(text)
+                cell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                if col == 7 and error:
+                    cell.setForeground(QColor("#f44336"))
+                    cell.setToolTip(error)
+                if col == 6 and valid is not None and valid < 98.0:
+                    cell.setForeground(QColor("#f57c00"))
+                self.data_table.setItem(row, col, cell)
+            item.setToolTip(p)
+            self._rows.append({"path": p, "info": info, "channels": channels, "error": error, "item": item, "row": row})
+        self.data_table.blockSignals(False)
+        self._refresh_data_summary()
+
+    def _set_all_checked(self, checked):
+        self.data_table.blockSignals(True)
+        for r in self._rows:
+            if not r["error"] and not self.data_table.isRowHidden(r["row"]):
+                r["item"].setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        self.data_table.blockSignals(False)
+        self._refresh_data_summary()
+
+    def _apply_filter(self, text):
+        needle = str(text or "").strip().lower()
+        for r in self._rows:
+            hay = " ".join(str(r["info"].get(k, "")) for k in ("session", "participant", "hand", "labels")).lower()
+            self.data_table.setRowHidden(r["row"], bool(needle) and needle not in hay)
+
+    def _on_data_item_changed(self, _item):
+        self._refresh_data_summary()
+
+    def on_remove_unchecked(self):
+        keep = [r["path"] for r in self._rows if r["item"].checkState() == Qt.Checked]
+        self.add_dataset_paths(keep, clear=True)
+
+    def on_scan_dataset(self):
+        root = self.visualizer._from_project_relative_path(getattr(self.visualizer, "record_save_dir", "") or DATASET_DIR)
+        if not os.path.isdir(root):
+            root = DATASET_DIR
+        found = ml_models.find_recordings(root)
+        if not found:
+            QMessageBox.information(self, "No Recordings", f"No signals_*.csv or emg_data_*.csv files found under:\n{root}")
+            return
+        self.set_status(f"Scanning {len(found)} recording(s)...", "#6a1b9a")
+        QApplication.processEvents()
+        # new continuous recordings are ticked; older pilot files (11 channels, different layout) are listed unticked
+        self.add_dataset_paths(found, check_legacy=False)
+        self.set_status(f"Found {len(found)} recording(s) in {root}", "#2e7d32")
+
+    def on_add_dataset_files(self):
+        start = self.visualizer._from_project_relative_path(getattr(self.visualizer, "record_save_dir", "") or DATASET_DIR)
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select Recording CSV Files", start, "CSV Files (*.csv);;All Files (*.*)")
+        self.add_dataset_paths([p for p in paths if not os.path.basename(p).startswith(("events_", "gaps_"))])
+
+    def on_add_dataset_folder(self):
+        start = self.visualizer._from_project_relative_path(getattr(self.visualizer, "record_save_dir", "") or DATASET_DIR)
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder With Recordings", start)
+        if not folder:
+            return
+        found = ml_models.find_recordings(folder)
+        if not found:
+            QMessageBox.information(self, "No Recordings", "No signals_*.csv or emg_data_*.csv files found in that folder.")
+            return
+        self.add_dataset_paths(found)
+
+    def _selected_rows(self):
+        return [r for r in self._rows if r["item"].checkState() == Qt.Checked]
+
+    def _channels_ok(self):
+        chosen = self._selected_rows()
+        counts = sorted({r["channels"] for r in chosen})
+        return bool(chosen) and len(counts) == 1 and counts[0] > 0, counts
+
+    def _refresh_data_summary(self):
+        if self._is_destroying:
+            return
+        chosen = self._selected_rows()
+        ok, counts = self._channels_ok()
+        frames = sum(int(r["info"].get("rows", 0) or 0) for r in chosen)
+        if not self._rows:
+            text, kind = "No recordings yet. Click 'Scan Dataset Folder' to list everything under the dataset folder.", "muted"
+        elif not chosen:
+            text, kind = "Tick at least one recording.", "muted"
+        elif not ok:
+            text, kind = (f"Selected recordings have different channel counts {counts}. Train on one layout at a time "
+                          "(untick the older 11-channel pilot files, or the newer 8-channel ones).", "danger")
+        else:
+            hands = sorted({str(r["info"].get("hand") or "-") for r in chosen})
+            people = sorted({str(r["info"].get("participant") or "-") for r in chosen})
+            text, kind = (f"{len(chosen)} recording(s) selected | {frames:,} frames | {counts[0]} channels | "
+                          f"participants: {', '.join(people)} | hands: {', '.join(hands)}", "success")
+        self.lbl_data_summary.setText(text)
+        self.lbl_data_summary.setStyleSheet(themed_label_style(kind))
         self.update_action_button_states()
+
+    # ---- step 2: models and settings -------------------------------------------------------
+    def _build_model_tab(self):
+        tab = QWidget()
+        outer = QHBoxLayout(tab)
+        outer.setSpacing(12)
+
+        left = QVBoxLayout()
+        left.addLayout(self._section("Models", "Tick every model you want to train and compare."))
+        self.model_list = QListWidget()
+        for spec in ml_models.MODEL_SPECS.values():
+            ok, why = spec.availability()
+            item = QListWidgetItem(f"{spec.name}   -   {spec.family}")
+            item.setData(Qt.UserRole, spec.key)
+            item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            item.setCheckState(Qt.Checked if spec.key == ml_models.DEFAULT_MODEL_KEY else Qt.Unchecked)
+            if not ok:
+                item.setFlags(Qt.ItemIsSelectable)
+                item.setCheckState(Qt.Unchecked)
+                item.setText(f"{spec.name}   -   unavailable")
+                item.setToolTip(why)
+            self.model_list.addItem(item)
+        self.model_list.currentItemChanged.connect(self._on_model_selected)
+        left.addWidget(self.model_list, 1)
+        quick = QHBoxLayout()
+        for text, keys in (("Recommended", ("random_forest", "svm_rbf", "cnn1d")), ("All", None), ("None", ())):
+            btn = QPushButton(text)
+            btn.setStyleSheet(themed_button_style("muted"))
+            btn.clicked.connect(lambda _c=False, k=keys: self._check_models(k))
+            quick.addWidget(btn)
+        left.addLayout(quick)
+        outer.addLayout(left, 4)
+
+        right = QVBoxLayout()
+        self.lbl_model_title = QLabel("")
+        self.lbl_model_title.setStyleSheet("font-weight: bold; font-size: 15px;")
+        right.addWidget(self.lbl_model_title)
+        self.lbl_model_desc = QLabel("")
+        self.lbl_model_desc.setWordWrap(True)
+        self.lbl_model_desc.setStyleSheet(themed_label_style("muted"))
+        right.addWidget(self.lbl_model_desc)
+        self.param_stack = QStackedWidget()
+        self._stack_index = {}
+        for key, spec in ml_models.MODEL_SPECS.items():
+            page = QWidget()
+            form = QFormLayout(page)
+            form.setSpacing(8)
+            self._param_widgets[key] = {}
+            if not spec.params:
+                form.addRow(QLabel("No settings: this model has no tunable parameters."))
+            for prm in spec.params:
+                if prm.kind == "int":
+                    w = QSpinBox()
+                    w.setRange(int(prm.minimum), int(prm.maximum))
+                    w.setSingleStep(int(prm.step))
+                    w.setValue(int(prm.default))
+                elif prm.kind == "float":
+                    w = QDoubleSpinBox()
+                    w.setDecimals(5 if prm.maximum <= 1.0 else 3)
+                    w.setRange(float(prm.minimum), float(prm.maximum))
+                    w.setSingleStep(float(prm.step))
+                    w.setValue(float(prm.default))
+                else:
+                    w = QComboBox()
+                    w.addItems(list(prm.choices))
+                    w.setCurrentText(str(prm.default))
+                if prm.tooltip:
+                    w.setToolTip(prm.tooltip)
+                form.addRow(prm.label + ":", w)
+                self._param_widgets[key][prm.key] = w
+            self._stack_index[key] = self.param_stack.addWidget(page)
+        right.addWidget(self.param_stack)
+
+        prep = QFormLayout()
+        prep.setSpacing(8)
+        right.addLayout(self._section("Data preparation"))
+        self.spin_window_ms = QSpinBox()
+        self.spin_window_ms.setRange(20, 4000)
+        self.spin_window_ms.setSuffix(" ms")
+        self.spin_window_ms.setValue(int(max(20, self.visualizer.analysis_ms_spin.value())))
+        self.spin_window_ms.setToolTip("Length of one analysis window. Longer windows are more accurate but react more slowly.")
+        prep.addRow("Window:", self.spin_window_ms)
+        self.spin_stride_ms = QSpinBox()
+        self.spin_stride_ms.setRange(5, 2000)
+        self.spin_stride_ms.setSuffix(" ms")
+        self.spin_stride_ms.setValue(50)
+        self.spin_stride_ms.setToolTip("Step between windows. Smaller = more (overlapping) training windows.")
+        prep.addRow("Stride:", self.spin_stride_ms)
+        self.spin_trim_ms = QSpinBox()
+        self.spin_trim_ms.setRange(0, 1500)
+        self.spin_trim_ms.setSingleStep(50)
+        self.spin_trim_ms.setSuffix(" ms")
+        self.spin_trim_ms.setValue(250)
+        self.spin_trim_ms.setToolTip("Cut this much from the start and end of every segment: the first moments of a "
+                                     "gesture are reaction time, not the gesture.")
+        prep.addRow("Trim segment edges:", self.spin_trim_ms)
+        self.spin_test_size = QDoubleSpinBox()
+        self.spin_test_size.setRange(0.05, 0.5)
+        self.spin_test_size.setDecimals(2)
+        self.spin_test_size.setSingleStep(0.05)
+        self.spin_test_size.setValue(0.20)
+        prep.addRow("Test share:", self.spin_test_size)
+        self.combo_split = QComboBox()
+        self.combo_split.addItem("Hold out segments (one recording is enough)", "segments")
+        self.combo_split.addItem("Hold out whole recordings (honest, needs 2+)", "recordings")
+        self.combo_split.setToolTip("'Whole recordings' tests on sessions the model never saw, which shows how it "
+                                    "will behave on a new session or person.")
+        prep.addRow("Test data:", self.combo_split)
+        self.spin_seed = QSpinBox()
+        self.spin_seed.setRange(0, 99999)
+        self.spin_seed.setValue(42)
+        prep.addRow("Random seed:", self.spin_seed)
+        self.check_balanced = QCheckBox("Balance classes (weight rare classes up)")
+        self.check_balanced.setChecked(True)
+        prep.addRow("", self.check_balanced)
+        self.check_auto_load_model = QCheckBox("Load the best model into the app after training")
+        self.check_auto_load_model.setChecked(True)
+        prep.addRow("", self.check_auto_load_model)
+        for i in range(prep.rowCount()):
+            field = prep.itemAt(i, QFormLayout.FieldRole)
+            if field is not None and field.widget() is not None and not isinstance(field.widget(), QCheckBox):
+                field.widget().setMinimumHeight(32)
+        right.addLayout(prep)
+
+        out = QFormLayout()
+        out.setSpacing(8)
+        row_out = QHBoxLayout()
+        self.output_dir_edit = QLineEdit("trained_model")
+        self.output_dir_edit.textChanged.connect(self._update_destination)
+        row_out.addWidget(self.output_dir_edit)
+        btn_browse = QPushButton("Browse")
+        btn_browse.setStyleSheet(themed_button_style("accent"))
+        btn_browse.clicked.connect(self.on_browse_output_dir)
+        row_out.addWidget(btn_browse)
+        wrap = QWidget()
+        wrap.setLayout(row_out)
+        out.addRow("Save in:", wrap)
+        self.run_name_edit = QLineEdit("run")
+        self.run_name_edit.textChanged.connect(self._update_destination)
+        out.addRow("Run name:", self.run_name_edit)
+        right.addLayout(out)
+        self.lbl_destination = QLabel("")
+        self.lbl_destination.setWordWrap(True)
+        self.lbl_destination.setStyleSheet(themed_label_style("muted"))
+        right.addWidget(self.lbl_destination)
+        right.addStretch()
+        outer.addLayout(right, 6)
+        self.tabs.addTab(tab, "2  Models")
+        self.model_list.setCurrentRow(0)
+        self._update_destination()
+
+    def _check_models(self, keys):
+        for i in range(self.model_list.count()):
+            item = self.model_list.item(i)
+            spec = ml_models.MODEL_SPECS[item.data(Qt.UserRole)]
+            if not spec.availability()[0]:
+                continue
+            on = (keys is None) or (spec.key in keys)
+            item.setCheckState(Qt.Checked if on else Qt.Unchecked)
+        self.update_action_button_states()
+
+    def _on_model_selected(self, current, _previous):
+        if current is None:
+            return
+        spec = ml_models.MODEL_SPECS[current.data(Qt.UserRole)]
+        ok, why = spec.availability()
+        self.lbl_model_title.setText(spec.name)
+        self.lbl_model_desc.setText(spec.summary + ("" if ok else f"\n\nUnavailable: {why}"))
+        self.param_stack.setCurrentIndex(self._stack_index[spec.key])
+
+    def _update_destination(self, *_args):
+        base = self.output_dir_edit.text().strip() or "trained_model"
+        run = self.visualizer._sanitize_filename_token(self.run_name_edit.text().strip() or "run")
+        self.lbl_destination.setText(f"Each model is saved as  {base}/<model folder>/{run}_<date_time>/   "
+                                     "e.g. random_forest, svm_rbf, cnn_1d.")
+
+    def on_browse_output_dir(self):
+        start = self.visualizer._from_project_relative_path(self.output_dir_edit.text().strip() or "trained_model")
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder For Trained Models", start)
+        if folder:
+            self.output_dir_edit.setText(self.visualizer._to_project_relative_path(folder))
+
+    def selected_model_keys(self):
+        keys = []
+        for i in range(self.model_list.count()):
+            item = self.model_list.item(i)
+            if item.checkState() == Qt.Checked:
+                keys.append(item.data(Qt.UserRole))
+        return keys
+
+    def _read_params(self, key):
+        out = {}
+        for pkey, w in self._param_widgets.get(key, {}).items():
+            out[pkey] = w.currentText() if isinstance(w, QComboBox) else w.value()
+        return out
 
     def apply_default_values(self, payload):
         payload = dict(payload or {})
-        self.add_dataset_paths(payload.get("dataset_paths", []), clear=True)
-
+        if payload.get("dataset_paths"):
+            self.add_dataset_paths(payload.get("dataset_paths", []), clear=True)
         self.spin_window_ms.setValue(int(max(20, payload.get("window_ms", self.spin_window_ms.value()))))
         self.spin_stride_ms.setValue(int(max(5, payload.get("stride_ms", self.spin_stride_ms.value()))))
-        self.spin_estimators.setValue(int(max(50, payload.get("n_estimators", self.spin_estimators.value()))))
-        self.spin_max_depth.setValue(int(max(0, payload.get("max_depth", self.spin_max_depth.value()))))
+        self.spin_trim_ms.setValue(int(max(0, payload.get("trim_ms", self.spin_trim_ms.value()))))
         self.spin_seed.setValue(int(max(0, payload.get("random_seed", self.spin_seed.value()))))
         self.spin_test_size.setValue(float(min(0.5, max(0.05, payload.get("test_size", self.spin_test_size.value())))))
         self.check_balanced.setChecked(bool(payload.get("class_weight_balanced", self.check_balanced.isChecked())))
         self.check_auto_load_model.setChecked(bool(payload.get("auto_load_model", self.check_auto_load_model.isChecked())))
-
+        idx = self.combo_split.findData("recordings" if str(payload.get("split_mode", "")).startswith("recordings") else "segments")
+        self.combo_split.setCurrentIndex(max(0, idx))
+        key = str(payload.get("model", "") or "")
+        if key in ml_models.MODEL_SPECS:
+            self._check_models((key,))
+            for pkey, value in dict(payload.get("model_params", {}) or {}).items():
+                w = self._param_widgets.get(key, {}).get(pkey)
+                if isinstance(w, QComboBox):
+                    w.setCurrentText(str(value))
+                elif w is not None:
+                    w.setValue(value)
         output_dir = str(payload.get("output_dir", self.output_dir_edit.text())).strip()
         if output_dir:
-            resolved_output_dir = self.visualizer._from_project_relative_path(output_dir)
-            self.output_dir_edit.setText(self.visualizer._to_project_relative_path(resolved_output_dir))
-        else:
-            self.output_dir_edit.setText("trained_model")
-
+            self.output_dir_edit.setText(self.visualizer._to_project_relative_path(
+                self.visualizer._from_project_relative_path(output_dir)))
         run_name = str(payload.get("run_name", self.run_name_edit.text())).strip()
         if run_name:
             self.run_name_edit.setText(run_name)
 
-    def on_add_dataset_files(self):
-        start_dir = self.visualizer._from_project_relative_path(
-            self.output_dir_edit.text().strip() or "trained_model"
-        )
-        paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Select Dataset CSV Files",
-            start_dir,
-            "CSV Files (*.csv);;All Files (*.*)",
-        )
-        self.add_dataset_paths(paths)
+    # ---- step 3: results -------------------------------------------------------------------
+    RESULT_COLUMNS = ["Model", "Accuracy", "Balanced acc.", "Macro F1", "Train time", "Predict", "Saved in"]
 
-    def on_add_dataset_folder(self):
-        start_dir = self.visualizer._from_project_relative_path(
-            self.output_dir_edit.text().strip() or "trained_model"
-        )
-        folder = QFileDialog.getExistingDirectory(self, "Select Dataset Folder", start_dir)
-        if not folder:
-            return
-        csv_paths = []
-        for root, _dirs, files in os.walk(folder):
-            for name in files:
-                if name.lower().endswith(".csv"):
-                    csv_paths.append(os.path.join(root, name))
-        csv_paths.sort()
-        if len(csv_paths) == 0:
-            QMessageBox.information(self, "No CSV", "No CSV files found in selected folder.")
-            return
-        self.add_dataset_paths(csv_paths)
+    def _build_results_tab(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setSpacing(8)
+        lay.addLayout(self._section("Comparison", "Accuracy is measured on windows the model did not train on. "
+                                    "'Predict' is the time for one live prediction, features included."))
+        self.compare_table = QTableWidget(0, len(self.RESULT_COLUMNS))
+        self.compare_table.setHorizontalHeaderLabels(self.RESULT_COLUMNS)
+        self.compare_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.compare_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.compare_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.compare_table.verticalHeader().setVisible(False)
+        self.compare_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.compare_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.compare_table.setStyleSheet(self._table_style())
+        self.compare_table.setMinimumHeight(80)
+        self.compare_table.itemSelectionChanged.connect(self._on_compare_selected)
+        lay.addWidget(self.compare_table)
 
-    def on_remove_selected_datasets(self):
-        selected = self.dataset_list.selectedItems()
-        if not selected:
+        row = QHBoxLayout()
+        self.btn_use_model = QPushButton("Use Selected Model In The App")
+        self.btn_use_model.setStyleSheet(themed_button_style("success"))
+        self.btn_use_model.clicked.connect(self.on_use_selected_model)
+        row.addWidget(self.btn_use_model)
+        self.btn_open_folder = QPushButton("Open Model Folder")
+        self.btn_open_folder.setStyleSheet(themed_button_style("accent"))
+        self.btn_open_folder.clicked.connect(self.on_open_run_folder)
+        row.addWidget(self.btn_open_folder)
+        row.addStretch()
+        lay.addLayout(row)
+
+        lay.addLayout(self._section("Summary"))
+        self.summary_text = QTextEdit()
+        self.summary_text.setReadOnly(True)
+        self.summary_text.setMaximumHeight(170)
+        self.summary_text.setStyleSheet(f"QTextEdit {{ font-family: {MONO_FONT_CSS}; font-size: 13px; }}")
+        lay.addWidget(self.summary_text)
+
+        lay.addLayout(self._section("Per-class report"))
+        self.report_text = QPlainTextEdit()
+        self.report_text.setObjectName("rfReportText")
+        self.report_text.setReadOnly(True)
+        self.report_text.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.report_text.setStyleSheet(
+            f"QPlainTextEdit#rfReportText {{ font-family: {MONO_FONT_CSS}; font-size: 13px; "
+            f"background-color: {THEME_COLORS['panel']}; color: {THEME_COLORS['text']}; "
+            f"border: 1px solid {THEME_COLORS['accent']}; border-radius: 6px; padding: 4px 6px; }}")
+        lay.addWidget(self.report_text, 1)
+
+        lay.addLayout(self._section("Confusion matrix", "Rows are the true gesture, columns the prediction."))
+        self.cm_table = QTableWidget(0, 0)
+        self.cm_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.cm_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.cm_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.cm_table.verticalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.cm_table.setMinimumHeight(200)
+        self.cm_table.setStyleSheet(self._table_style())
+        lay.addWidget(self.cm_table, 2)
+        self.results_tab = tab
+        self.tabs.addTab(tab, "3  Results")
+        self._update_result_buttons()
+
+    def _fill_comparison(self, runs, best_index=-1):
+        self._runs = list(runs or [])
+        self.compare_table.blockSignals(True)
+        self.compare_table.setRowCount(0)
+        accs = [float(r["metrics"].get("accuracy", 0.0)) for r in self._runs]
+        low, high = (min(accs), max(accs)) if accs else (0.0, 1.0)
+        base, top = self._hex_to_rgb(THEME_COLORS["panel"]), self._hex_to_rgb(THEME_COLORS["success"])
+        for i, run in enumerate(self._runs):
+            m = run["metrics"]
+            self.compare_table.insertRow(i)
+            name = run.get("model_name", "") + ("   (best)" if i == best_index else "")
+            cells = [name, f"{100 * m.get('accuracy', 0):.1f}%",
+                     f"{100 * m.get('balanced_accuracy', 0):.1f}%" if "balanced_accuracy" in m else "-",
+                     f"{100 * m.get('macro_f1', 0):.1f}%" if "macro_f1" in m else "-",
+                     f"{m['train_seconds']:.1f} s" if "train_seconds" in m else "-",
+                     f"{m['latency_ms']:.2f} ms" if "latency_ms" in m else "-",
+                     self.visualizer._to_project_relative_path(run.get("run_dir", ""))]
+            for col, text in enumerate(cells):
+                cell = QTableWidgetItem(text)
+                cell.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                if col == 1:
+                    t = (accs[i] - low) / (high - low) if high > low else 1.0
+                    rgb = self._blend_rgb(base, top, 0.35 + 0.65 * t)
+                    cell.setBackground(QColor(*rgb))
+                    cell.setTextAlignment(Qt.AlignCenter)
+                self.compare_table.setItem(i, col, cell)
+        self.compare_table.blockSignals(False)
+        # show every model without an inner scroll bar (up to ten rows)
+        header_h = self.compare_table.horizontalHeader().height() or 32
+        self.compare_table.setFixedHeight(header_h + 34 * min(10, max(1, len(self._runs))) + 6)
+        self.compare_table.verticalHeader().setDefaultSectionSize(34)
+        if self._runs:
+            self.compare_table.selectRow(best_index if best_index >= 0 else 0)
+        self._update_result_buttons()
+
+    def _on_compare_selected(self):
+        rows = self.compare_table.selectionModel().selectedRows() if self.compare_table.selectionModel() else []
+        if rows and 0 <= rows[0].row() < len(self._runs):
+            self.apply_training_result(self._runs[rows[0].row()], update_table=False)
+        self._update_result_buttons()
+
+    def _selected_run(self):
+        rows = self.compare_table.selectionModel().selectedRows() if self.compare_table.selectionModel() else []
+        if rows and 0 <= rows[0].row() < len(self._runs):
+            return self._runs[rows[0].row()]
+        return None
+
+    def _update_result_buttons(self):
+        has = self._selected_run() is not None
+        for btn in (self.btn_use_model, self.btn_open_folder):
+            btn.setEnabled(has and not self._is_training)
+
+    def on_use_selected_model(self):
+        run = self._selected_run()
+        if run is None or not run.get("model_path"):
             return
-        rows = sorted((self.dataset_list.row(it) for it in selected), reverse=True)
-        for row in rows:
-            self.dataset_list.takeItem(row)
+        try:
+            self.visualizer.load_rf_model(run["model_path"])
+            self.set_status(f"{run.get('model_name', 'Model')} loaded into the app.", "#2e7d32")
+        except Exception as exc:
+            QMessageBox.warning(self, "Load Model", str(exc))
+
+    def on_open_run_folder(self):
+        run = self._selected_run()
+        if run is None:
+            return
+        from PyQt5.QtCore import QUrl
+        from PyQt5.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(run.get("run_dir", ""))))
+
+    def apply_training_result(self, result, update_table=True):
+        result = dict(result or {})
+        self.current_model_path = str(result.get("model_path", "")).strip()
+        self.current_run_dir = str(result.get("run_dir", "")).strip()
+        if update_table and "runs" not in result:
+            self._fill_comparison([result], 0)
+        self.summary_text.setPlainText(str(result.get("summary_text", "")).strip())
+        report_text = str(result.get("report_text", ""))
+        self.report_text.setPlainText(report_text.rstrip("\n") if report_text.strip() else "")
+        class_names = [str(x) for x in list(result.get("classes", []))]
+        cm_list = result.get("cm", [])
+        cm = np.asarray(cm_list, dtype=np.int32) if len(cm_list) > 0 else np.zeros((0, 0), dtype=np.int32)
+        self.populate_confusion_matrix(cm if cm.ndim == 2 else np.zeros((0, 0), dtype=np.int32), class_names)
         self.update_action_button_states()
 
-    def on_clear_datasets(self):
-        self.dataset_list.clear()
-        self.update_action_button_states()
+    def populate_confusion_matrix(self, cm, class_names):
+        if cm.size == 0:
+            self.cm_table.clear()
+            self.cm_table.setRowCount(0)
+            self.cm_table.setColumnCount(0)
+            return
+        rows, cols = int(cm.shape[0]), int(cm.shape[1])
+        labels = list(class_names) if len(class_names) == rows else [f"C{i + 1}" for i in range(rows)]
+        self.cm_table.clear()
+        self.cm_table.setRowCount(rows)
+        self.cm_table.setColumnCount(cols)
+        self.cm_table.setHorizontalHeaderLabels(labels)
+        self.cm_table.setVerticalHeaderLabels(labels)
+        base_rgb, high_rgb = self._hex_to_rgb(THEME_COLORS["panel"]), self._hex_to_rgb(THEME_COLORS["success"])
+        text_rgb = self._hex_to_rgb(THEME_COLORS["text"], fallback=(232, 238, 240))
+        muted_rgb = self._hex_to_rgb(THEME_COLORS["muted"], fallback=(169, 194, 207))
+        row_totals = np.maximum(1, cm.sum(axis=1))
+        for r in range(rows):
+            for c in range(cols):
+                val = int(cm[r, c])
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(Qt.AlignCenter)
+                ratio = val / float(row_totals[r])          # share of that gesture, so rare classes stay visible
+                if r != c and val > 0:
+                    rgb = self._blend_rgb(base_rgb, self._hex_to_rgb(THEME_COLORS["special"]), min(1.0, 3 * ratio))
+                else:
+                    rgb = self._blend_rgb(base_rgb, high_rgb, ratio)
+                item.setBackground(QColor(*rgb))
+                fg = muted_rgb if val <= 0 else text_rgb
+                item.setForeground(QColor(*fg))
+                self.cm_table.setItem(r, c, item)
 
-    def on_browse_output_dir(self):
-        start_dir = self.visualizer._from_project_relative_path(
-            self.output_dir_edit.text().strip() or "trained_model"
-        )
-        folder = QFileDialog.getExistingDirectory(self, "Select Training Output Base Folder", start_dir)
-        if folder:
-            self.output_dir_edit.setText(self.visualizer._to_project_relative_path(folder))
+    # ---- training --------------------------------------------------------------------------
+    def update_action_button_states(self):
+        if self._is_destroying:
+            return
+        try:
+            ok, _counts = self._channels_ok()
+            can = ok and bool(self.selected_model_keys()) and not self._is_training
+            self.btn_train.setEnabled(can)
+            self.btn_stop.setEnabled(self._is_training)
+            self.btn_load_previous.setEnabled(not self._is_training)
+            tip = "" if can else "Tick compatible recordings (step 1) and at least one model (step 2)."
+            self.btn_train.setToolTip(tip)
+            self._update_result_buttons()
+        except RuntimeError:
+            return
 
     def build_training_config(self):
         csv_paths = self.dataset_paths()
-        if len(csv_paths) == 0:
-            raise ValueError("Select at least one dataset CSV file.")
-
-        output_dir = self.output_dir_edit.text().strip() or "trained_model"
-        run_name = self.visualizer._sanitize_filename_token(self.run_name_edit.text().strip() or "rf_training")
-
+        if not csv_paths:
+            raise ValueError("Tick at least one recording in step 1.")
+        keys = self.selected_model_keys()
+        if not keys:
+            raise ValueError("Tick at least one model in step 2.")
         return {
             "dataset_paths": csv_paths,
-            "output_dir": output_dir,
-            "run_name": run_name,
+            "output_dir": self.output_dir_edit.text().strip() or "trained_model",
+            "run_name": self.visualizer._sanitize_filename_token(self.run_name_edit.text().strip() or "run"),
+            "models": keys,
+            "model_params": {k: self._read_params(k) for k in keys},
             "window_ms": int(self.spin_window_ms.value()),
             "stride_ms": int(self.spin_stride_ms.value()),
-            "n_estimators": int(self.spin_estimators.value()),
-            "max_depth": int(self.spin_max_depth.value()),
+            "trim_ms": int(self.spin_trim_ms.value()),
             "random_seed": int(self.spin_seed.value()),
             "test_size": float(self.spin_test_size.value()),
+            "split_mode": str(self.combo_split.currentData()),
             "class_weight_balanced": bool(self.check_balanced.isChecked()),
             "auto_load_model": bool(self.check_auto_load_model.isChecked()),
         }
@@ -3271,37 +3544,51 @@ class RFTrainingDialog(QDialog):
                 QMessageBox.warning(self, "Training Setup", "Finish or cancel the active data collection session before training.")
                 return
             if len(getattr(self.visualizer, "record_save_workers", [])) > 0:
-                QMessageBox.warning(self, "Training Setup", "A recorded CSV is still saving. Wait for the save to finish before training.")
+                QMessageBox.warning(self, "Training Setup", "A recording is still being saved. Wait for it to finish before training.")
                 return
             config = self.build_training_config()
         except Exception as e:
             QMessageBox.warning(self, "Training Setup", str(e))
             return
-
         self._is_training = True
+        self.progress.setValue(0)
         self.update_action_button_states()
         self.set_status("Training started...", "#6a1b9a")
         self.training_worker = RFTrainingWorker(self.visualizer, config, self)
         self.training_worker.status_updated.connect(self.set_status)
+        self.training_worker.progress_updated.connect(self._on_progress)
         self.training_worker.training_completed.connect(self.on_training_completed)
         self.training_worker.training_failed.connect(self.on_training_failed)
         self.training_worker.finished.connect(self.on_training_worker_finished)
         self.training_worker.start(QThread.LowPriority)
 
+    def _on_progress(self, percent, text):
+        self.progress.setValue(int(percent))
+        if text:
+            self.progress.setFormat(f"%p%  {text}")
+
+    def on_stop_clicked(self):
+        if self.training_worker is not None:
+            self.training_worker.cancel()
+            self.btn_stop.setEnabled(False)
+            self.set_status("Stopping after the current model...", "#f57c00")
+
     def on_training_completed(self, result):
-        self.apply_training_result(result)
-        self.tabs.setCurrentWidget(self.results_tab)
         result = dict(result or {})
-        should_auto_load = bool(dict(result.get("config", {})).get("auto_load_model", False))
+        runs = result.get("runs") or [result]
+        best = int(result.get("best_index", 0))
+        self._fill_comparison(runs, best)
+        self.apply_training_result(runs[best] if runs else result, update_table=False)
+        self.tabs.setCurrentWidget(self.results_tab)
         model_path = str(result.get("model_path", "")).strip()
-        if should_auto_load and model_path:
+        if bool(dict(result.get("config", {})).get("auto_load_model", False)) and model_path:
             try:
                 artifact = result.get("artifact", None)
                 if isinstance(artifact, dict):
                     self.visualizer.apply_rf_model_artifact(artifact, model_path)
                 else:
                     self.visualizer.load_rf_model(model_path)
-                self.set_status("Training complete and model loaded.", "#2e7d32")
+                self.set_status(f"Training complete. {result.get('model_name', 'Best model')} loaded into the app.", "#2e7d32")
             except Exception as e:
                 self.set_status("Training complete; model load failed.", "#f57c00")
                 QMessageBox.warning(self, "Model Load", str(e))
@@ -3309,7 +3596,7 @@ class RFTrainingDialog(QDialog):
             self.set_status("Training complete.", "#2e7d32")
 
     def on_training_failed(self, detail):
-        QMessageBox.critical(self, "RF Training Error", str(detail))
+        QMessageBox.critical(self, "Training Error", str(detail))
         self.set_status("Training failed.", "#c62828")
 
     def on_training_worker_finished(self):
@@ -3317,95 +3604,42 @@ class RFTrainingDialog(QDialog):
             self.training_worker.deleteLater()
             self.training_worker = None
         self._is_training = False
+        self.progress.setFormat("%p%")
         self.update_action_button_states()
 
     def on_load_previous_run(self):
-        start_dir = self.visualizer._from_project_relative_path(
-            self.output_dir_edit.text().strip() or "trained_model"
-        )
-        folder = QFileDialog.getExistingDirectory(self, "Select Saved Training Run Folder", start_dir)
+        start = self.visualizer._from_project_relative_path(self.output_dir_edit.text().strip() or "trained_model")
+        folder = QFileDialog.getExistingDirectory(self, "Select A Saved Training Run Folder", start)
         if not folder:
             return
         try:
             loaded = self.visualizer.load_saved_training_run(folder)
             setup = dict(loaded.get("config", {}))
-            if "dataset_paths" not in setup:
-                setup["dataset_paths"] = loaded.get("dataset_paths", [])
-            if "output_dir" not in setup:
-                setup["output_dir"] = os.path.dirname(os.path.abspath(folder))
-            if "run_name" not in setup:
-                setup["run_name"] = os.path.basename(os.path.abspath(folder))
+            setup.setdefault("dataset_paths", loaded.get("dataset_paths", []))
             self.apply_default_values(setup)
             result = loaded.get("result", {})
             if result:
-                self.apply_training_result(result)
+                result = dict(result)
+                result.setdefault("model_name", str(setup.get("model_name", "Saved run")))
+                result.setdefault("metrics", {})
+                self._fill_comparison([result], 0)
+                self.apply_training_result(result, update_table=False)
                 self.tabs.setCurrentWidget(self.results_tab)
-            self.set_status("Loaded previous run.", "#2e7d32")
-            self.update_action_button_states()
+            self.set_status("Opened previous run.", "#2e7d32")
         except Exception as e:
-            QMessageBox.warning(self, "Load Run", str(e))
-            self.set_status("Failed to load run.", "#c62828")
+            QMessageBox.warning(self, "Open Run", str(e))
+            self.set_status("Failed to open run.", "#c62828")
 
-    def apply_training_result(self, result):
-        result = dict(result or {})
-        self.current_model_path = str(result.get("model_path", "")).strip()
-        self.current_run_dir = str(result.get("run_dir", "")).strip()
-        self.update_action_button_states()
-
-        summary_text = str(result.get("summary_text", "")).strip()
-        if summary_text:
-            self.summary_text.setPlainText(summary_text)
-        else:
-            self.summary_text.clear()
-
-        report_text = str(result.get("report_text", ""))
-        if report_text.strip():
-            self.report_text.setPlainText(report_text.rstrip("\n"))
-        else:
-            self.report_text.clear()
-
-        class_names = [str(x) for x in list(result.get("classes", []))]
-        cm_list = result.get("cm", [])
-        cm = np.asarray(cm_list, dtype=np.int32) if len(cm_list) > 0 else np.zeros((0, 0), dtype=np.int32)
-        if cm.ndim != 2:
-            cm = np.zeros((0, 0), dtype=np.int32)
-        self.populate_confusion_matrix(cm, class_names)
-
-    def populate_confusion_matrix(self, cm, class_names):
-        if cm.size == 0:
-            self.cm_table.clear()
-            self.cm_table.setRowCount(0)
-            self.cm_table.setColumnCount(0)
+    def closeEvent(self, event):
+        if self._is_training:
+            QMessageBox.information(self, "Training Running", "Wait for training to finish (or press Stop) before closing this window.")
+            event.ignore()
             return
+        self._is_destroying = True
+        super().closeEvent(event)
 
-        rows = int(cm.shape[0])
-        cols = int(cm.shape[1])
-        labels = list(class_names)
-        if len(labels) != rows:
-            labels = [f"C{i + 1}" for i in range(rows)]
 
-        self.cm_table.clear()
-        self.cm_table.setRowCount(rows)
-        self.cm_table.setColumnCount(cols)
-        self.cm_table.setHorizontalHeaderLabels(labels)
-        self.cm_table.setVerticalHeaderLabels(labels)
-
-        max_val = max(1, int(np.max(cm)))
-        base_rgb = self._hex_to_rgb(THEME_COLORS["panel"])
-        high_rgb = self._hex_to_rgb(THEME_COLORS["success"])
-        text_rgb = self._hex_to_rgb(THEME_COLORS["text"], fallback=(232, 238, 240))
-        muted_rgb = self._hex_to_rgb(THEME_COLORS["muted"], fallback=(169, 194, 207))
-        for r in range(rows):
-            for c in range(cols):
-                val = int(cm[r, c])
-                item = QTableWidgetItem(str(val))
-                item.setTextAlignment(Qt.AlignCenter)
-                ratio = (val / max_val) if max_val > 0 else 0.0
-                rgb = self._blend_rgb(base_rgb, high_rgb, ratio)
-                item.setBackground(QColor(rgb[0], rgb[1], rgb[2]))
-                fg = muted_rgb if val <= 0 else text_rgb
-                item.setForeground(QColor(fg[0], fg[1], fg[2]))
-                self.cm_table.setItem(r, c, item)
+RFTrainingDialog = ModelTrainingDialog   # old name, kept for any external reference
 
 
 class ClassLabelEditorDialog(QDialog):
@@ -5309,6 +5543,8 @@ class EMGVisualizer(QMainWindow):
         self.contact_quality = []
         self.analysis_window = None
         self.rf_model = None
+        self.rf_model_input_kind = "features"
+        self.rf_model_type_name = ""
         self.rf_class_names = []
         self.rf_window_samples = 100
         self.rf_stride_samples = 0
@@ -5630,6 +5866,13 @@ class EMGVisualizer(QMainWindow):
         self.main_layout.addLayout(controls_layout)
         self.main_layout.addSpacing(6)
 
+        # Workflow bar: shows where you are (connect > calibrate > collect > train > classify) and what to do next.
+        self.lbl_workflow = StableLabel("")
+        self.lbl_workflow.setTextFormat(Qt.RichText)
+        self.lbl_workflow.setWordWrap(True)
+        self.main_layout.addWidget(self.lbl_workflow)
+        self.main_layout.addSpacing(4)
+
         info_actions_layout = QHBoxLayout()
         info_actions_layout.setSpacing(12)
         info_actions_layout.setAlignment(Qt.AlignTop)
@@ -5641,7 +5884,7 @@ class EMGVisualizer(QMainWindow):
         self.lbl_status.setStyleSheet(themed_label_style("muted"))
         info_text_layout.addWidget(self.lbl_status)
 
-        self.lbl_rf = StableLabel("RF Model: Not loaded")
+        self.lbl_rf = StableLabel("Model: Not loaded")
         self.lbl_rf.setStyleSheet(themed_label_style("muted"))
         info_text_layout.addWidget(self.lbl_rf)
         info_actions_layout.addLayout(info_text_layout, 0)
@@ -5652,21 +5895,25 @@ class EMGVisualizer(QMainWindow):
         buttons_layout.setSpacing(12)
 
         self.btn_data_collection = QPushButton("Data Collection")
+        self.btn_data_collection.setToolTip("Record labelled gesture data with the guided study protocol.")
         self.btn_data_collection.setStyleSheet(themed_button_style("accent"))
         self.btn_data_collection.clicked.connect(self.open_data_collection_dialog)
         buttons_layout.addWidget(self.btn_data_collection)
 
         self.btn_train_model = QPushButton("Train Model")
+        self.btn_train_model.setToolTip("Train and compare gesture models (Random Forest, SVM, 1D CNN, ...) on recorded data.")
         self.btn_train_model.setStyleSheet(themed_button_style("accent"))
         self.btn_train_model.clicked.connect(self.train_rf_from_app)
         buttons_layout.addWidget(self.btn_train_model)
 
         self.btn_load_trained_model = QPushButton("Load Trained Model")
+        self.btn_load_trained_model.setToolTip("Load a saved model (.joblib) from trained_model/<model name>/.")
         self.btn_load_trained_model.setStyleSheet(themed_button_style("accent"))
         self.btn_load_trained_model.clicked.connect(self.load_rf_model_dialog)
         buttons_layout.addWidget(self.btn_load_trained_model)
 
         self.btn_realtime_classification = QPushButton("Real-time Classification")
+        self.btn_realtime_classification.setToolTip("Show live gesture predictions from the loaded model.")
         self.btn_realtime_classification.setStyleSheet(themed_button_style("accent"))
         self.btn_realtime_classification.clicked.connect(self.open_realtime_classification_window)
         buttons_layout.addWidget(self.btn_realtime_classification)
@@ -6081,12 +6328,12 @@ class EMGVisualizer(QMainWindow):
             self.reset_fps_counters()
             self.set_status("Wireless connected - calibration required", "#ff9800")
             if self.rf_model is not None:
-                model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+                model_name = self.current_model_label()
                 self.rf_last_status_reason = "Waiting calibrated stream..."
-                self.lbl_rf.setText(f"RF Model: {model_name} | Waiting calibrated stream...")
+                self.lbl_rf.setText(f"Model: {model_name} | Waiting calibrated stream...")
                 self.lbl_rf.setStyleSheet(themed_label_style("success"))
             else:
-                self.lbl_rf.setText("RF Model: Not loaded")
+                self.lbl_rf.setText("Model: Not loaded")
                 self.lbl_rf.setStyleSheet(themed_label_style("muted"))
 
             if dialog is not None:
@@ -6255,12 +6502,12 @@ class EMGVisualizer(QMainWindow):
             self.reset_fps_counters()
             self.set_status("Connected - calibration required", "#ff9800")
             if self.rf_model is not None:
-                model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+                model_name = self.current_model_label()
                 self.rf_last_status_reason = "Waiting calibrated stream..."
-                self.lbl_rf.setText(f"RF Model: {model_name} | Waiting calibrated stream...")
+                self.lbl_rf.setText(f"Model: {model_name} | Waiting calibrated stream...")
                 self.lbl_rf.setStyleSheet(themed_label_style("success"))
             else:
-                self.lbl_rf.setText("RF Model: Not loaded")
+                self.lbl_rf.setText("Model: Not loaded")
                 self.lbl_rf.setStyleSheet(themed_label_style("muted"))
             self.sync_port_dialog_state()
             self.sync_calibration_dialog_state()
@@ -6323,12 +6570,12 @@ class EMGVisualizer(QMainWindow):
         self.reset_link_labels()
         self.set_waiting_for_calibration_labels()
         if self.rf_model is not None:
-            model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+            model_name = self.current_model_label()
             self.rf_last_status_reason = "Disconnected"
-            self.lbl_rf.setText(f"RF Model: {model_name} | Disconnected")
+            self.lbl_rf.setText(f"Model: {model_name} | Disconnected")
             self.lbl_rf.setStyleSheet(themed_label_style("success"))
         else:
-            self.lbl_rf.setText("RF Model: Not loaded")
+            self.lbl_rf.setText("Model: Not loaded")
             self.lbl_rf.setStyleSheet(themed_label_style("muted"))
         self.sync_port_dialog_state()
         self.sync_calibration_dialog_state()
@@ -6766,11 +7013,11 @@ class EMGVisualizer(QMainWindow):
                 "#ff9800",
             )
             if self.rf_model is not None:
-                model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
-                self.lbl_rf.setText(f"RF Model: {model_name} | Waiting calibrated stream...")
+                model_name = self.current_model_label()
+                self.lbl_rf.setText(f"Model: {model_name} | Waiting calibrated stream...")
                 self.lbl_rf.setStyleSheet(themed_label_style("success"))
             else:
-                self.lbl_rf.setText("RF Model: Not loaded")
+                self.lbl_rf.setText("Model: Not loaded")
                 self.lbl_rf.setStyleSheet(themed_label_style("muted"))
             self.sync_port_dialog_state()
             self.sync_calibration_dialog_state()
@@ -6853,6 +7100,7 @@ class EMGVisualizer(QMainWindow):
     def on_realtime_classification_window_closed(self):
         self.realtime_classification_window = None
 
+    @staticmethod
     def expected_rf_feature_count(num_channels):
         n_ch = int(max(1, num_channels))
         per_channel_features = 15
@@ -6875,15 +7123,15 @@ class EMGVisualizer(QMainWindow):
         reason_text = str(reason or "").strip()
         self.rf_last_status_reason = reason_text
         if self.rf_model is None:
-            self.lbl_rf.setText("RF Model: Not loaded")
+            self.lbl_rf.setText("Model: Not loaded")
             self.lbl_rf.setStyleSheet(themed_label_style("muted"))
             return
-        model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+        model_name = self.current_model_label()
         if reason_text:
-            self.lbl_rf.setText(f"RF Model: {model_name} | {reason_text}")
+            self.lbl_rf.setText(f"Model: {model_name} | {reason_text}")
         else:
             self.lbl_rf.setText(
-                f"RF Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
+                f"Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
             )
         self.lbl_rf.setStyleSheet(themed_label_style(style_kind))
 
@@ -6976,9 +7224,9 @@ class EMGVisualizer(QMainWindow):
         )
 
         if self.rf_model is not None:
-            model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+            model_name = self.current_model_label()
             self.lbl_rf.setText(
-                f"RF Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
+                f"Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
             )
             self.lbl_rf.setStyleSheet(themed_label_style("success"))
 
@@ -7000,7 +7248,7 @@ class EMGVisualizer(QMainWindow):
 
     def get_realtime_classification_payload(self):
         model_loaded = self.rf_model is not None
-        model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Not loaded"
+        model_name = self.current_model_label("Not loaded")
         model_path_text = self._to_project_relative_path(self.rf_model_path) if self.rf_model_path else "N/A"
 
         if model_loaded:
@@ -7053,14 +7301,14 @@ class EMGVisualizer(QMainWindow):
             self.rf_last_prediction_ts = 0.0
             self.rf_valid_sample_count = 0
             self.rf_last_status_reason = "Model not loaded"
-            self.lbl_rf.setText("RF Model: Not loaded")
+            self.lbl_rf.setText("Model: Not loaded")
             self.lbl_rf.setStyleSheet(themed_label_style("muted"))
             return
 
-        model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+        model_name = self.current_model_label()
         if self.data_buffer is not None and self.data_buffer.shape[0] < int(max(1, self.rf_model_input_channels)):
             self.lbl_rf.setText(
-                f"RF Model: {model_name} | Incompatible channels "
+                f"Model: {model_name} | Incompatible channels "
                 f"(needs {self.rf_model_input_channels}, stream has {self.data_buffer.shape[0]})"
             )
             self.lbl_rf.setStyleSheet(themed_label_style("muted"))
@@ -7069,13 +7317,21 @@ class EMGVisualizer(QMainWindow):
             )
             return
         if self.rf_last_status_reason:
-            self.lbl_rf.setText(f"RF Model: {model_name} | {self.rf_last_status_reason}")
+            self.lbl_rf.setText(f"Model: {model_name} | {self.rf_last_status_reason}")
             self.lbl_rf.setStyleSheet(themed_label_style("success"))
             return
         self.lbl_rf.setText(
-            f"RF Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
+            f"Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
         )
         self.lbl_rf.setStyleSheet(themed_label_style("success"))
+
+    def current_model_label(self, fallback="Loaded"):
+        """'Random Forest - run_20261105_101500' style name of the loaded model for the status line."""
+        if not self.rf_model_path:
+            return fallback
+        run = os.path.basename(os.path.dirname(self.rf_model_path)) or os.path.basename(self.rf_model_path)
+        kind = self.rf_model_type_name or os.path.basename(self.rf_model_path)
+        return f"{kind} - {run}"
 
     def load_rf_model_dialog(self):
         if not HAS_RF_FEATURES:
@@ -7089,7 +7345,7 @@ class EMGVisualizer(QMainWindow):
         start_dir = os.path.dirname(self.rf_model_path) if self.rf_model_path else TRAINED_MODEL_DIR
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select RF Model Artifact",
+            "Select Trained Model (.joblib)",
             start_dir,
             "Joblib Files (*.joblib);;All Files (*.*)",
         )
@@ -7103,7 +7359,7 @@ class EMGVisualizer(QMainWindow):
             artifact = joblib.load(path)
             self.apply_rf_model_artifact(artifact, path)
         except Exception as e:
-            QMessageBox.critical(self, "RF Model Load Error", str(e))
+            QMessageBox.critical(self, "Model Load Error", str(e))
 
     def apply_rf_model_artifact(self, artifact, path=""):
         try:
@@ -7115,8 +7371,11 @@ class EMGVisualizer(QMainWindow):
             if not class_names and hasattr(model, "classes_"):
                 class_names = [str(x) for x in list(getattr(model, "classes_", []))]
 
+            input_kind = str(artifact.get("input_kind", "features") or "features")
+            if input_kind == "window" and not ml_models.torch_available():
+                raise ValueError("This model is a 1D CNN and needs PyTorch to run. Install it with:  pip install torch")
             artifact_input_channels = artifact.get("input_channels", None)
-            model_feature_count = int(getattr(model, "n_features_in_", 0) or 0)
+            model_feature_count = 0 if input_kind == "window" else int(getattr(model, "n_features_in_", 0) or 0)
             if model_feature_count <= 0:
                 try:
                     model_feature_count = int(len(artifact.get("feature_names", []) or []))
@@ -7146,6 +7405,8 @@ class EMGVisualizer(QMainWindow):
                     )
 
             self.rf_model = model
+            self.rf_model_input_kind = input_kind
+            self.rf_model_type_name = str(artifact.get("model_name", "") or "Random Forest")
             self.rf_class_names = [str(x) for x in class_names]
             self.rf_window_samples = int(max(8, artifact.get("window_samples", 100)))
             self.rf_stride_samples = int(max(1, artifact.get("stride_samples", self.rf_window_samples)))
@@ -7169,7 +7430,8 @@ class EMGVisualizer(QMainWindow):
             # Warm up the forest so the first real prediction isn't slowed by lazy init.
             self._warm_up_rf_model(model, input_channels)
             if self.rf_worker is not None:
-                self.rf_worker.set_model(self.rf_model, self.rf_class_names, sample_rate=self.rf_model_sample_rate)
+                self.rf_worker.set_model(self.rf_model, self.rf_class_names, sample_rate=self.rf_model_sample_rate,
+                                         input_kind=self.rf_model_input_kind)
             self.request_realtime_prediction()
 
             if self.rf_last_status_reason:
@@ -7181,12 +7443,13 @@ class EMGVisualizer(QMainWindow):
 
     def _warm_up_rf_model(self, model, input_channels):
         """Run one throwaway prediction so first live inference isn't slowed by lazy init."""
-        if model is None or not HAS_RF_FEATURES or rf_extract_window_features is None:
+        windowed = getattr(self, "rf_model_input_kind", "features") == "window"
+        if model is None or (not windowed and (not HAS_RF_FEATURES or rf_extract_window_features is None)):
             return
         try:
             n_ch = int(max(1, input_channels))
             win = np.zeros((int(max(8, self.rf_window_samples)), n_ch), dtype=np.float32)
-            feats = rf_extract_window_features(win, sample_rate=self.rf_model_sample_rate).reshape(1, -1)
+            feats = win[None] if windowed else rf_extract_window_features(win, sample_rate=self.rf_model_sample_rate).reshape(1, -1)
             if hasattr(model, "predict_proba"):
                 model.predict_proba(feats)
             else:
@@ -7401,17 +7664,7 @@ class EMGVisualizer(QMainWindow):
         csv_path = cls._from_project_relative_path(path)
         if not csv_path or not os.path.isfile(csv_path):
             raise ValueError(f"Dataset CSV not found: {path}")
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            if reader.fieldnames is None:
-                raise ValueError("CSV has no header.")
-            field_map = {str(name).strip().lower(): str(name).strip() for name in list(reader.fieldnames)}
-            if "label" not in field_map:
-                raise ValueError("CSV missing required column: Label")
-            channel_cols = cls._active_channel_columns_from_csv(csv_path)
-            if len(channel_cols) == 0:
-                raise ValueError("CSV must contain channel columns (Ch1..ChN)")
-            return int(len(channel_cols))
+        return int(ml_models.detect_channel_count(csv_path))
 
     def recorded_sample_count(self):
         """Frames written so far by the continuous recorder (valid and gap frames)."""
@@ -7833,65 +8086,9 @@ class EMGVisualizer(QMainWindow):
 
     @classmethod
     def load_segments_from_record_csv(cls, path):
-        segments = []
+        """Segments of one recording (perform/rest frames only, gaps never bridged); see ml_models.load_segments."""
         csv_path = cls._from_project_relative_path(path)
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            if reader.fieldnames is None:
-                raise ValueError("CSV has no header.")
-            field_map = {str(name).strip().lower(): str(name).strip() for name in list(reader.fieldnames)}
-            label_col = field_map.get("label", "")
-            trial_col = field_map.get("trial_id", "")
-            phase_col = field_map.get("phase", "")
-            valid_col = field_map.get("valid", "")
-            channel_cols = cls._active_channel_columns_from_csv(csv_path)
-            if not label_col:
-                raise ValueError("CSV missing required column: Label")
-            if len(channel_cols) == 0:
-                raise ValueError("CSV must contain at least one channel column (Ch1..ChN).")
-
-            current_key = None
-            current_label = None
-            buf = []
-            for row in reader:
-                label = str(row.get(label_col, "")).strip()
-                if not label:
-                    continue
-                phase = str(row.get(phase_col, "")).strip() if phase_col else ""
-                invalid = bool(valid_col) and str(row.get(valid_col, "1")).strip() == "0"
-                # Continuous recordings also contain prepare/settle/break/pause/aborted frames and
-                # NaN gap frames: only task (perform) and rest frames are training data, and a gap
-                # ends the current segment instead of being bridged.
-                if invalid or (phase and phase.lower() not in ("perform", "rest")):
-                    if len(buf) > 0 and current_label:
-                        segments.append((current_label, np.asarray(buf, dtype=np.float32)))
-                    buf, current_key, current_label = [], None, None
-                    continue
-                trial = str(row.get(trial_col, "1")).strip() if trial_col else "1"
-                key = (label, trial, phase)
-                try:
-                    sample = []
-                    for ch_name in channel_cols:
-                        raw_val = str(row.get(ch_name, "")).strip()
-                        sample.append(float(raw_val) if raw_val != "" else 0.0)
-                except Exception:
-                    continue
-
-                if current_key is None:
-                    current_key = key
-                    current_label = label
-                if key != current_key:
-                    if len(buf) > 0 and current_label:
-                        segments.append((current_label, np.asarray(buf, dtype=np.float32)))
-                    buf = []
-                    current_key = key
-                    current_label = label
-
-                buf.append(sample)
-
-            if len(buf) > 0 and current_label:
-                segments.append((current_label, np.asarray(buf, dtype=np.float32)))
-        return segments, int(len(channel_cols))
+        return ml_models.load_segments(csv_path)
 
     def train_rf_from_app(self):
         self.open_rf_training_dialog()
@@ -7903,7 +8100,7 @@ class EMGVisualizer(QMainWindow):
             return
 
         setup = self.default_rf_training_setup()
-        self.training_dialog = RFTrainingDialog(self, self)
+        self.training_dialog = ModelTrainingDialog(self, self)
         self.training_dialog.apply_default_values(setup)
         self.training_dialog.finished.connect(lambda _result: setattr(self, "training_dialog", None))
         center_window(self.training_dialog, self)
@@ -7915,11 +8112,10 @@ class EMGVisualizer(QMainWindow):
         return {
             "dataset_paths": [],
             "output_dir": "trained_model",
-            "run_name": "rf_training",
+            "run_name": "run",
             "window_ms": int(max(20, self.analysis_ms_spin.value())),
             "stride_ms": 50,
-            "n_estimators": RF_DEFAULT_N_ESTIMATORS,
-            "max_depth": RF_DEFAULT_MAX_DEPTH,
+            "trim_ms": 250,
             "random_seed": 42,
             "test_size": 0.20,
             "class_weight_balanced": True,
@@ -7984,287 +8180,215 @@ class EMGVisualizer(QMainWindow):
         return normalized
 
     def train_rf_with_config(self, config):
-        if not HAS_RF_FEATURES:
-            raise ValueError("rf_features.py is required for training.")
-        if not HAS_SKLEARN:
-            raise ValueError("scikit-learn is required. Install with: py -3 -m pip install scikit-learn")
+        """Train one or several models on the selected recordings and save each in its own folder.
 
+        Every model is written to ``<output>/<model folder>/<run name>_<time>/`` (for example
+        ``trained_model/random_forest/run_20261105_101500/``) together with its metrics and report.
+        """
         cfg = dict(config or {})
         csv_paths = self._normalize_training_csv_paths(cfg.get("dataset_paths", []))
         if len(csv_paths) == 0:
             raise ValueError("No dataset CSV files selected.")
         status_callback = cfg.get("_status_callback", None)
+        progress_callback = cfg.get("_progress_callback", None)
+        cancel_event = cfg.get("_cancel_event", None)
         default_window_ms = DEFAULT_ANALYSIS_MS if callable(status_callback) else self.analysis_ms_spin.value()
 
-        output_dir = str(cfg.get("output_dir", TRAINED_MODEL_DIR)).strip() or TRAINED_MODEL_DIR
-        output_dir_abs = self._from_project_relative_path(output_dir)
-        run_name = self._sanitize_filename_token(cfg.get("run_name", "rf_training"))
+        output_dir_abs = self._from_project_relative_path(str(cfg.get("output_dir", TRAINED_MODEL_DIR)).strip() or TRAINED_MODEL_DIR)
+        run_name = self._sanitize_filename_token(cfg.get("run_name", "run"))
         window_ms = int(max(20, cfg.get("window_ms", default_window_ms)))
         stride_ms = int(max(5, cfg.get("stride_ms", 50)))
-        n_estimators = int(max(50, cfg.get("n_estimators", RF_DEFAULT_N_ESTIMATORS)))
-        max_depth_value = int(max(0, cfg.get("max_depth", RF_DEFAULT_MAX_DEPTH)))
+        trim_ms = int(max(0, cfg.get("trim_ms", 0)))
         test_size = float(min(0.5, max(0.05, cfg.get("test_size", 0.2))))
         random_seed = int(max(0, cfg.get("random_seed", 42)))
-        class_weight_balanced = bool(cfg.get("class_weight_balanced", True))
+        balanced = bool(cfg.get("class_weight_balanced", True))
+        split_mode = str(cfg.get("split_mode", "segments"))
         auto_load_model = bool(cfg.get("auto_load_model", True))
         defer_auto_load = bool(cfg.get("_defer_auto_load", False))
+        model_keys = [k for k in list(cfg.get("models") or [ml_models.DEFAULT_MODEL_KEY]) if k in ml_models.MODEL_SPECS]
+        if not model_keys:
+            raise ValueError("Select at least one model to train.")
+        params_by_model = dict(cfg.get("model_params", {}) or {})
+        specs = [ml_models.MODEL_SPECS[k] for k in model_keys]
+        for spec in specs:
+            ok, why = spec.availability()
+            if not ok:
+                raise ValueError(f"{spec.name} is not available: {why}")
+        if not HAS_RF_FEATURES:
+            raise ValueError("rf_features.py is required for training.")
 
-        def emit_training_status(text, color="#6a1b9a"):
+        def say(text, color="#6a1b9a"):
             if callable(status_callback):
                 status_callback(text, color)
             else:
                 self.set_status(text, color)
                 QApplication.processEvents()
 
-        emit_training_status("RF training: loading dataset CSV files...")
-        segments = []
-        segment_count_by_file = {}
-        channel_count_by_file = {}
-        for csv_path in csv_paths:
-            file_segments, file_channel_count = self.load_segments_from_record_csv(csv_path)
+        def progress(fraction, text=""):
+            if callable(progress_callback):
+                progress_callback(float(min(1.0, max(0.0, fraction))), str(text))
+
+        say("Loading recordings...")
+        progress(0.02, "Loading recordings")
+        segments, sources = [], []
+        segment_count_by_file, channel_count_by_file = {}, {}
+        for n, csv_path in enumerate(csv_paths):
+            file_segments, file_channels = self.load_segments_from_record_csv(csv_path)
             segment_count_by_file[csv_path] = int(len(file_segments))
-            channel_count_by_file[csv_path] = int(file_channel_count)
+            channel_count_by_file[csv_path] = int(file_channels)
             segments.extend(file_segments)
-
-        if len(segments) == 0:
-            raise ValueError("No segments found across selected datasets.")
-
-        valid_channel_counts = [c for c in channel_count_by_file.values() if int(c) > 0]
-        if len(valid_channel_counts) == 0:
-            raise ValueError("No channel columns were detected in selected datasets.")
-        unique_channel_counts = sorted(set(int(c) for c in valid_channel_counts))
-        if len(unique_channel_counts) != 1:
-            details = ", ".join(
-                [
-                    f"{os.path.basename(path)}:{int(count)}"
-                    for path, count in list(channel_count_by_file.items())[:8]
-                ]
-            )
-            if len(channel_count_by_file) > 8:
-                details = f"{details}, +{len(channel_count_by_file) - 8} more"
-            raise ValueError(
-                "Channel count mismatch across selected datasets. "
-                "All files must have the same channel count.\n"
-                f"Detected: {details}"
-            )
-        target_channels = int(unique_channel_counts[0])
-        if target_channels <= 0:
-            raise ValueError("Invalid dataset channel configuration.")
+            sources.extend([n] * len(file_segments))
+        if not segments:
+            raise ValueError("No usable segments found in the selected recordings (only perform and rest frames with Valid=1 are used).")
+        unique_channels = sorted({c for c in channel_count_by_file.values() if c > 0})
+        if len(unique_channels) != 1:
+            details = ", ".join(f"{os.path.basename(p)}:{c}" for p, c in list(channel_count_by_file.items())[:8])
+            raise ValueError("Channel count mismatch across selected recordings. All files must have the same channel count.\n"
+                             f"Detected: {details}")
+        target_channels = int(unique_channels[0])
 
         win_samples = max(8, int((window_ms / 1000.0) * SAMPLE_RATE))
         stride_samples = max(1, int((stride_ms / 1000.0) * SAMPLE_RATE))
-
-        emit_training_status("RF training: extracting features...")
-        windows_all = []
-        y = []
-        groups = []  # one id per source segment, so overlapping windows never split across sets
-        skipped_channel_segments = 0
-        mismatched_segments = 0
-        seg_id = 0
-        for label, seq in segments:
-            arr = np.asarray(seq, dtype=np.float32)
-            if arr.ndim != 2:
-                skipped_channel_segments += 1
-                continue
-            if arr.shape[1] != target_channels:
-                mismatched_segments += 1
-                continue
-            windows = rf_build_windows_from_sequence(arr, win_samples, stride_samples)
-            for w in windows:
-                windows_all.append(w)
-                y.append(label)
-                groups.append(seg_id)
-            seg_id += 1
-
-        if mismatched_segments > 0:
-            raise ValueError(
-                "Channel count mismatch detected inside loaded segments. "
-                f"Expected {target_channels} channel(s), found {mismatched_segments} mismatched segment(s)."
-            )
-
-        if len(windows_all) < 20:
-            raise ValueError(
-                f"Too few windows for training ({len(windows_all)}). "
-                f"Add more data or reduce window size. "
-                f"Using {target_channels} channel(s)."
-            )
-
-        # Feature extraction is embarrassingly parallel across windows. Use threads: the
-        # extractor is numpy/FFT-bound (releases the GIL), and threads avoid the
-        # process-spawn hazards of running from inside this worker QThread on Windows.
-        feats_list = None
-        if HAS_JOBLIB_PARALLEL and len(windows_all) >= 256:
-            feat_jobs = int(max(1, (os.cpu_count() or 2) - 1))
-            try:
-                feats_list = Parallel(n_jobs=feat_jobs, prefer="threads")(
-                    delayed(rf_extract_window_features)(w, SAMPLE_RATE) for w in windows_all
-                )
-            except Exception:
-                feats_list = None  # fall back to sequential below
-        if feats_list is None:
-            feats_list = [rf_extract_window_features(w, sample_rate=SAMPLE_RATE) for w in windows_all]
-
-        X = np.asarray(feats_list, dtype=np.float32)
-        y = np.asarray(y)
-        groups = np.asarray(groups, dtype=np.int64)
-        classes = sorted(list(np.unique(y)))
-        if len(classes) < 2:
-            raise ValueError("Need at least 2 classes for classification.")
-
-        class_to_idx = {c: i for i, c in enumerate(classes)}
-        y_idx = np.asarray([class_to_idx[v] for v in y], dtype=np.int32)
-        class_counts = np.bincount(y_idx, minlength=len(classes))
-        if np.min(class_counts) < 2:
-            raise ValueError("Each class needs at least 2 windows for stratified split.")
-
-        emit_training_status("RF training: splitting train/test...")
-        X_train, X_test, y_train, y_test = self._split_train_test(
-            X, y_idx, groups, classes, test_size, random_seed
-        )
-
-        emit_training_status("RF training: fitting model...")
-        rf_jobs = int(max(1, (os.cpu_count() or 2) - 1))
-        model = RandomForestClassifier(
-            n_estimators=n_estimators,
-            max_depth=None if max_depth_value <= 0 else max_depth_value,
-            min_samples_leaf=RF_DEFAULT_MIN_SAMPLES_LEAF,
-            random_state=random_seed,
-            class_weight="balanced" if class_weight_balanced else None,
-            n_jobs=rf_jobs,
-        )
-        model.fit(X_train, y_train)
-
-        y_pred = model.predict(X_test)
-        acc = float(accuracy_score(y_test, y_pred))
-        report_dict = classification_report(
-            y_test,
-            y_pred,
-            labels=np.arange(len(classes)),
-            target_names=classes,
-            digits=4,
-            zero_division=0,
-            output_dict=True,
-        )
-        report = self.build_aligned_classification_report(report_dict, classes)
-        cm = confusion_matrix(y_test, y_pred, labels=np.arange(len(classes)))
-
-        run_dir = self._unique_run_dir(output_dir_abs, run_name)
-        os.makedirs(run_dir, exist_ok=True)
-        model_path = os.path.join(run_dir, DEFAULT_RF_MODEL_ARTIFACT)
-        run_dir_rel = self._to_project_relative_path(run_dir)
-        model_path_rel = self._to_project_relative_path(model_path)
+        trim_samples = int((trim_ms / 1000.0) * SAMPLE_RATE)
+        say("Cutting windows and extracting features...")
+        progress(0.08, "Preparing windows")
+        ds = ml_models.prepare_dataset(
+            segments, window_samples=win_samples, stride_samples=stride_samples, sample_rate=SAMPLE_RATE,
+            trim_samples=trim_samples, want_features=any(s.input_kind == "features" for s in specs),
+            want_windows=any(s.input_kind == "window" for s in specs), progress=lambda t: say(t))
+        ds_sources = np.asarray(sources, dtype=np.int64)
+        # per-window source recording, for "hold out whole recordings"
+        seg_ids_per_window = ds.groups
+        window_source = ds_sources[seg_ids_per_window] if len(ds_sources) else np.zeros(len(ds.y), dtype=np.int64)
+        split_groups = ds.groups
+        split_used = "segments"
+        if split_mode == "recordings" and len(csv_paths) >= 2:
+            split_groups, split_used = window_source, "recordings"
+        elif split_mode == "recordings":
+            say("Only one recording selected: holding out segments instead.", "#f57c00")
+        say("Splitting train/test...")
+        progress(0.12, "Splitting")
+        train_idx, test_idx = ml_models.split_train_test(ds.y, split_groups, len(ds.classes), test_size, random_seed)
+        if split_used == "recordings" and (np.unique(ds.y[train_idx]).size != len(ds.classes)
+                                            or np.unique(ds.y[test_idx]).size != len(ds.classes)):
+            split_used = "segments (recordings could not cover every class)"
 
         created_at_text = time.strftime("%Y-%m-%d %H:%M:%S")
-        csv_paths_rel = [self._to_project_relative_path(p) for p in csv_paths]
-        setup_payload = {
-            "created_at_text": created_at_text,
-            "dataset_paths": csv_paths_rel,
-            "output_dir": self._to_project_relative_path(output_dir_abs),
-            "run_name": run_name,
-            "window_ms": window_ms,
-            "stride_ms": stride_ms,
-            "window_samples": win_samples,
-            "stride_samples": stride_samples,
-            "n_estimators": n_estimators,
-            "max_depth": max_depth_value,
-            "test_size": test_size,
-            "random_seed": random_seed,
-            "class_weight_balanced": class_weight_balanced,
-            "auto_load_model": auto_load_model,
-            "sample_rate_hz": int(SAMPLE_RATE),
-            "input_channels": int(target_channels),
-        }
-        results_payload = {
-            "created_at_text": created_at_text,
-            "accuracy": acc,
-            "train_windows": int(len(y_train)),
-            "test_windows": int(len(y_test)),
-            "num_features": int(X.shape[1]),
-            "classes": classes,
-            "class_window_counts": {classes[i]: int(class_counts[i]) for i in range(len(classes))},
-            "segment_count_by_file": {
-                self._to_project_relative_path(path): count for path, count in segment_count_by_file.items()
-            },
-            "channel_count_by_file": {
-                self._to_project_relative_path(path): count for path, count in channel_count_by_file.items()
-            },
-            "input_channels": int(target_channels),
-            "skipped_channel_segments": int(skipped_channel_segments),
-            "confusion_matrix": cm.tolist(),
-            "classification_report_text": report,
-            "classification_report_dict": report_dict,
-            "model_file": os.path.basename(model_path),
-            "run_dir": run_dir_rel,
-            "model_path": model_path_rel,
-        }
+        runs = []
+        for n, spec in enumerate(specs):
+            if cancel_event is not None and cancel_event.is_set():
+                say("Training stopped.", "#f57c00")
+                break
+            base = 0.12 + 0.86 * n / len(specs)
+            span = 0.86 / len(specs)
+            say(f"Training {spec.name} ({n + 1}/{len(specs)})...")
+            progress(base, f"Training {spec.name}")
 
+            def epoch_progress(epoch, epochs, loss, val_acc, _b=base, _s=span, _spec=spec):
+                progress(_b + _s * epoch / max(1, epochs), f"{_spec.name}: epoch {epoch}/{epochs}")
+                say(f"{_spec.name}: epoch {epoch}/{epochs} | loss {loss:.3f}"
+                    + (f" | val acc {100 * val_acc:.1f}%" if val_acc is not None else ""))
+
+            fit = ml_models.fit_and_evaluate(
+                spec, dict(params_by_model.get(spec.key, {})), ds, train_idx, test_idx, seed=random_seed,
+                balanced=balanced, sample_rate=SAMPLE_RATE, progress=epoch_progress, cancel=cancel_event)
+            progress(base + span, f"{spec.name} done")
+            setup_payload = {
+                "created_at_text": created_at_text, "dataset_paths": [self._to_project_relative_path(p) for p in csv_paths],
+                "output_dir": self._to_project_relative_path(output_dir_abs), "run_name": run_name,
+                "model": spec.key, "model_name": spec.name, "model_params": fit.params, "input_kind": spec.input_kind,
+                "window_ms": window_ms, "stride_ms": stride_ms, "trim_ms": trim_ms, "window_samples": win_samples,
+                "stride_samples": stride_samples, "test_size": test_size, "split_mode": split_used,
+                "random_seed": random_seed, "class_weight_balanced": balanced, "auto_load_model": auto_load_model,
+                "sample_rate_hz": int(SAMPLE_RATE), "input_channels": int(target_channels),
+            }
+            runs.append(self._save_training_run(
+                spec, fit, ds, setup_payload, csv_paths, segment_count_by_file, channel_count_by_file,
+                output_dir_abs, run_name, created_at_text, window_ms, stride_ms, win_samples, stride_samples,
+                target_channels))
+        if not runs:
+            raise ValueError("Training was stopped before any model finished.")
+
+        best = max(runs, key=lambda r: (r["metrics"]["accuracy"], r["metrics"].get("macro_f1", 0.0)))
+        if auto_load_model and not defer_auto_load:
+            self.load_rf_model(best["model_path"])
+            self.set_status(f"Training complete; {best['model_name']} loaded.", "#2e7d32")
+        else:
+            say(f"Training complete; best: {best['model_name']} ({100 * best['metrics']['accuracy']:.1f}%).", "#2e7d32")
+        progress(1.0, "Done")
+        result = dict(best)
+        result["artifact"] = best["artifact"] if defer_auto_load else None
+        result["runs"] = [dict(r, artifact=None) for r in runs]
+        result["best_index"] = runs.index(best)
+        return result
+
+    def _save_training_run(self, spec, fit, ds, setup_payload, csv_paths, segment_count_by_file,
+                           channel_count_by_file, output_dir_abs, run_name, created_at_text, window_ms, stride_ms,
+                           win_samples, stride_samples, target_channels):
+        """Write one trained model and its reports to ``<output>/<model folder>/<run>_<time>/``."""
+        classes = list(ds.classes)
+        report = self.build_aligned_classification_report(fit.report_dict, classes)
+        run_dir = self._unique_run_dir(os.path.join(output_dir_abs, spec.folder), run_name)
+        os.makedirs(run_dir, exist_ok=True)
+        model_file = f"{spec.folder}_model.joblib"
+        model_path = os.path.join(run_dir, model_file)
+        run_dir_rel = self._to_project_relative_path(run_dir)
+        model_path_rel = self._to_project_relative_path(model_path)
+        metrics = {
+            "accuracy": fit.accuracy, "balanced_accuracy": fit.balanced_accuracy, "macro_f1": fit.macro_f1,
+            "train_windows": fit.train_windows, "test_windows": fit.test_windows, "train_seconds": fit.train_seconds,
+            "latency_ms": fit.latency_ms,
+        }
         artifact = {
-            "model": model,
-            "class_names": classes,
-            "sample_rate": SAMPLE_RATE,
-            "window_samples": win_samples,
-            "stride_samples": stride_samples,
-            "created_at_text": created_at_text,
-            "input_channels": int(target_channels),
-            "run_dir": run_dir_rel,
-            "setup": setup_payload,
-            "metrics": {
-                "accuracy": acc,
-                "train_windows": int(len(y_train)),
-                "test_windows": int(len(y_test)),
-            },
+            "model": fit.estimator, "class_names": classes, "sample_rate": SAMPLE_RATE,
+            "window_samples": win_samples, "stride_samples": stride_samples, "created_at_text": created_at_text,
+            "input_channels": int(target_channels), "run_dir": run_dir_rel, "setup": setup_payload,
+            "model_type": spec.key, "model_name": spec.name, "input_kind": spec.input_kind,
+            "metrics": metrics,
         }
         joblib.dump(artifact, model_path)
 
-        setup_path = os.path.join(run_dir, "training_setup.json")
-        results_path = os.path.join(run_dir, "training_results.json")
-        report_path = os.path.join(run_dir, "classification_report.txt")
-        summary_path = os.path.join(run_dir, "training_summary.txt")
-        cm_csv_path = os.path.join(run_dir, "confusion_matrix.csv")
-
-        with open(setup_path, "w", encoding="utf-8") as f:
-            json.dump(setup_payload, f, indent=2)
-        with open(results_path, "w", encoding="utf-8") as f:
-            json.dump(results_payload, f, indent=2)
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(report.rstrip("\n") + "\n")
-        with open(cm_csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["actual/predicted"] + classes)
-            for idx, row in enumerate(cm.tolist()):
-                writer.writerow([classes[idx]] + [int(v) for v in row])
-
+        class_counts = ds.class_counts
+        results_payload = {
+            "created_at_text": created_at_text, **metrics, "num_features": int(fit.num_features),
+            "model": spec.key, "model_name": spec.name, "model_params": fit.params,
+            "classes": classes, "class_window_counts": {classes[i]: int(class_counts[i]) for i in range(len(classes))},
+            "segment_count_by_file": {self._to_project_relative_path(p): c for p, c in segment_count_by_file.items()},
+            "channel_count_by_file": {self._to_project_relative_path(p): c for p, c in channel_count_by_file.items()},
+            "input_channels": int(target_channels), "skipped_channel_segments": int(ds.skipped_segments),
+            "confusion_matrix": fit.confusion.tolist(), "classification_report_text": report,
+            "classification_report_dict": fit.report_dict, "history": fit.history,
+            "model_file": model_file, "run_dir": run_dir_rel, "model_path": model_path_rel,
+        }
         summary = (
+            f"Model: {spec.name}\n"
             f"Run Folder: {run_dir_rel}\n"
             f"Model File: {model_path_rel}\n"
-            f"Datasets: {len(csv_paths)} file(s)\n"
-            f"Accuracy: {acc:.4f}\n"
-            f"Train windows: {len(y_train)} | Test windows: {len(y_test)}\n"
-            f"Window: {window_ms} ms ({win_samples} samples) | Stride: {stride_ms} ms ({stride_samples} samples)\n"
+            f"Recordings: {len(csv_paths)} file(s) | Split: {setup_payload['split_mode']}\n"
+            f"Accuracy: {fit.accuracy:.4f} | Balanced accuracy: {fit.balanced_accuracy:.4f} | Macro F1: {fit.macro_f1:.4f}\n"
+            f"Train windows: {fit.train_windows} | Test windows: {fit.test_windows}\n"
+            f"Training time: {fit.train_seconds:.1f} s | Prediction time: {fit.latency_ms:.2f} ms per window\n"
+            f"Window: {window_ms} ms ({win_samples} samples) | Stride: {stride_ms} ms ({stride_samples} samples)"
+            f" | Edge trim: {setup_payload['trim_ms']} ms\n"
             f"Input channels: {target_channels}\n"
             f"Classes: {', '.join(classes)}"
         )
-        with open(summary_path, "w", encoding="utf-8") as f:
+        for name, payload in (("training_setup.json", setup_payload), ("training_results.json", results_payload)):
+            with open(os.path.join(run_dir, name), "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, default=float)
+        with open(os.path.join(run_dir, "classification_report.txt"), "w", encoding="utf-8") as f:
+            f.write(report.rstrip("\n") + "\n")
+        with open(os.path.join(run_dir, "training_summary.txt"), "w", encoding="utf-8") as f:
             f.write(summary + "\n")
-
-        if auto_load_model and not defer_auto_load:
-            self.load_rf_model(model_path)
-            self.set_status("RF training complete and model loaded.", "#2e7d32")
-        elif auto_load_model and defer_auto_load:
-            emit_training_status("RF training complete; loading model...", "#2e7d32")
-        else:
-            emit_training_status("RF training complete.", "#2e7d32")
-
+        with open(os.path.join(run_dir, "confusion_matrix.csv"), "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["actual/predicted"] + classes)
+            for idx, row in enumerate(fit.confusion.tolist()):
+                writer.writerow([classes[idx]] + [int(v) for v in row])
         return {
-            "run_dir": run_dir,
-            "model_path": model_path,
-            "artifact": artifact if defer_auto_load else None,
-            "summary_text": summary,
-            "report_text": report,
-            "cm": cm.tolist(),
-            "classes": classes,
-            "config": setup_payload,
-            "metrics": results_payload,
+            "run_dir": run_dir, "model_path": model_path, "artifact": artifact, "summary_text": summary,
+            "report_text": report, "cm": fit.confusion.tolist(), "classes": classes, "config": setup_payload,
+            "metrics": results_payload, "model_key": spec.key, "model_name": spec.name,
         }
 
     def load_saved_training_run(self, run_dir):
@@ -8333,7 +8457,11 @@ class EMGVisualizer(QMainWindow):
         model_path = os.path.join(run_dir_abs, model_file)
         if not os.path.isfile(model_path):
             fallback_path = os.path.join(run_dir_abs, DEFAULT_RF_MODEL_ARTIFACT)
-            model_path = fallback_path if os.path.isfile(fallback_path) else ""
+            if os.path.isfile(fallback_path):
+                model_path = fallback_path
+            else:                                    # any saved model in the folder (new runs are named <model>_model.joblib)
+                joblibs = sorted(f for f in os.listdir(run_dir_abs) if f.lower().endswith(".joblib"))
+                model_path = os.path.join(run_dir_abs, joblibs[0]) if joblibs else ""
 
         if "dataset_paths" in setup_payload:
             setup_payload["dataset_paths"] = [
@@ -8354,6 +8482,7 @@ class EMGVisualizer(QMainWindow):
             "cm": cm,
             "classes": classes,
             "metrics": results_payload,
+            "model_name": str(results_payload.get("model_name") or setup_payload.get("model_name") or "Random Forest"),
         }
         return {
             "run_dir": run_dir_abs,
@@ -8374,31 +8503,6 @@ class EMGVisualizer(QMainWindow):
             return int(round(float(val)))
         except Exception:
             return 0
-
-    def _split_train_test(self, X, y_idx, groups, classes, test_size, random_seed):
-        """Group-aware split: overlapping windows from one recording never straddle the
-        train/test boundary (removes leakage that inflates accuracy). Falls back to a
-        stratified split when grouping can't keep every class on both sides."""
-        n_groups = int(np.unique(groups).size)
-        if GroupShuffleSplit is not None and n_groups >= 2:
-            try:
-                gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_seed)
-                train_idx, test_idx = next(gss.split(X, y_idx, groups=groups))
-                y_train = y_idx[train_idx]
-                y_test = y_idx[test_idx]
-                # Only accept the grouped split if both sides see every class.
-                n_classes = len(classes)
-                if (len(train_idx) > 0 and len(test_idx) > 0
-                        and np.unique(y_train).size == n_classes
-                        and np.unique(y_test).size == n_classes):
-                    return X[train_idx], X[test_idx], y_train, y_test
-            except Exception:
-                pass
-        # Fallback: stratified split (may leak across overlapping windows, but keeps
-        # training usable on small single-recording datasets).
-        return train_test_split(
-            X, y_idx, test_size=test_size, random_state=random_seed, stratify=y_idx,
-        )
 
     @classmethod
     def build_aligned_classification_report(cls, report_dict, classes):
@@ -8885,16 +8989,16 @@ class EMGVisualizer(QMainWindow):
             self.gesture_label = self.rf_last_pred_label
 
         if self.rf_model is not None:
-            model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+            model_name = self.current_model_label()
             if self.rf_last_status_reason:
-                self.lbl_rf.setText(f"RF Model: {model_name} | {self.rf_last_status_reason}")
+                self.lbl_rf.setText(f"Model: {model_name} | {self.rf_last_status_reason}")
             else:
                 self.lbl_rf.setText(
-                    f"RF Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
+                    f"Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
                 )
             self.lbl_rf.setStyleSheet(themed_label_style("success"))
         else:
-            self.lbl_rf.setText("RF Model: Not loaded")
+            self.lbl_rf.setText("Model: Not loaded")
             self.lbl_rf.setStyleSheet(themed_label_style("muted"))
 
         self.anomaly_label = self.detect_anomaly_label(
@@ -9435,6 +9539,40 @@ class EMGVisualizer(QMainWindow):
         for lbl in (self.lbl_pkt_rate, self.lbl_pkt_loss):
             lbl.setStyleSheet(f"color: {THEME_COLORS['muted']}; font-family: {MONO_FONT_CSS};")
 
+    def refresh_workflow_hint(self):
+        """Update the workflow bar from the current connection / calibration / model state."""
+        if not hasattr(self, "lbl_workflow"):
+            return
+        connected, calibrated = bool(self.is_connected), bool(self.is_calibrated)
+        has_model = self.rf_model is not None
+        collecting = bool(self.task_session_active)
+        training = bool(self.training_dialog is not None and getattr(self.training_dialog, "_is_training", False))
+        done = [connected, calibrated, self._last_session_quality is not None or collecting, has_model, False]
+        if not connected:
+            current, hint = 0, "Click <b>Port Configuration</b> to connect the armband over USB or Wi-Fi."
+        elif not calibrated:
+            current, hint = 1, "Run <b>Channel Calibration</b>: relax for a few seconds, then flex."
+        elif collecting:
+            current, hint = 2, "Recording in progress. Follow the on-screen cues in the Data Collection window."
+        elif training:
+            current, hint = 3, "Training in progress. You can follow it in the Model Training window."
+        elif not has_model:
+            current, hint = 2, ("Record gestures with <b>Data Collection</b>, or train on existing recordings with "
+                                "<b>Train Model</b>.")
+        else:
+            current, hint = 4, "A model is loaded. Open <b>Real-time Classification</b> to see live predictions."
+        names = ["Connect", "Calibrate", "Collect data", "Train model", "Classify"]
+        chips = []
+        for i, name in enumerate(names):
+            if i == current:
+                chips.append(f'<span style="background-color:{THEME_COLORS["accent"]}; color:#ffffff;"> <b>{i + 1}  {name}</b> </span>')
+            elif done[i]:
+                chips.append(f'<span style="color:{THEME_COLORS["accent"]};">\u2713 {name}</span>')
+            else:
+                chips.append(f'<span style="color:{THEME_COLORS["disabled"]};">{i + 1}  {name}</span>')
+        sep = f'<span style="color:{THEME_COLORS["disabled"]};">  \u203a  </span>'
+        self.lbl_workflow.setText(sep.join(chips) + f'<span style="color:{THEME_COLORS["muted"]};">&nbsp;&nbsp;&nbsp;{hint}</span>')
+
     def on_packet_tick(self):
         """4 Hz: update packet statistics, the tracer window and the live CSV counter."""
         if self.is_connected:
@@ -9449,6 +9587,7 @@ class EMGVisualizer(QMainWindow):
             if self.packet_tracer_window is not None and self.packet_tracer_window.isVisible():
                 self.packet_tracer_window.refresh()
         self.refresh_csv_counter()
+        self.refresh_workflow_hint()
 
     def refresh_csv_counter(self):
         rows = int(self.recorded_sample_count())
@@ -9531,7 +9670,7 @@ class EMGVisualizer(QMainWindow):
                 ("Live CSV counter", f"{self.recorded_sample_count():,} rows", "Rows captured so far versus the number the protocol should produce."),
             ]),
             ("Models", [
-                ("Train Model", "-", "Train a Random Forest from recorded CSV files and review accuracy and the confusion matrix."),
+                ("Train Model", "-", "Train and compare gesture models (Random Forest, SVM, 1D CNN and more) on your recordings; each is saved in its own folder."),
                 ("Load Trained Model", model, "Load a saved model for real-time prediction."),
                 ("Real-time Classification", "Open" if self.realtime_classification_window else "Closed", "Shows the live predicted gesture, confidence and per-class scores."),
                 ("Gesture game", "Separate app", f"Run gesture_game_app.py; it listens to this app on UDP {GESTURE_BRIDGE_PORT} (keyboard works without it)."),

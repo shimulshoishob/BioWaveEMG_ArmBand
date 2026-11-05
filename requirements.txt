@@ -1,8 +1,11 @@
-﻿numpy
+numpy
 pyqt5
 pyqtgraph
 pyserial
 joblib
 scikit-learn
 PyWavelets
+# optional: needed only for the 1D CNN model
+torch
+# optional: only used by the separate mouse_controller.py
 pyautogui
