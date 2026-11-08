@@ -5,6 +5,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -88,3 +89,49 @@ class ControlProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiscoveryTests(unittest.TestCase):
+    """Discovery must find a device whichever adapter it is reachable through (Mac and Windows)."""
+
+    def setUp(self):
+        self._port, self._timeout = app.WIFI_CONTROL_PORT, app.DISCOVERY_TIMEOUT
+        app.DISCOVERY_TIMEOUT = 1.0
+
+    def tearDown(self):
+        app.WIFI_CONTROL_PORT, app.DISCOVERY_TIMEOUT = self._port, self._timeout
+
+    def test_finds_a_device_that_answers_the_probe(self):
+        dev = FakeDevice(); dev.running = True
+        original_run = dev.run
+
+        def hello_run():
+            while dev.running:
+                try:
+                    data, addr = dev.sock.recvfrom(1024)
+                except socket.timeout:
+                    continue
+                if data == b"DISCOVER":
+                    dev.sock.sendto(b"HELLO|AABBCC|BioWave-EMG-IMU|STA|127.0.0.1|1|0|emg-imu-2.0.0|500", addr)
+        dev.run = hello_run
+        dev.start(); app.WIFI_CONTROL_PORT = dev.port
+        try:
+            found = app.ControlProtocol.discover(extra_targets=("127.0.0.1",))     # unicast probe: works without a LAN
+        finally:
+            dev.running = False
+        self.assertEqual([(d.device_id, d.firmware, d.sample_rate_hz) for d in found], [("AABBCC", "emg-imu-2.0.0", 500.0)])
+
+    def test_no_reply_returns_an_empty_list_within_the_timeout(self):
+        app.WIFI_CONTROL_PORT = free_udp_port()
+        t = time.monotonic()
+        self.assertEqual(app.ControlProtocol.discover(), [])
+        self.assertLess(time.monotonic() - t, 2.5)
+
+    def test_local_addresses_exclude_loopback_and_link_local(self):
+        for ip in app.ControlProtocol.local_ipv4_addresses():
+            self.assertFalse(ip.startswith(("127.", "169.254.")))
+
+
+def free_udp_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+    return port

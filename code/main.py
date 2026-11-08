@@ -404,7 +404,7 @@ DEVICE_SECRET_PATH = os.path.join(SCRIPT_DIR, "device_secret.json")   # gitignor
 CONTROL_RETRY_BACKOFF_S = (0.2, 0.5, 1.0)   # waits before retry 1..3 of a control command
 KEEPALIVE_RESTART_AFTER = 2                 # consecutive failed pings before START is re-issued
 DISCOVERY_ADDRESS = "255.255.255.255"
-DISCOVERY_TIMEOUT = 1.2
+DISCOVERY_TIMEOUT = 2.0         # total wait for replies; the request is repeated halfway (UDP is lossy)
 CONTROL_TIMEOUT = 2.0
 KEEPALIVE_INTERVAL_MS = 2000
 GESTURE_BRIDGE_HOST = "127.0.0.1"   # Predictions are mirrored here for the separate gesture_game_app.py
@@ -955,15 +955,67 @@ class ControlProtocol:
             sock.close()
 
     @staticmethod
-    def discover():
+    def local_ipv4_addresses():
+        """This computer's usable IPv4 addresses (loopback and link-local excluded)."""
+        found = set()
+        try:
+            found.update(socket.gethostbyname_ex(socket.gethostname())[2])
+        except OSError:
+            pass
+        try:
+            found.add(get_local_ip_for_target("8.8.8.8"))     # the adapter that owns the default route (no traffic is sent)
+        except OSError:
+            pass
+        return sorted(ip for ip in found if ip and not ip.startswith("127.") and not ip.startswith("169.254."))
+
+    @staticmethod
+    def discover(extra_targets=()):
+        """Find BioWave devices on the LAN.
+
+        A single 255.255.255.255 broadcast leaves through ONE adapter. On Windows that is often a VPN, VirtualBox
+        or WSL adapter, not the Wi-Fi one, so the device never hears it. The request is therefore sent from every
+        local IPv4 address, to the limited broadcast and to that address's /24 directed broadcast (also covers
+        routers that drop 255.255.255.255), and repeated once. ``extra_targets`` adds unicast addresses to probe.
+        """
+        local_ips = ControlProtocol.local_ipv4_addresses()
+        socks = []
+        for ip in local_ips or [""]:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.settimeout(0.05)
+            try:
+                sock.bind((ip, 0))
+            except OSError:
+                sock.close()
+                continue
+            socks.append((ip, sock))
+        responses = []
+        try:
+            started = time.monotonic()
+            sent_rounds = 0
+            while time.monotonic() - started < DISCOVERY_TIMEOUT:
+                if sent_rounds == 0 or (sent_rounds == 1 and time.monotonic() - started >= DISCOVERY_TIMEOUT / 2):
+                    sent_rounds += 1
+                    for ip, sock in socks:
+                        targets = {DISCOVERY_ADDRESS, *extra_targets}
+                        if ip:
+                            targets.add(ip.rsplit(".", 1)[0] + ".255")
+                        for target in targets:
+                            try:
+                                sock.sendto(b"DISCOVER", (target, WIFI_CONTROL_PORT))
+                            except OSError:
+                                pass
+                for _, sock in socks:
+                    try:
+                        data, addr = sock.recvfrom(2048)
+                        responses.append((data.decode("utf-8", errors="replace"), addr[0]))
+                    except (socket.timeout, OSError):
+                        continue
+        finally:
+            for _, sock in socks:
+                sock.close()
+
         devices = {}
-        responses = ControlProtocol.send_and_receive(
-            "DISCOVER",
-            DISCOVERY_ADDRESS,
-            expect_multiple=True,
-            timeout=DISCOVERY_TIMEOUT,
-            broadcast=True,
-        )
         for response, source_ip in responses:
             try:
                 device = ControlProtocol.parse_device_info(response, source_ip)
@@ -1709,6 +1761,18 @@ class RFRealtimeInferenceWorker(QThread):
                 )
             except Exception as e:
                 self.error_occurred.emit(str(e))
+
+
+class DiscoveryWorker(QThread):
+    """Runs ControlProtocol.discover() off the GUI thread."""
+    finished_ok = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            self.finished_ok.emit(ControlProtocol.discover())
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class SessionFinalizeWorker(QThread):
@@ -6228,24 +6292,41 @@ class EMGVisualizer(QMainWindow):
             self.discover_wireless_devices(self.wireless_config_dialog)
 
     def discover_wireless_devices(self, dialog=None):
-        try:
-            devices = ControlProtocol.discover()
-        except Exception as exc:
-            target_dialog = dialog or self.wireless_config_dialog
-            if target_dialog is not None:
-                target_dialog.set_connection_state(False, f"Wireless discovery failed: {exc}")
-            QMessageBox.warning(self, "Wireless Discovery Failed", str(exc))
+        """Scan the network in a background thread (it waits up to 2 s for replies); the window stays responsive."""
+        if getattr(self, "_discover_worker", None) is not None and self._discover_worker.isRunning():
             return
-
-        self.discovered_wireless_devices = devices
         target_dialog = dialog or self.wireless_config_dialog
         if target_dialog is not None:
+            target_dialog.set_connection_state(False, "Scanning the network for BioWave devices...")
+            if hasattr(target_dialog, "btn_discover"):
+                target_dialog.btn_discover.setEnabled(False)
+        worker = DiscoveryWorker(self)
+        worker.finished_ok.connect(lambda devices, d=target_dialog: self._on_discovery_done(devices, d))
+        worker.failed.connect(lambda message, d=target_dialog: self._on_discovery_failed(message, d))
+        self._discover_worker = worker
+        worker.start()
+
+    def _discovery_dialog_idle(self, dialog):
+        if dialog is not None and hasattr(dialog, "btn_discover"):
+            dialog.btn_discover.setEnabled(True)
+
+    def _on_discovery_failed(self, message, dialog):
+        self._discovery_dialog_idle(dialog)
+        if dialog is not None:
+            dialog.set_connection_state(False, f"Wireless discovery failed: {message}")
+        QMessageBox.warning(self, "Wireless Discovery Failed", message)
+
+    def _on_discovery_done(self, devices, dialog):
+        self._discovery_dialog_idle(dialog)
+        self.discovered_wireless_devices = devices
+        if dialog is not None:
             selected_ip = self.current_device.ip if self.current_device is not None else ""
-            target_dialog.set_devices(devices, selected_ip=selected_ip)
+            dialog.set_devices(devices, selected_ip=selected_ip)
             if devices:
-                target_dialog.set_connection_state(False, f"Discovered {len(devices)} BioWave wireless device(s).")
+                dialog.set_connection_state(False, f"Discovered {len(devices)} BioWave wireless device(s).")
             else:
-                target_dialog.set_connection_state(False, "No BioWave wireless devices replied on the current Wi-Fi.")
+                dialog.set_connection_state(False, "No BioWave devices replied. Check that the PC and the armband are on the same Wi-Fi "
+                                                   "(not a guest network) and that the firewall allows this app.")
 
     def connect_wireless(self, device, access_key, dialog=None):
         if device is None:
