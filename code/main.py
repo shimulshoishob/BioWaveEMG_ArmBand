@@ -404,7 +404,7 @@ DEVICE_SECRET_PATH = os.path.join(SCRIPT_DIR, "device_secret.json")   # gitignor
 CONTROL_RETRY_BACKOFF_S = (0.2, 0.5, 1.0)   # waits before retry 1..3 of a control command
 KEEPALIVE_RESTART_AFTER = 2                 # consecutive failed pings before START is re-issued
 DISCOVERY_ADDRESS = "255.255.255.255"
-DISCOVERY_TIMEOUT = 1.2
+DISCOVERY_TIMEOUT = 2.0
 CONTROL_TIMEOUT = 2.0
 KEEPALIVE_INTERVAL_MS = 2000
 GESTURE_BRIDGE_HOST = "127.0.0.1"   # Predictions are mirrored here for the separate gesture_game_app.py
@@ -957,13 +957,54 @@ class ControlProtocol:
     @staticmethod
     def discover():
         devices = {}
-        responses = ControlProtocol.send_and_receive(
-            "DISCOVER",
-            DISCOVERY_ADDRESS,
-            expect_multiple=True,
-            timeout=DISCOVERY_TIMEOUT,
-            broadcast=True,
-        )
+        # A lone 255.255.255.255 broadcast leaves through ONE adapter on Windows (often a VPN / VirtualBox /
+        # WSL one), so bind a socket to every local IPv4 address and broadcast from each of them.
+        local_ips = set()
+        try:
+            local_ips.update(socket.gethostbyname_ex(socket.gethostname())[2])
+        except OSError:
+            pass
+        try:
+            local_ips.add(get_local_ip_for_target("8.8.8.8"))
+        except OSError:
+            pass
+        local_ips = sorted(ip for ip in local_ips if ip and not ip.startswith("127.") and not ip.startswith("169.254."))
+
+        socks = []
+        for ip in local_ips or [""]:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.settimeout(0.1)
+            try:
+                s.bind((ip, 0))
+            except OSError:
+                s.close()
+                continue
+            socks.append((ip, s))
+
+        responses = []
+        try:
+            for _ in range(2):                                   # UDP is lossy: send twice
+                for ip, s in socks:
+                    targets = {DISCOVERY_ADDRESS}
+                    if ip:
+                        targets.add(ip.rsplit(".", 1)[0] + ".255")   # directed /24 broadcast
+                    for target in targets:
+                        try:
+                            s.sendto(b"DISCOVER", (target, WIFI_CONTROL_PORT))
+                        except OSError:
+                            pass
+                deadline = time.monotonic() + DISCOVERY_TIMEOUT
+                while time.monotonic() < deadline:
+                    for _, s in socks:
+                        try:
+                            data, addr = s.recvfrom(2048)
+                            responses.append((data.decode("utf-8", errors="replace"), addr[0]))
+                        except (socket.timeout, OSError):
+                            continue
+        finally:
+            for _, s in socks:
+                s.close()
         for response, source_ip in responses:
             try:
                 device = ControlProtocol.parse_device_info(response, source_ip)
