@@ -1,0 +1,146 @@
+{
+  "created_at_text": "2026-11-06 00:08:08",
+  "accuracy": 0.9354838709677419,
+  "balanced_accuracy": 0.9118357487922705,
+  "macro_f1": 0.9133153043639745,
+  "train_windows": 1116,
+  "test_windows": 279,
+  "train_seconds": 0.1443618749617599,
+  "latency_ms": 0.8189888671040535,
+  "num_features": 156,
+  "model": "svm_linear",
+  "model_name": "SVM (linear)",
+  "model_params": {
+    "c": 1.0
+  },
+  "classes": [
+    "down",
+    "fist_close",
+    "left",
+    "rest",
+    "right",
+    "up"
+  ],
+  "class_window_counts": {
+    "down": 140,
+    "fist_close": 144,
+    "left": 140,
+    "rest": 691,
+    "right": 139,
+    "up": 141
+  },
+  "segment_count_by_file": {
+    "dataset/S03_day01_left_20261103T092948Z/signals_S03_day01_left_20261103T092948Z.csv": 31
+  },
+  "channel_count_by_file": {
+    "dataset/S03_day01_left_20261103T092948Z/signals_S03_day01_left_20261103T092948Z.csv": 8
+  },
+  "input_channels": 8,
+  "skipped_channel_segments": 0,
+  "confusion_matrix": [
+    [
+      26,
+      0,
+      0,
+      2,
+      0,
+      0
+    ],
+    [
+      0,
+      29,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      22,
+      3,
+      0,
+      3
+    ],
+    [
+      1,
+      0,
+      2,
+      134,
+      0,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      27,
+      1
+    ],
+    [
+      2,
+      2,
+      1,
+      0,
+      0,
+      23
+    ]
+  ],
+  "classification_report_text": "              precision     recall   f1-score    support\n\n        down     0.8966     0.9286     0.9123         28\n  fist_close     0.9355     1.0000     0.9667         29\n        left     0.8800     0.7857     0.8302         28\n        rest     0.9640     0.9710     0.9675        138\n       right     1.0000     0.9643     0.9818         28\n          up     0.8214     0.8214     0.8214         28\n\n    accuracy                           0.9355        279\n   macro avg     0.9162     0.9118     0.9133        279\nweighted avg     0.9352     0.9355     0.9349        279",
+  "classification_report_dict": {
+    "down": {
+      "precision": 0.896551724137931,
+      "recall": 0.9285714285714286,
+      "f1-score": 0.9122807017543859,
+      "support": 28.0
+    },
+    "fist_close": {
+      "precision": 0.9354838709677419,
+      "recall": 1.0,
+      "f1-score": 0.9666666666666667,
+      "support": 29.0
+    },
+    "left": {
+      "precision": 0.88,
+      "recall": 0.7857142857142857,
+      "f1-score": 0.8301886792452831,
+      "support": 28.0
+    },
+    "rest": {
+      "precision": 0.9640287769784173,
+      "recall": 0.9710144927536232,
+      "f1-score": 0.9675090252707581,
+      "support": 138.0
+    },
+    "right": {
+      "precision": 1.0,
+      "recall": 0.9642857142857143,
+      "f1-score": 0.9818181818181818,
+      "support": 28.0
+    },
+    "up": {
+      "precision": 0.8214285714285714,
+      "recall": 0.8214285714285714,
+      "f1-score": 0.8214285714285714,
+      "support": 28.0
+    },
+    "accuracy": 0.9354838709677419,
+    "macro avg": {
+      "precision": 0.9162488239187768,
+      "recall": 0.9118357487922705,
+      "f1-score": 0.9133153043639745,
+      "support": 279.0
+    },
+    "weighted avg": {
+      "precision": 0.9351557410643304,
+      "recall": 0.9354838709677419,
+      "f1-score": 0.9348732278838631,
+      "support": 279.0
+    }
+  },
+  "history": [],
+  "model_file": "svm_linear_model.joblib",
+  "run_dir": "trained_model/svm_linear/run_20261106_000809",
+  "model_path": "trained_model/svm_linear/run_20261106_000809/svm_linear_model.joblib"
+}

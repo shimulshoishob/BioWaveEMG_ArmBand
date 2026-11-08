@@ -1,0 +1,73 @@
+{
+  "session": "S02_day01_left_20261103T092129Z",
+  "rows_total": 75220,
+  "rows_valid": 75200,
+  "valid_sample_ratio": 0.999734113267748,
+  "loss_pct_valid_samples": 0.026588673225202974,
+  "min_valid_sample_ratio": 0.98,
+  "meets_valid_sample_threshold": true,
+  "sample_rate_hz": 500,
+  "transport": {
+    "kind": "wireless",
+    "packets_received": 23004,
+    "packets_missing": 9,
+    "packets_late": 0,
+    "packets_duplicate": 0,
+    "packets_out_of_order": 19,
+    "packets_invalid": 5,
+    "frames_missing": 45,
+    "loss_pct_packets": 0.03910833007430583,
+    "max_packet_gap_ms": 338.1019579828717,
+    "jitter_ms": 0.8948882037387279
+  },
+  "gaps": [
+    {
+      "start_frame": 86892,
+      "length": 20,
+      "label": "prepare",
+      "phase": "prepare"
+    }
+  ],
+  "device_counters": {
+    "queue_drops": 0,
+    "acq_overruns": 6,
+    "send_failures": 0,
+    "wifi_reconnects": 0
+  },
+  "late_frames": 0,
+  "keepalive_restarts": [],
+  "clipping_pct_per_channel": [
+    0.8577,
+    0.0,
+    1.2128,
+    1.137,
+    0.0,
+    0.2846,
+    0.0,
+    2.0426
+  ],
+  "phases": {
+    "end": {
+      "expected_frames": 0,
+      "actual_frames": 4,
+      "valid_frames": 4
+    },
+    "perform": {
+      "expected_frames": 22500,
+      "actual_frames": 22575,
+      "valid_frames": 22575
+    },
+    "prepare": {
+      "expected_frames": 30000,
+      "actual_frames": 30076,
+      "valid_frames": 30056
+    },
+    "rest": {
+      "expected_frames": 22500,
+      "actual_frames": 22565,
+      "valid_frames": 22565
+    }
+  },
+  "latency_estimate_s": 0.0013310834765434265,
+  "events": 46
+}

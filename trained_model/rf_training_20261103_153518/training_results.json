@@ -1,0 +1,136 @@
+{
+  "created_at_text": "2026-11-03 15:35:18",
+  "accuracy": 0.9085545722713865,
+  "train_windows": 1356,
+  "test_windows": 339,
+  "num_features": 156,
+  "classes": [
+    "down",
+    "fist_close",
+    "left",
+    "rest",
+    "right",
+    "up"
+  ],
+  "class_window_counts": {
+    "down": 170,
+    "fist_close": 174,
+    "left": 170,
+    "rest": 841,
+    "right": 169,
+    "up": 171
+  },
+  "segment_count_by_file": {
+    "dataset/S03_day01_left_20261103T092948Z/signals_S03_day01_left_20261103T092948Z.csv": 31
+  },
+  "channel_count_by_file": {
+    "dataset/S03_day01_left_20261103T092948Z/signals_S03_day01_left_20261103T092948Z.csv": 8
+  },
+  "input_channels": 8,
+  "skipped_channel_segments": 0,
+  "confusion_matrix": [
+    [
+      30,
+      0,
+      0,
+      4,
+      0,
+      0
+    ],
+    [
+      0,
+      32,
+      0,
+      3,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      34,
+      0,
+      0,
+      0
+    ],
+    [
+      7,
+      3,
+      5,
+      149,
+      2,
+      2
+    ],
+    [
+      0,
+      0,
+      1,
+      1,
+      32,
+      0
+    ],
+    [
+      1,
+      0,
+      1,
+      1,
+      0,
+      31
+    ]
+  ],
+  "classification_report_text": "              precision     recall   f1-score    support\n\n        down     0.7895     0.8824     0.8333         34\n  fist_close     0.9143     0.9143     0.9143         35\n        left     0.8293     1.0000     0.9067         34\n        rest     0.9430     0.8869     0.9141        168\n       right     0.9412     0.9412     0.9412         34\n          up     0.9394     0.9118     0.9254         34\n\n    accuracy                           0.9086        339\n   macro avg     0.8928     0.9227     0.9058        339\nweighted avg     0.9127     0.9086     0.9091        339",
+  "classification_report_dict": {
+    "down": {
+      "precision": 0.7894736842105263,
+      "recall": 0.8823529411764706,
+      "f1-score": 0.8333333333333334,
+      "support": 34.0
+    },
+    "fist_close": {
+      "precision": 0.9142857142857143,
+      "recall": 0.9142857142857143,
+      "f1-score": 0.9142857142857143,
+      "support": 35.0
+    },
+    "left": {
+      "precision": 0.8292682926829268,
+      "recall": 1.0,
+      "f1-score": 0.9066666666666666,
+      "support": 34.0
+    },
+    "rest": {
+      "precision": 0.9430379746835443,
+      "recall": 0.8869047619047619,
+      "f1-score": 0.9141104294478528,
+      "support": 168.0
+    },
+    "right": {
+      "precision": 0.9411764705882353,
+      "recall": 0.9411764705882353,
+      "f1-score": 0.9411764705882353,
+      "support": 34.0
+    },
+    "up": {
+      "precision": 0.9393939393939394,
+      "recall": 0.9117647058823529,
+      "f1-score": 0.9253731343283582,
+      "support": 34.0
+    },
+    "accuracy": 0.9085545722713865,
+    "macro avg": {
+      "precision": 0.8927726793074812,
+      "recall": 0.9227474323062559,
+      "f1-score": 0.9058242914416935,
+      "support": 339.0
+    },
+    "weighted avg": {
+      "precision": 0.9127050174059197,
+      "recall": 0.9085545722713865,
+      "f1-score": 0.9091245979775913,
+      "support": 339.0
+    }
+  },
+  "model_file": "rf_realtime_model.joblib",
+  "run_dir": "trained_model/rf_training_20261103_153518",
+  "model_path": "trained_model/rf_training_20261103_153518/rf_realtime_model.joblib"
+}

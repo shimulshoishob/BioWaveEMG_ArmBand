@@ -38,6 +38,22 @@ def session_folder_name(pid: str, day: int, hand_order: str, utc: time.struct_ti
     return f"practice_{name}" if practice else name
 
 
+def find_existing_sessions(save_dir: str, pid: str, day: int, hand: str) -> list:
+    """Folders in ``save_dir`` that already hold a (non-practice) session of this participant, day and hand.
+
+    Recording the same participant / day / hand twice by accident is the usual way a dataset gets a wrong
+    hand label, so the app asks before it allows it.
+    """
+    import os
+    pid = normalize_participant_id(pid)
+    prefix = f"{pid}_day{int(day):02d}_{str(hand).replace('_', '-')}_"
+    try:
+        names = os.listdir(save_dir)
+    except OSError:
+        return []
+    return sorted(n for n in names if n.startswith(prefix) and os.path.isdir(os.path.join(save_dir, n)))
+
+
 CHANNEL_MAP = ([{"channel": i, "column": f"Ch{i}", "name": f"EMG{i}", "type": "emg",
                  "unit": "ADC counts (12-bit, raw, 0-4095)"} for i in range(1, 9)]
                + [{"channel": 9, "column": "IMU_roll", "name": "roll", "type": "imu_orientation", "unit": "degrees"},

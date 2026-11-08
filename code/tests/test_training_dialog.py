@@ -120,7 +120,7 @@ class OptionsContentTests(unittest.TestCase):
                     win.btn_realtime_classification):
             self.assertIn(btn.text().lower(), names, f"Options window does not mention the '{btn.text()}' button")
         for text in ("window", "rms limit", "hz limit", "use hz gate", "auto-scale y axis", "draw live graph",
-                     "room conditions", "electrode placement", "practice / demo mode", "pause / resume"):
+                     "room conditions", "electrode placement", "session length", "pause / resume"):
             self.assertIn(text, names)
         for stale in ("max cycles per block", "settle", "contributor", "toolbar"):
             self.assertNotIn(stale, [row[0].lower() for _, rows in sections for row in rows] + [t.lower() for t, _ in sections])

@@ -67,13 +67,14 @@ class SimulatorTests(unittest.TestCase):
             win.study_meta.update(temp_start_c=22.0, humidity_start_pct=45.0, hand_order="left")
             win.open_data_collection_dialog()
             dlg = win.data_collection_dialog
-            for spin, value in ((dlg.spin_task_prep, 0.3), (dlg.spin_task_hold, 0.4), (dlg.spin_task_rest, 0.3)):
-                spin.setValue(value)
+            dlg._fixed_plan.update(prep_s=0.3, hold_s=0.4, rest_s=0.3)   # shortened for the test only
             dlg.spin_task_repeats.setValue(1)
             dlg.check_agree_yes.setChecked(True)
             dlg.input_contributor.setText("S01")
             dlg.spin_temp_start.setValue(22.0); dlg.spin_humidity_start.setValue(45.0)
             dlg.task_labels = ["left", "rest"]; dlg.labels_saved = True
+            dlg.combo_hand_order.setCurrentIndex(dlg.combo_hand_order.findData("left"))
+            QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.Yes)
             dlg._update_access_state()
             dlg._emit_start_requested()
             win.start_task_timer_recording()

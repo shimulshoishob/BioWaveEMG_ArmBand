@@ -1,0 +1,147 @@
+{
+  "created_at_text": "2026-11-06 00:08:08",
+  "accuracy": 0.946236559139785,
+  "balanced_accuracy": 0.9109195402298851,
+  "macro_f1": 0.9334641760334194,
+  "train_windows": 1116,
+  "test_windows": 279,
+  "train_seconds": 0.001569832966197282,
+  "latency_ms": 2.2420888650231063,
+  "num_features": 156,
+  "model": "knn",
+  "model_name": "k-Nearest Neighbours",
+  "model_params": {
+    "k": 7,
+    "weights": "distance"
+  },
+  "classes": [
+    "down",
+    "fist_close",
+    "left",
+    "rest",
+    "right",
+    "up"
+  ],
+  "class_window_counts": {
+    "down": 140,
+    "fist_close": 144,
+    "left": 140,
+    "rest": 691,
+    "right": 139,
+    "up": 141
+  },
+  "segment_count_by_file": {
+    "dataset/S03_day01_left_20261103T092948Z/signals_S03_day01_left_20261103T092948Z.csv": 31
+  },
+  "channel_count_by_file": {
+    "dataset/S03_day01_left_20261103T092948Z/signals_S03_day01_left_20261103T092948Z.csv": 8
+  },
+  "input_channels": 8,
+  "skipped_channel_segments": 0,
+  "confusion_matrix": [
+    [
+      24,
+      0,
+      0,
+      4,
+      0,
+      0
+    ],
+    [
+      0,
+      28,
+      0,
+      0,
+      1,
+      0
+    ],
+    [
+      0,
+      0,
+      26,
+      2,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      138,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      1,
+      27,
+      0
+    ],
+    [
+      0,
+      2,
+      1,
+      4,
+      0,
+      21
+    ]
+  ],
+  "classification_report_text": "              precision     recall   f1-score    support\n\n        down     1.0000     0.8571     0.9231         28\n  fist_close     0.9333     0.9655     0.9492         29\n        left     0.9630     0.9286     0.9455         28\n        rest     0.9262     1.0000     0.9617        138\n       right     0.9643     0.9643     0.9643         28\n          up     1.0000     0.7500     0.8571         28\n\n    accuracy                           0.9462        279\n   macro avg     0.9645     0.9109     0.9335        279\nweighted avg     0.9493     0.9462     0.9446        279",
+  "classification_report_dict": {
+    "down": {
+      "precision": 1.0,
+      "recall": 0.8571428571428571,
+      "f1-score": 0.9230769230769231,
+      "support": 28.0
+    },
+    "fist_close": {
+      "precision": 0.9333333333333333,
+      "recall": 0.9655172413793104,
+      "f1-score": 0.9491525423728814,
+      "support": 29.0
+    },
+    "left": {
+      "precision": 0.9629629629629629,
+      "recall": 0.9285714285714286,
+      "f1-score": 0.9454545454545454,
+      "support": 28.0
+    },
+    "rest": {
+      "precision": 0.9261744966442953,
+      "recall": 1.0,
+      "f1-score": 0.9616724738675958,
+      "support": 138.0
+    },
+    "right": {
+      "precision": 0.9642857142857143,
+      "recall": 0.9642857142857143,
+      "f1-score": 0.9642857142857143,
+      "support": 28.0
+    },
+    "up": {
+      "precision": 1.0,
+      "recall": 0.75,
+      "f1-score": 0.8571428571428571,
+      "support": 28.0
+    },
+    "accuracy": 0.946236559139785,
+    "macro avg": {
+      "precision": 0.9644594178710509,
+      "recall": 0.9109195402298851,
+      "f1-score": 0.9334641760334194,
+      "support": 279.0
+    },
+    "weighted avg": {
+      "precision": 0.9492534414571412,
+      "recall": 0.946236559139785,
+      "f1-score": 0.9446419578545623,
+      "support": 279.0
+    }
+  },
+  "history": [],
+  "model_file": "knn_model.joblib",
+  "run_dir": "trained_model/knn/run_20261106_000810",
+  "model_path": "trained_model/knn/run_20261106_000810/knn_model.joblib"
+}

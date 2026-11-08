@@ -30,28 +30,73 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual([x[2] for x in fixed[:10]], labels)
         self.assertNotEqual([x[2] for x in order(self.widget(1))[:10]], labels)
 
-    def test_study_mode_locks_randomization_and_practice_unlocks_it(self):
+    def test_no_breaks_and_no_removed_options(self):
+        w = self.widget(5, hand_order="left")
+        phases = {st["phase"] for st in w.steps}
+        self.assertEqual(phases, {"Prepare", "Perform", "Rest"})          # no Break / Switch Hand steps
+        self.assertEqual({st["block"] for st in w.steps}, {1})            # one continuous block
+        self.assertFalse(hasattr(w, "btn_skip_break"))
+        self.assertEqual(w.session_total_ms, sum(st["duration_ms"] for st in w.steps))
         d = app.DataCollectionDialog({"participant_id": "S01"})
-        self.assertTrue(d.check_randomize_order.isChecked() and not d.check_randomize_order.isEnabledTo(d.session_config_section))
-        d.check_randomize_order.setChecked(False)                       # cannot be turned off by code paths either
-        d._apply_practice_rules()
-        self.assertTrue(d.check_randomize_order.isChecked())
-        d.check_practice.setChecked(True)
-        self.assertTrue(d.check_randomize_order.isEnabledTo(d.session_config_section))
-        d.check_randomize_order.setChecked(False)
-        self.assertFalse(d.settings_payload()["randomize_order"])
-        self.assertTrue(d.settings_payload()["practice_mode"])
+        for gone in ("spin_hand_switch", "check_practice", "check_randomize_order", "input_photo"):
+            self.assertFalse(hasattr(d, gone), gone)
+        payload = d.settings_payload()
+        self.assertTrue(payload["randomize_order"])
+        self.assertEqual((payload["block_break_s"], payload["hand_switch_s"]), (0.0, 0.0))
 
-    def test_hand_order_alternates_with_participant_and_manual_override_is_recorded(self):
+    def test_hand_must_be_chosen_every_session_and_only_left_or_right_exist(self):
+        d = app.DataCollectionDialog({"hand_order": "right"})                  # even a stored hand is NOT pre-selected
+        self.assertEqual(d.settings_payload()["hand_order"], "")
+        self.assertEqual([d.combo_hand_order.itemData(i) for i in range(d.combo_hand_order.count())], ["", "left", "right"])
+        self.assertIn("Choose the hand", d.lbl_plan.text())
+        d.combo_hand_order.setCurrentIndex(d.combo_hand_order.findData("left"))
+        self.assertEqual(d.settings_payload()["hand_order"], "left")
+        self.assertIn("LEFT HAND", d.lbl_plan.text())
+
+    def test_proceed_is_refused_until_a_hand_is_chosen(self):
+        from PyQt5.QtWidgets import QMessageBox
+        shown = []
+        old = QMessageBox.warning
+        QMessageBox.warning = staticmethod(lambda *a, **k: shown.append(a[1]))
+        try:
+            d = app.DataCollectionDialog({"participant_id": "S01", "agreed": True, "task_labels": ["left", "rest"],
+                                          "labels_saved": True, "temp_start_c": 22.0, "humidity_start_pct": 45.0})
+            d._emit_start_requested()
+            self.assertEqual(shown, ["Select the Hand"])
+            self.assertFalse(d.session_prepared)
+        finally:
+            QMessageBox.warning = old
+
+    def test_time_button_reveals_the_fixed_timing(self):
+        d = app.DataCollectionDialog({"task_labels": app.DEFAULT_TASK_LABELS.split(","), "labels_saved": True})
+        self.assertEqual(d.btn_time.text().split()[0], "Time")
+        self.assertTrue(d.time_panel.isHidden())
+        d.btn_time.setChecked(True)
+        self.assertFalse(d.time_panel.isHidden())
+        text = d.time_panel.text()
+        for expected in ("4 s", "3 s", "10 s", "90"):
+            self.assertIn(expected, text)
+
+    def test_repeats_editable_and_electrode_fields_fixed(self):
         d = app.DataCollectionDialog({})
-        d.input_contributor.setText("S01"); self.assertEqual(d.combo_hand_order.currentData(), "left_right")
-        d.input_contributor.setText("S02"); self.assertEqual(d.combo_hand_order.currentData(), "right_left")
-        self.assertEqual(d.settings_payload()["hand_order_source"], "auto")
-        self.assertEqual(d.settings_payload()["hand_order_default"], "right_left")
-        d.combo_hand_order.activated.emit(0)                           # operator picks an order by hand
-        d.combo_hand_order.setCurrentIndex(0)
-        d.input_contributor.setText("S04"); self.assertEqual(d.combo_hand_order.currentData(), "left_right")
-        self.assertEqual(d.settings_payload()["hand_order_source"], "manual")
+        d.spin_task_repeats.setValue(2)
+        self.assertEqual(d.settings_payload()["repeats"], 2)
+        self.assertTrue(d.input_skin_prep.isReadOnly() and d.input_electrode_type.isReadOnly())
+        d.combo_ch1_muscle.setCurrentIndex(2)
+        el = d.settings_payload()["electrode"]
+        self.assertEqual((el["skin_preparation"], el["electrode_type"]), ("Alcohol wipe", "Dry electrodes"))
+        self.assertEqual(el["channel1_muscle"], app.CHANNEL1_MUSCLES[1])
+        self.assertEqual(d.combo_ch1_muscle.count(), 1 + len(app.CHANNEL1_MUSCLES))
+
+    def test_existing_session_for_the_same_hand_is_detected(self):
+        import tempfile
+        from study_meta import find_existing_sessions
+        with tempfile.TemporaryDirectory() as t:
+            os.makedirs(os.path.join(t, "S01_day01_left_20261103T045043Z"))
+            os.makedirs(os.path.join(t, "practice_S01_day01_left_20261103T045043Z"))
+            self.assertEqual(len(find_existing_sessions(t, "S01", 1, "left")), 1)
+            self.assertEqual(find_existing_sessions(t, "S01", 1, "right"), [])
+            self.assertEqual(find_existing_sessions(t, "S01", 2, "left"), [])
 
 
 if __name__ == "__main__":

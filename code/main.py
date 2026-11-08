@@ -94,8 +94,10 @@ from app_theme import (
     themed_label_style,
     themed_status_color,
 )
-from study_meta import (CONSENT_FORM_VERSION, build_metadata_json, default_hand_order, normalize_participant_id,
+from study_meta import (CONSENT_FORM_VERSION, build_metadata_json, default_hand_order, find_existing_sessions,
+                        normalize_participant_id,
                         parse_info_line, session_folder_name, valid_participant_id)
+from channel_quality import assess_channels, summary_for_metadata
 from session_recording import (ContinuousRecorder, EventLog, LABEL_CODES, LABEL_MAP, MIN_VALID_SAMPLE_RATIO,
                                PSEUDO_LABELS, SIGNAL_COLUMNS, finalize_session)
 from emg_v4_core import (StreamAssembler, UsbFrameDecoder, WirelessStats, parse_bwim_packet,
@@ -272,6 +274,9 @@ BLOOD_GROUP_OPTIONS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"]
 ELECTRODE_LANDMARKS = ["Lateral epicondyle", "Medial epicondyle", "Olecranon", "Ulnar styloid process",
                        "Radial styloid process", "Other"]
 SKIN_PREPARATIONS = ["None (dry skin)", "Alcohol wipe", "Shaved + alcohol", "Abraded + alcohol"]
+FIXED_SKIN_PREPARATION = "Alcohol wipe"          # always the same for every participant
+FIXED_ELECTRODE_TYPE = "Dry electrodes"
+CHANNEL1_MUSCLES = ["Extensor digitorum", "Flexor carpi radialis", "Flexor carpi ulnaris"]
 
 
 def _value_or_na(value, fmt, cast=float):
@@ -379,16 +384,16 @@ DEFAULT_TASK_REST_S = 3.0
 DEFAULT_TASK_SETTLE_S = 0.0   # Optional un-recorded gap after each hold (0 keeps the cycle at 10 s).
 DEFAULT_TASK_REPEATS = 9      # Repetitions per class PER HAND in one session.
 DEFAULT_SESSION_DAY = 1
-DEFAULT_HAND_ORDER = "left_right"
+DEFAULT_HAND_ORDER = "left"          # engine fallback only: the dialog never pre-selects a hand
+# One session records ONE hand. The dialog starts on "Select hand" so the operator must choose on purpose.
 HAND_ORDER_OPTIONS = [
-    ("left_right", "Left hand, then Right hand"),
-    ("right_left", "Right hand, then Left hand"),
     ("left", "Left hand only"),
     ("right", "Right hand only"),
 ]
-DEFAULT_MAX_CYCLES_PER_BLOCK = 30   # <= 30 cycles (~5 min) without a break
-DEFAULT_BLOCK_BREAK_S = 210         # 3-4 min break between blocks
-DEFAULT_HAND_SWITCH_BREAK_S = 300   # ~5 min when the armband moves to the other arm
+DEFAULT_MAX_CYCLES_PER_BLOCK = 100000   # one continuous block: a session has no breaks
+DEFAULT_BLOCK_BREAK_S = 0               # no breaks during data collection
+DEFAULT_HAND_SWITCH_BREAK_S = 0
+CHECKPOINT_EVERY_CYCLES = 30            # background checkpoint of the CSV data every N cycles (no pause)
 STUDY_ENV_KEYS = ("temp_start_c", "humidity_start_pct")
 DEFAULT_RECORD_CSV = "realtime_collected_emg.csv"
 DEFAULT_RF_MODEL_ARTIFACT = "rf_realtime_model.joblib"
@@ -1866,7 +1871,7 @@ class CalibrationDialog(QDialog):
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
         self.setWindowTitle("Channel Calibration")
         self.setModal(True)
-        self.resize(680, 560)
+        self.resize(760, 760)
         apply_dark_title_bar(self)
         self.is_connected = bool(is_connected)
         self.is_port_applied = bool(is_port_applied)
@@ -1925,7 +1930,9 @@ class CalibrationDialog(QDialog):
         self.lbl_steps = QLabel(
             "Calibration Steps:<br>"
             "1. <b>REST</b>: Keep your arm relaxed and steady, and try to remain calm.<br>"
-            "2. <b>FLEX</b>: Get stretch and strong flex in the target muscle."
+            "2. <b>FLEX</b>: Get stretch and strong flex in the target muscle.<br>"
+            "3. <b>CONTACT CHECK</b> (automatic): every channel is rated Good / Fair / Poor so a loose "
+            "electrode is found <i>before</i> you record."
         )
         self.lbl_steps.setWordWrap(True)
         layout.addWidget(self.lbl_steps)
@@ -2013,6 +2020,41 @@ class CalibrationDialog(QDialog):
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
+
+        # ---- Electrode contact result (filled in when calibration finishes) -------------------
+        layout.addSpacing(10)
+        lbl_contact = QLabel("Channel Contact Check")
+        lbl_contact.setStyleSheet("font-weight: bold; font-size: 19px;")
+        layout.addWidget(lbl_contact)
+        self.lbl_contact_hint = QLabel(
+            "After calibration each channel is scored from how clearly it reacts to the flex, how quiet it is "
+            "at rest, mains hum, baseline drift and clipping.")
+        self.lbl_contact_hint.setWordWrap(True)
+        self.lbl_contact_hint.setStyleSheet(themed_label_style("muted"))
+        layout.addWidget(self.lbl_contact_hint)
+        self.lbl_contact_verdict = QLabel("Run calibration to check the electrode contact.")
+        self.lbl_contact_verdict.setWordWrap(True)
+        self.lbl_contact_verdict.setStyleSheet("font-weight: bold; font-size: 15px;")
+        layout.addWidget(self.lbl_contact_verdict)
+        self.contact_table = QTableWidget(0, 6)
+        self.contact_table.setHorizontalHeaderLabels(["Channel", "Contact", "Score", "Flex SNR", "Rest noise", "What to do"])
+        self.contact_table.verticalHeader().setVisible(False)
+        self.contact_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.contact_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.contact_table.setWordWrap(True)
+        self.contact_table.setMinimumHeight(230)
+        hdr = self.contact_table.horizontalHeader()
+        hdr.setStretchLastSection(True)
+        self.contact_table.setColumnWidth(0, 70)
+        self.contact_table.setColumnWidth(1, 90)
+        self.contact_table.setColumnWidth(2, 55)
+        self.contact_table.setColumnWidth(3, 80)
+        self.contact_table.setColumnWidth(4, 90)
+        self.contact_table.setToolTip(
+            "Score 75+ = Good, 50-74 = Fair, below 50 = Poor.\n"
+            "Flex SNR: how much stronger the signal is when flexing than at rest (12 dB or more is good).\n"
+            "Rest noise: RMS noise in ADC counts while relaxed (lower is better).")
+        layout.addWidget(self.contact_table)
 
         self.lock_overlay = QWidget(self)
         self.lock_overlay.setStyleSheet(
@@ -2146,6 +2188,40 @@ class CalibrationDialog(QDialog):
         self.btn_start.setText("Completed")
         self.btn_recalibrate.setEnabled(self.is_connected and self.is_port_applied)
 
+    _GRADE_COLORS = {"GOOD": THEME_COLORS["ok"], "FAIR": THEME_COLORS["warn"],
+                     "POOR": THEME_COLORS["special"], "NO SIGNAL": THEME_COLORS["special"]}
+
+    def set_contact_report(self, report):
+        """Show the per-channel contact verdict produced by channel_quality.assess_channels()."""
+        if not report:
+            self.contact_table.setRowCount(0)
+            self.lbl_contact_verdict.setText("Run calibration to check the electrode contact.")
+            self.lbl_contact_verdict.setStyleSheet("font-weight: bold; font-size: 15px;")
+            return
+        self.lbl_contact_verdict.setText(("\u2713 " if report["ready"] else "\u26a0 ") + report["message"])
+        color = THEME_COLORS["ok"] if report["ready"] and not report["counts"].get("FAIR") else (
+            THEME_COLORS["warn"] if report["ready"] else THEME_COLORS["special"])
+        self.lbl_contact_verdict.setStyleSheet(f"font-weight: bold; font-size: 15px; color: {color};")
+        chans = report["channels"]
+        self.contact_table.setRowCount(len(chans))
+        for row, c in enumerate(chans):
+            snr = "--" if c["snr_db"] is None else f"{c['snr_db']:.1f} dB"
+            noise = "--" if c["rest_rms"] is None else f"{c['rest_rms']:.1f}"
+            cells = [c["name"], c["grade"].title(), str(c["score"]), snr, noise, c["advice"]]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if col == 1:
+                    item.setForeground(QBrush(QColor(self._GRADE_COLORS.get(c["grade"], THEME_COLORS["text"]))))
+                    f = item.font(); f.setBold(True); item.setFont(f)
+                if col == 5 and len(c["issues"]) > 1:
+                    item.setToolTip("\n".join(t for _code, t in c["issues"]))
+                self.contact_table.setItem(row, col, item)
+            self.contact_table.setRowHeight(row, 44)
+        self.contact_table.setFixedHeight(34 + 44 * len(chans) + 4)    # show every channel without an inner scrollbar
+        # Bring the verdict into view: it sits below the calibration controls.
+        QTimer.singleShot(0, lambda: [sa.ensureWidgetVisible(self.contact_table, 0, 40)
+                                      for sa in self.findChildren(QScrollArea)])
+
     def set_calibrated_state(self, is_calibrated):
         self.is_calibrated = bool(is_calibrated)
         can_calibrate = self.is_connected and self.is_port_applied and (not self.is_running)
@@ -2219,17 +2295,12 @@ def plan_summary(settings):
     hold = float(settings.get("hold_s", DEFAULT_TASK_HOLD_S))
     rest = float(settings.get("rest_s", DEFAULT_TASK_REST_S))
     settle = float(settings.get("settle_s", DEFAULT_TASK_SETTLE_S))
-    max_block = max(1, int(settings.get("max_cycles_per_block", DEFAULT_MAX_CYCLES_PER_BLOCK)))
-    block_break = float(settings.get("block_break_s", DEFAULT_BLOCK_BREAK_S))
-    switch_break = float(settings.get("hand_switch_s", DEFAULT_HAND_SWITCH_BREAK_S))
     cycle_s = prep + hold + settle + rest
     cycles_per_hand = len(labels) * repeats
-    blocks_per_hand = -(-cycles_per_hand // max_block) if cycles_per_hand else 0
+    blocks_per_hand = 1 if cycles_per_hand else 0     # no breaks: one continuous block
     cycles = cycles_per_hand * len(hands)
-    block_breaks = max(0, blocks_per_hand - 1) * len(hands)
-    switch_breaks = max(0, len(hands) - 1)
     active_s = cycles * cycle_s
-    total_s = active_s + block_breaks * block_break + switch_breaks * switch_break
+    total_s = active_s                                # nothing but the cycles themselves
     return {
         "hands": hands, "cycles": cycles, "cycles_per_hand": cycles_per_hand,
         "blocks_per_hand": blocks_per_hand, "cycle_s": cycle_s,
@@ -2264,9 +2335,6 @@ class TaskProtocolWidget(QWidget):
         self.hand_order = DEFAULT_HAND_ORDER
         self.session_day = DEFAULT_SESSION_DAY
         self.max_cycles_per_block = DEFAULT_MAX_CYCLES_PER_BLOCK
-        self.block_break_ms = int(DEFAULT_BLOCK_BREAK_S * 1000)
-        self.hand_switch_ms = int(DEFAULT_HAND_SWITCH_BREAK_S * 1000)
-
         self.steps = []
         self.step_idx = -1
         self.remaining_ms = 0
@@ -2330,12 +2398,12 @@ class TaskProtocolWidget(QWidget):
         text_col.addStretch(1)
         layout.addWidget(self.phase_box)
 
-        self.lbl_meta_info = StableLabel("Day - | Hand - | Block -/- | Cycle -/- | Label: -")
+        self.lbl_meta_info = StableLabel("Day - | Hand - | Cycle -/- | Label: -")
         self.lbl_meta_info.setWordWrap(True)
         self.lbl_meta_info.setStyleSheet(themed_label_style("muted"))
         layout.addWidget(self.lbl_meta_info)
 
-        self.lbl_count = StableLabel("Phase: --.- s | Session: --:-- left")
+        self.lbl_count = StableLabel("Phase --.- s  |  Elapsed --:--  |  Time left --:--  |  Total --:--")
         self.lbl_count.setStyleSheet("font-weight: bold;")
         layout.addWidget(self.lbl_count)
 
@@ -2354,10 +2422,22 @@ class TaskProtocolWidget(QWidget):
         self.progress_session.setFixedHeight(6)
         layout.addWidget(self.progress_session)
 
-        # Live CSV counter: rows captured so far versus what the protocol should produce.
+        # Live CSV progress: rows captured so far versus what the protocol should produce, with the
+        # packet loss and the electrode-contact verdict shown underneath for the whole session.
         self.lbl_csv_counter = StableLabel("CSV rows recorded: 0")
         self.lbl_csv_counter.setStyleSheet(f"font-weight: bold; color: {THEME_COLORS['accent']};")
         layout.addWidget(self.lbl_csv_counter)
+        self.csv_bar = QProgressBar()
+        self.csv_bar.setRange(0, 1000)
+        self.csv_bar.setValue(0)
+        self.csv_bar.setTextVisible(False)
+        self.csv_bar.setFixedHeight(8)
+        self.csv_bar.setToolTip("Rows written to the session CSV compared with the rows the whole protocol should produce.")
+        layout.addWidget(self.csv_bar)
+        self.lbl_live_stats = StableLabel("Packet loss: --")
+        self.lbl_live_stats.setWordWrap(True)
+        self.lbl_live_stats.setStyleSheet(f"font-weight: bold; color: {THEME_COLORS['muted']};")
+        layout.addWidget(self.lbl_live_stats)
 
         btn_row = QHBoxLayout()
         self.btn_start = QPushButton("Start Recording")
@@ -2374,13 +2454,6 @@ class TaskProtocolWidget(QWidget):
         self.btn_pause.clicked.connect(self.toggle_pause)
         btn_row.addWidget(self.btn_pause)
 
-        self.btn_skip_break = QPushButton("Skip Break")
-        self.btn_skip_break.setStyleSheet(themed_button_style("muted"))
-        self.btn_skip_break.setEnabled(False)
-        self.btn_skip_break.setToolTip("End the current break early (participant is ready).")
-        self.btn_skip_break.clicked.connect(self.skip_break)
-        btn_row.addWidget(self.btn_skip_break)
-
         self.btn_cancel = QPushButton("Cancel Session")
         self.btn_cancel.setStyleSheet(themed_button_style("muted"))
         self.btn_cancel.setEnabled(False)
@@ -2393,7 +2466,7 @@ class TaskProtocolWidget(QWidget):
     def configure(self, labels, repeats, prep_s, hold_s, rest_s, record_rest=True,
                   settle_s=DEFAULT_TASK_SETTLE_S, randomize_order=True, hand_order=DEFAULT_HAND_ORDER,
                   session_day=DEFAULT_SESSION_DAY, max_cycles_per_block=DEFAULT_MAX_CYCLES_PER_BLOCK,
-                  block_break_s=DEFAULT_BLOCK_BREAK_S, hand_switch_s=DEFAULT_HAND_SWITCH_BREAK_S, seed=0):
+                  block_break_s=0, hand_switch_s=0, seed=0):   # break arguments are accepted and ignored: no breaks
         self.seed = int(seed)
         self.labels = [str(x).strip() for x in (labels or []) if str(x).strip()]
         self.repeats = max(1, int(repeats))
@@ -2406,8 +2479,6 @@ class TaskProtocolWidget(QWidget):
         self.hand_order = str(hand_order)
         self.session_day = int(session_day)
         self.max_cycles_per_block = max(1, int(max_cycles_per_block))
-        self.block_break_ms = int(max(0.0, block_break_s) * 1000)
-        self.hand_switch_ms = int(max(0.0, hand_switch_s) * 1000)
         self.steps = self.build_steps()
         self.session_total_ms = max(1, sum(int(st["duration_ms"]) for st in self.steps))
         self.session_done_ms = 0
@@ -2418,18 +2489,19 @@ class TaskProtocolWidget(QWidget):
         self.is_ready = True
         self.progress.setValue(0)
         self.progress_session.setValue(0)
+        self.csv_bar.setValue(0)
         self.btn_start.setEnabled(False)
         self.btn_cancel.setEnabled(False)
-        self.btn_skip_break.setEnabled(False)
         self.lbl_phase.setText("Ready")
         self.lbl_instruction.setText("Session configured. Press Start Recording to begin.")
         self._set_gesture_image(None)
         self.phase_box.set_state("activity")
         self.lbl_meta_info.setText(
-            f"Day {self.session_day} | {' + '.join(hands_for_order(self.hand_order))} hand | "
-            f"{self.cycles_total} cycles | about {format_duration(self.session_total_ms, False)} incl. breaks"
+            f"Day {self.session_day} | {' + '.join(hands_for_order(self.hand_order)).upper()} HAND | "
+            f"{self.cycles_total} cycles | total time {format_duration(self.session_total_ms, False)} (no breaks)"
         )
-        self.lbl_count.setText(f"Phase: --.- s | Session: {format_duration(self.session_total_ms, False)} left")
+        self.lbl_count.setText(f"Phase --.- s  |  Elapsed 0:00  |  Time left {format_duration(self.session_total_ms, False)}"
+                               f"  |  Total {format_duration(self.session_total_ms, False)}")
 
     @property
     def cycles_total(self):
@@ -2442,19 +2514,29 @@ class TaskProtocolWidget(QWidget):
         if not self.is_running:
             self.btn_cancel.setEnabled(bool(enabled) and self.is_ready)
 
-    def set_csv_counter(self, text, kind="accent"):
-        color = {"accent": THEME_COLORS["accent"], "warn": "#f57c00", "danger": "#f44336"}.get(kind, THEME_COLORS["accent"])
+    _KIND_COLORS = {"accent": None, "ok": THEME_COLORS["ok"], "warn": THEME_COLORS["warn"],
+                    "danger": THEME_COLORS["special"]}
+
+    def _kind_color(self, kind):
+        return self._KIND_COLORS.get(kind) or THEME_COLORS["accent"]
+
+    def set_csv_counter(self, text, kind="accent", fraction=None):
         self.lbl_csv_counter.setText(text)
-        self.lbl_csv_counter.setStyleSheet(f"font-weight: bold; color: {color};")
+        self.lbl_csv_counter.setStyleSheet(f"font-weight: bold; color: {self._kind_color(kind)};")
+        if fraction is not None:
+            self.csv_bar.setValue(int(1000 * max(0.0, min(1.0, float(fraction)))))
+
+    def set_live_stats(self, text, kind="ok"):
+        """Packet loss and electrode contact, shown for the whole session."""
+        self.lbl_live_stats.setText(text)
+        self.lbl_live_stats.setStyleSheet(f"font-weight: bold; color: {self._kind_color(kind)};")
 
     def build_steps(self):
         """Flatten the study design into timed steps.
 
         Per hand: `repeats` repetitions of every class (order shuffled per repetition so
-        fatigue is spread across classes), split into blocks of at most
-        `max_cycles_per_block` cycles with a break in between; a longer break separates
-        the hands (the armband moves to the other forearm). Trial ids keep counting up
-        across hands so (label, trial) stays unique in the CSV.
+        fatigue is spread across classes). There are no breaks: the cycles run back to back.
+        Trial ids keep counting up across hands so (label, trial) stays unique in the CSV.
         """
         steps = []
         rng = random.Random(self.seed)   # per-session seed, saved in the metadata: the order is reproducible
@@ -2490,20 +2572,6 @@ class TaskProtocolWidget(QWidget):
                                       "instruction": "Relax. (Not recorded - settling before Rest capture.)"})
                     steps.append({**common, "phase": "Rest", "label": "Rest", "duration_ms": self.rest_ms,
                                   "record": self.record_rest, "instruction": "Rest arm fully. Relax muscles."})
-                is_last_block = block_idx == len(blocks) - 1
-                is_last_hand = hand_idx == len(hands) - 1
-                common = {"trial_id": cycles[-1][0] if is_last_block else block[-1][0], "hand": hand,
-                          "block": block_idx + 1, "blocks": len(blocks), "cycle_no": cycle_no,
-                          "cycles_total": cycles_total, "label": "Rest", "record": False}
-                if not is_last_block and self.block_break_ms > 0:
-                    steps.append({**common, "phase": "Break", "duration_ms": self.block_break_ms,
-                                  "instruction": f"Block {block_idx + 1}/{len(blocks)} done. Relax and shake out your "
-                                                 "arm. The next block starts when the countdown ends."})
-                elif is_last_block and not is_last_hand and self.hand_switch_ms > 0:
-                    next_hand = hands[hand_idx + 1]
-                    steps.append({**common, "phase": "Switch Hand", "duration_ms": self.hand_switch_ms,
-                                  "instruction": f"{hand} hand finished. Move the armband to the {next_hand.lower()} "
-                                                 "forearm (re-run Channel Calibration if needed)."})
             trial_offset += self.repeats
         return steps
 
@@ -2532,8 +2600,6 @@ class TaskProtocolWidget(QWidget):
             return "prepare"
         if p == "perform":
             return "perform"
-        if p in ("break", "switch hand"):
-            return "break"
         return "activity"
 
     def next_step(self, advance_done=True):
@@ -2547,7 +2613,6 @@ class TaskProtocolWidget(QWidget):
             self.is_running = False
             self.is_ready = False
             self.btn_cancel.setEnabled(False)
-            self.btn_skip_break.setEnabled(False)
             self.btn_pause.setEnabled(False)
             self.progress.setValue(100)
             self.progress_session.setValue(1000)
@@ -2556,7 +2621,8 @@ class TaskProtocolWidget(QWidget):
             self._set_gesture_image(None)
             self.phase_box.set_state("activity")
             self.lbl_meta_info.setText("Session complete.")
-            self.lbl_count.setText("Phase: 0.0 s | Session: 0:00 left")
+            self.lbl_count.setText(f"Phase 0.0 s  |  Elapsed {format_duration(self.session_total_ms, False)}  |  "
+                                   f"Time left 0:00  |  Total {format_duration(self.session_total_ms, False)}")
             self.protocol_finished.emit()
             return
 
@@ -2566,7 +2632,6 @@ class TaskProtocolWidget(QWidget):
         self.step_deadline = time.monotonic() + self.remaining_ms / 1000.0
         phase_name = str(st["phase"]).strip().lower()
         pretty_label = str(st["label"]).replace("_", " ")
-        is_break = phase_name in ("break", "switch hand")
         if phase_name == "perform":
             phase_display = f"Perform: {pretty_label}"
         elif phase_name == "prepare":
@@ -2575,27 +2640,21 @@ class TaskProtocolWidget(QWidget):
             phase_display = "Rest"
         elif phase_name == "settle":
             phase_display = "Settling..."
-        elif phase_name == "break":
-            phase_display = "Break"
-        elif phase_name == "switch hand":
-            phase_display = "Switch Hand"
         else:
             phase_display = str(st["phase"])
         self.lbl_phase.setText(phase_display)
         self.lbl_instruction.setText(st["instruction"])
         self.phase_box.set_state(self._state_for_phase(st["phase"]))
-        self._set_gesture_image(None if is_break else st["label"])
-        self.btn_skip_break.setEnabled(is_break)
+        self._set_gesture_image(st["label"])
         self.lbl_meta_info.setText(
-            f"Day {self.session_day} | {st['hand']} hand | Block {st['block']}/{st['blocks']} | "
-            f"Cycle {st['cycle_no']}/{st['cycles_total']} | Trial {st['trial_id']}"
-            + ("" if is_break else f" | Label: {st['label']}")
+            f"Day {self.session_day} | {str(st['hand']).upper()} HAND | "
+            f"Cycle {st['cycle_no']}/{st['cycles_total']} | Trial {st['trial_id']} | Label: {st['label']}"
         )
         self._update_countdown_labels(self.remaining_ms)
         self.progress.setValue(0)
 
         self._emit_phase_started(st, int(st["duration_ms"]))
-        self.timer.start(50 if not is_break else 200)
+        self.timer.start(50)
 
     def _emit_phase_started(self, st, planned_ms):
         self.phase_started.emit(
@@ -2626,7 +2685,6 @@ class TaskProtocolWidget(QWidget):
         self.lbl_instruction.setText("Session paused - recording is stopped. Press Resume when ready.")
         self.phase_box.set_state("break")
         self.btn_pause.setText("Resume")
-        self.btn_skip_break.setEnabled(False)
         self.paused_changed.emit(True)
 
     def resume_protocol(self):
@@ -2635,17 +2693,6 @@ class TaskProtocolWidget(QWidget):
         self.paused = False
         self.btn_pause.setText("Pause")
         st = self.steps[self.step_idx]
-        if str(st["phase"]).strip().lower() in ("break", "switch hand"):
-            self.step_deadline = time.monotonic() + self._pause_remaining_ms / 1000.0
-            if self._pause_saved:
-                self.lbl_phase.setText(self._pause_saved[0])
-                self.lbl_instruction.setText(self._pause_saved[1])
-                self.phase_box.set_state(self._pause_saved[2])
-            self.btn_skip_break.setEnabled(True)
-            self.paused_changed.emit(False)
-            self._emit_phase_started(st, self._pause_remaining_ms)   # the break label resumes at this sample
-            self.timer.start(200)
-            return
         # Mid-cycle: restart the cycle from its Prepare step so every recorded trial is complete.
         j = self.step_idx
         while j > 0 and self.steps[j]["phase"] != "Prepare":
@@ -2655,13 +2702,6 @@ class TaskProtocolWidget(QWidget):
         self.paused_changed.emit(False)
         self.rewind_requested.emit()
         self.next_step(advance_done=False)
-
-    def skip_break(self):
-        if not self.is_running or not (0 <= self.step_idx < len(self.steps)):
-            return
-        if str(self.steps[self.step_idx]["phase"]).strip().lower() in ("break", "switch hand"):
-            self.timer.stop()
-            self.next_step()
 
     def _preload_gesture_images(self):
         dpr = self.devicePixelRatioF()
@@ -2680,11 +2720,21 @@ class TaskProtocolWidget(QWidget):
         self.lbl_gesture_image.setPixmap(pix)
         self.lbl_gesture_image.show()
 
+    def elapsed_ms(self):
+        """Milliseconds of the session timeline that have passed (0 when idle)."""
+        if not self.is_running or not (0 <= self.step_idx < len(self.steps)):
+            return 0
+        left = self._pause_remaining_ms if self.paused else max(
+            0, int(round((self.step_deadline - time.monotonic()) * 1000.0)))
+        return int(self.session_done_ms + max(0, self.current_step_total_ms - left))
+
     def _update_countdown_labels(self, remaining_ms):
         elapsed_in_step = self.current_step_total_ms - remaining_ms
-        session_left = max(0, self.session_total_ms - self.session_done_ms - elapsed_in_step)
+        session_elapsed = min(self.session_total_ms, self.session_done_ms + elapsed_in_step)
+        session_left = max(0, self.session_total_ms - session_elapsed)
         self.lbl_count.setText(
-            f"Phase: {format_duration(remaining_ms)} left | Session: {format_duration(session_left, False)} left"
+            f"Phase {format_duration(remaining_ms)}  |  Elapsed {format_duration(session_elapsed, False)}  |  "
+            f"Time left {format_duration(session_left, False)}  |  Total {format_duration(self.session_total_ms, False)}"
         )
         self.progress_session.setValue(int(1000 * min(1.0, (self.session_done_ms + elapsed_in_step) / self.session_total_ms)))
 
@@ -2709,7 +2759,6 @@ class TaskProtocolWidget(QWidget):
         self.is_ready = False
         self.btn_cancel.setEnabled(False)
         self.btn_start.setEnabled(False)
-        self.btn_skip_break.setEnabled(False)
         self.progress.setValue(0)
         self.progress_session.setValue(0)
         self.lbl_phase.setText("Canceled" if was_running else "Waiting")
@@ -2718,8 +2767,8 @@ class TaskProtocolWidget(QWidget):
             "Protocol canceled. Press Proceed to prepare again." if was_running else "Press Proceed to prepare."
         )
         self.phase_box.set_state("activity")
-        self.lbl_meta_info.setText("Day - | Hand - | Block -/- | Cycle -/- | Label: -")
-        self.lbl_count.setText("Phase: --.- s | Session: --:-- left")
+        self.lbl_meta_info.setText("Day - | Hand - | Cycle -/- | Label: -")
+        self.lbl_count.setText("Phase --.- s  |  Elapsed --:--  |  Time left --:--  |  Total --:--")
         if emit_signal and (was_running or was_prepared):
             self.protocol_canceled.emit()
 
@@ -4036,20 +4085,21 @@ class DataCollectionDialog(QDialog):
             self.combo_landmark.setCurrentText(electrode["landmark"])
         self.spin_landmark_distance = _make_spin(0.0, 60.0, 0.5, 1, " cm", electrode.get("landmark_distance_cm", 0.0))
         self.spin_landmark_distance.setToolTip("Distance from the landmark to the centre of the armband, along the forearm.")
-        self.input_ch1_muscle = QLineEdit(str(electrode.get("channel1_muscle", "") or ""))
-        self.input_ch1_muscle.setPlaceholderText("muscle under channel 1")
-        self.combo_skin_prep = QComboBox()
-        self.combo_skin_prep.addItems(["N/A"] + SKIN_PREPARATIONS)
-        if electrode.get("skin_preparation") in SKIN_PREPARATIONS:
-            self.combo_skin_prep.setCurrentText(electrode["skin_preparation"])
-        self.input_electrode_type = QLineEdit(str(electrode.get("electrode_type", "") or ""))
-        self.input_electrode_type.setPlaceholderText("e.g. dry electrodes, OYMotion armband")
-        self.input_photo = QLineEdit(str(electrode.get("photo_filename", "") or ""))
-        self.input_photo.setPlaceholderText("placement photo file name")
+        self.combo_ch1_muscle = QComboBox()
+        self.combo_ch1_muscle.addItems(["N/A"] + CHANNEL1_MUSCLES)
+        if electrode.get("channel1_muscle") in CHANNEL1_MUSCLES:
+            self.combo_ch1_muscle.setCurrentText(electrode["channel1_muscle"])
+        # Skin preparation and electrode type are the same for every session, so they are shown but locked.
+        self.input_skin_prep = QLineEdit(FIXED_SKIN_PREPARATION)
+        self.input_skin_prep.setReadOnly(True)
+        self.input_skin_prep.setToolTip("Fixed by the study protocol: clean the skin with an alcohol wipe.")
+        self.input_electrode_type = QLineEdit(FIXED_ELECTRODE_TYPE)
+        self.input_electrode_type.setReadOnly(True)
+        self.input_electrode_type.setToolTip("Fixed by the study protocol.")
         for col, (text, widget) in enumerate([
             ("Landmark:", self.combo_landmark), ("Distance:", self.spin_landmark_distance),
-            ("Channel 1 muscle:", self.input_ch1_muscle), ("Skin preparation:", self.combo_skin_prep),
-            ("Electrode type:", self.input_electrode_type), ("Photo file:", self.input_photo),
+            ("Channel 1 muscle:", self.combo_ch1_muscle), ("Skin preparation:", self.input_skin_prep),
+            ("Electrode type:", self.input_electrode_type),
         ]):
             row, base = divmod(col, 2)
             electrode_grid.addWidget(QLabel(text), row, base * 2)
@@ -4123,57 +4173,29 @@ class DataCollectionDialog(QDialog):
         self.spin_session_day.setRange(1, 2)
         self.spin_session_day.setPrefix("Day ")
         self.spin_session_day.setValue(int(settings.get("session_day", DEFAULT_SESSION_DAY)))
+        # The hand is never pre-selected (not even from the previous session): the operator has to choose it
+        # every time, because recording with the wrong hand selected silently mislabels the whole session.
         self.combo_hand_order = QComboBox()
+        self.combo_hand_order.addItem("Select hand (required)", "")
         for key, text in HAND_ORDER_OPTIONS:
             self.combo_hand_order.addItem(text, key)
-        idx = self.combo_hand_order.findData(str(settings.get("hand_order", DEFAULT_HAND_ORDER)))
-        self.combo_hand_order.setCurrentIndex(max(0, idx))
-        self.spin_task_repeats = QSpinBox()
-        self.spin_task_repeats.setRange(1, 100)
-        self.spin_task_repeats.setValue(int(settings.get("repeats", DEFAULT_TASK_REPEATS)))
-        self.spin_task_repeats.setToolTip("Repetitions of every class per hand (study: 9 per hand per day).")
-
-        def _seconds_spin(minimum, maximum, step, value, decimals=1, suffix=" s"):
-            sp = QDoubleSpinBox()
-            sp.setRange(minimum, maximum)
-            sp.setSingleStep(step)
-            sp.setDecimals(decimals)
-            sp.setSuffix(suffix)
-            sp.setValue(float(value))
-            return sp
-
-        self.spin_task_prep = _seconds_spin(0.2, 30.0, 0.5, settings.get("prep_s", DEFAULT_TASK_PREP_S))
-        self.spin_task_hold = _seconds_spin(0.2, 30.0, 0.5, settings.get("hold_s", DEFAULT_TASK_HOLD_S))
-        self.spin_task_rest = _seconds_spin(0.2, 30.0, 0.5, settings.get("rest_s", DEFAULT_TASK_REST_S))
-        # Fixed by the study protocol, so not shown: no settle gap, 30 cycles per block, 3.5 min block break.
+        self.combo_hand_order.setCurrentIndex(0)
+        self.combo_hand_order.setToolTip("Which arm wears the armband for this session. Must be chosen every session.")
+        # Fixed by the study protocol, so not editable: 4 s prepare, 3 s perform, 3 s rest (a 10 s cycle), no settle gap and no breaks (one continuous block).
         self._fixed_plan = {
-            "settle_s": float(settings.get("settle_s", DEFAULT_TASK_SETTLE_S)),
-            "max_cycles_per_block": int(settings.get("max_cycles_per_block", DEFAULT_MAX_CYCLES_PER_BLOCK)),
-            "block_break_s": float(settings.get("block_break_s", DEFAULT_BLOCK_BREAK_S)),
+            "prep_s": DEFAULT_TASK_PREP_S,
+            "hold_s": DEFAULT_TASK_HOLD_S,
+            "rest_s": DEFAULT_TASK_REST_S,
+            "settle_s": DEFAULT_TASK_SETTLE_S,
+            "max_cycles_per_block": DEFAULT_MAX_CYCLES_PER_BLOCK,
+            "block_break_s": 0.0,
+            "hand_switch_s": 0.0,
         }
-        self.spin_hand_switch = _seconds_spin(
-            0, 1800, 10, settings.get("hand_switch_s", DEFAULT_HAND_SWITCH_BREAK_S), 0)
-        self.spin_hand_switch.setToolTip("Break while the armband is moved to the other arm (study: about 5 minutes).")
         self.check_record_rest = QCheckBox("Record Rest")
         self.check_record_rest.setChecked(bool(settings.get("record_rest", True)))
         self.session_seed = int(settings.get("seed", 0) or 0) or secrets.randbits(32)
-        self._hand_order_manual = str(settings.get("hand_order_source", "auto")) == "manual"
-        self.check_practice = QCheckBox("Practice / demo mode")
-        self.check_practice.setChecked(bool(settings.get("practice_mode", False)))
-        self.check_practice.setToolTip("Practice runs are saved under a 'practice_' folder and are NOT part of the dataset.\n"
-                                       "Only in this mode can randomization be switched off.")
-        self.check_randomize_order = QCheckBox("Randomize Gesture Order")
-        self.check_randomize_order.setChecked(bool(settings.get("randomize_order", True)))
-        self.check_randomize_order.setToolTip(
-            "Shuffle gesture order independently each repeat, so fatigue doesn't always "
-            "degrade whichever gesture is fixed last in the cycle."
-        )
-
         plan_fields = [
             ("Session:", self.spin_session_day), ("Hands:", self.combo_hand_order),
-            ("Repeats per hand:", self.spin_task_repeats),
-            ("Prepare:", self.spin_task_prep), ("Perform:", self.spin_task_hold), ("Rest:", self.spin_task_rest),
-            ("Hand-switch break:", self.spin_hand_switch),
         ]
         for i, (text, widget) in enumerate(plan_fields):
             row, base = divmod(i, 2)
@@ -4183,10 +4205,35 @@ class DataCollectionDialog(QDialog):
             plan_grid.setColumnStretch(col, 1)
         config_layout.addLayout(plan_grid)
 
+        # The fixed timing is visible, but only on request, under a "Time" button (read-only).
+        self.btn_time = QPushButton("Time  \u25b8")
+        self.btn_time.setCheckable(True)
+        self.btn_time.setStyleSheet(themed_button_style("muted"))
+        self.btn_time.setToolTip("Show the fixed session timing (cannot be changed).")
+        self.spin_task_repeats = QSpinBox()
+        self.spin_task_repeats.setRange(1, 100)
+        self.spin_task_repeats.setValue(int(settings.get("repeats", DEFAULT_TASK_REPEATS)))
+        self.spin_task_repeats.setMinimumWidth(110)
+        self.spin_task_repeats.setToolTip("Repetitions of every class per hand (study: 9 per hand per day). Editable.")
+        row_time = QHBoxLayout()
+        row_time.addWidget(self.btn_time)
+        row_time.addSpacing(16)
+        row_time.addWidget(QLabel("Repeats per hand:"))
+        row_time.addWidget(self.spin_task_repeats)
+        row_time.addStretch()
+        config_layout.addLayout(row_time)
+        self.time_panel = QLabel("")
+        self.time_panel.setWordWrap(True)
+        self.time_panel.setTextFormat(Qt.RichText)
+        self.time_panel.setStyleSheet(
+            f"background-color: {THEME_COLORS['panel']}; border: 1px solid {THEME_COLORS['border']}; "
+            "border-radius: 6px; padding: 8px 12px;")
+        self.time_panel.hide()
+        config_layout.addWidget(self.time_panel)
+        self.btn_time.toggled.connect(self._toggle_time)
+
         row_checks = QHBoxLayout()
         row_checks.addWidget(self.check_record_rest)
-        row_checks.addWidget(self.check_randomize_order)
-        row_checks.addWidget(self.check_practice)
         row_checks.addStretch()
         config_layout.addLayout(row_checks)
 
@@ -4245,22 +4292,14 @@ class DataCollectionDialog(QDialog):
             self.spin_forearm_circumference.valueChanged,
             self.spin_temp_start.valueChanged, self.spin_humidity_start.valueChanged,
             self.combo_landmark.currentIndexChanged, self.spin_landmark_distance.valueChanged,
-            self.input_ch1_muscle.textChanged, self.combo_skin_prep.currentIndexChanged,
-            self.input_electrode_type.textChanged, self.input_photo.textChanged,
+            self.combo_ch1_muscle.currentIndexChanged,
             self.spin_session_day.valueChanged, self.combo_hand_order.currentIndexChanged,
-            self.spin_task_repeats.valueChanged, self.spin_task_prep.valueChanged,
-            self.spin_task_hold.valueChanged, self.spin_task_rest.valueChanged,
-            self.spin_hand_switch.valueChanged,
-            self.check_record_rest.stateChanged, self.check_randomize_order.stateChanged,
-            self.check_practice.stateChanged,
+            self.spin_task_repeats.valueChanged, self.check_record_rest.stateChanged,
             self.input_record_dir.textChanged,
         ):
             sig.connect(self._emit_settings_changed)
-        self.check_practice.stateChanged.connect(self._apply_practice_rules)
-        self.combo_hand_order.activated.connect(self._on_hand_order_chosen)
-        self.input_contributor.textChanged.connect(self._on_participant_id_changed)
-        self._apply_practice_rules()
-        self._on_participant_id_changed()
+        self.combo_hand_order.currentIndexChanged.connect(self._refresh_hand_warning)
+        self._refresh_hand_warning()
         self.check_agree_yes.stateChanged.connect(self._on_agree_yes_changed)
         self.check_agree_no.stateChanged.connect(self._on_agree_no_changed)
 
@@ -4270,12 +4309,16 @@ class DataCollectionDialog(QDialog):
 
     # -- helpers ---------------------------------------------------------------
     def _update_plan_label(self):
-        plan = plan_summary(self.settings_payload())
-        hands = " + ".join(plan["hands"])
+        self._refresh_time_panel()
+        payload = self.settings_payload()
+        plan = plan_summary(payload)
+        if not payload["hand_order"]:
+            self.lbl_plan.setText("Choose the hand (Left / Right) to see the session plan.")
+            return
+        hands = " + ".join(plan["hands"]).upper()
         self.lbl_plan.setText(
-            f"This session: {hands} hand | {plan['cycles']} cycles x {plan['cycle_s']:.0f} s = "
-            f"{format_duration(plan['active_s'] * 1000, False)} active | {plan['blocks_per_hand']} block(s) per hand | "
-            f"about {format_duration(plan['total_s'] * 1000, False)} including breaks"
+            f"This session: {hands} HAND | {plan['cycles']} cycles x {plan['cycle_s']:.0f} s | "
+            f"total recording time {format_duration(plan['total_s'] * 1000, False)} (no breaks)"
         )
 
     def _refresh_class_labels_display(self):
@@ -4311,37 +4354,50 @@ class DataCollectionDialog(QDialog):
             "electrode": {
                 "landmark": self.combo_landmark.currentText() if self.combo_landmark.currentIndex() > 0 else "",
                 "landmark_distance_cm": float(self.spin_landmark_distance.value()),
-                "channel1_muscle": self.input_ch1_muscle.text().strip(),
-                "skin_preparation": self.combo_skin_prep.currentText() if self.combo_skin_prep.currentIndex() > 0 else "",
-                "electrode_type": self.input_electrode_type.text().strip(),
-                "photo_filename": os.path.basename(self.input_photo.text().strip()),
+                "channel1_muscle": self.combo_ch1_muscle.currentText() if self.combo_ch1_muscle.currentIndex() > 0 else "",
+                "skin_preparation": FIXED_SKIN_PREPARATION,
+                "electrode_type": FIXED_ELECTRODE_TYPE,
+                "photo_filename": "",
             },
             "agreed": bool(self.check_agree_yes.isChecked() and not self.check_agree_no.isChecked()),
             "seed": int(self.session_seed),
-            "practice_mode": bool(self.check_practice.isChecked()),
-            "hand_order_source": "manual" if self._hand_order_manual else "auto",
-            "hand_order_default": (default_hand_order(self.input_contributor.text())
-                                   if valid_participant_id(self.input_contributor.text()) else ""),
+            "practice_mode": False,
+            "hand_order_source": "manual",       # chosen by the operator every session
+            "hand_order_default": "",
             "task_labels": list(self.task_labels),
             "labels_saved": bool(self.labels_saved),
             "session_day": int(self.spin_session_day.value()),
-            "hand_order": str(self.combo_hand_order.currentData() or DEFAULT_HAND_ORDER),
-            "repeats": int(self.spin_task_repeats.value()),
-            "prep_s": float(self.spin_task_prep.value()),
-            "hold_s": float(self.spin_task_hold.value()),
-            "rest_s": float(self.spin_task_rest.value()),
+            "hand_order": str(self.combo_hand_order.currentData() or ""),
             "record_rest": bool(self.check_record_rest.isChecked()),
+            "repeats": int(self.spin_task_repeats.value()),
             **self._fixed_plan,
-            "hand_switch_s": float(self.spin_hand_switch.value()),
-            "randomize_order": bool(self.check_randomize_order.isChecked()),
+            "randomize_order": True,          # mandatory: fatigue is spread across gestures
             "csv_dir": self.input_record_dir.text().strip(),
         }
 
     def set_csv_dir(self, path):
         self.input_record_dir.setText(str(path or ""))
 
-    def set_csv_counter(self, text, kind="accent"):
-        self.task_protocol.set_csv_counter(text, kind)
+    def set_csv_counter(self, text, kind="accent", fraction=None):
+        self.task_protocol.set_csv_counter(text, kind, fraction)
+
+    def set_live_stats(self, text, kind="ok"):
+        self.task_protocol.set_live_stats(text, kind)
+
+    def _toggle_time(self, shown):
+        self.time_panel.setVisible(bool(shown))
+        self.btn_time.setText("Time  " + ("\u25be" if shown else "\u25b8"))
+
+    def _refresh_time_panel(self):
+        plan = plan_summary(self.settings_payload())
+        fp = self._fixed_plan
+        total = format_duration(plan["total_s"] * 1000, False)
+        self.time_panel.setText(
+            f"<b>Fixed timing</b> (set by the study, not editable; only the repeats can be changed)<br>"
+            f"Prepare: <b>{fp['prep_s']:g} s</b> &nbsp;|&nbsp; "
+            f"Perform: <b>{fp['hold_s']:g} s</b> &nbsp;|&nbsp; Rest: <b>{fp['rest_s']:g} s</b><br>"
+            f"One cycle: <b>{plan['cycle_s']:g} s</b> &nbsp;|&nbsp; Cycles per hand: <b>{plan['cycles_per_hand']}</b> "
+            f"&nbsp;|&nbsp; Total recording time: <b>{total}</b> (no breaks)")
 
     def _toggle_additional(self, shown):
         self.extra_panel.setVisible(bool(shown))
@@ -4399,30 +4455,11 @@ class DataCollectionDialog(QDialog):
         self.task_protocol.set_start_enabled(self.session_prepared and (not self.protocol_running))
         self.task_protocol.set_cancel_enabled(self.session_prepared and (not self.protocol_running))
 
-    def _apply_practice_rules(self, *_args):
-        """Study mode: randomization is mandatory. Only practice/demo mode may switch it off."""
-        practice = self.check_practice.isChecked()
-        if not practice:
-            self.check_randomize_order.setChecked(True)
-        self.check_randomize_order.setEnabled(practice)
-        self.check_randomize_order.setToolTip(
-            "Shuffle gesture order independently each repeat, so fatigue doesn't always degrade whichever "
-            "gesture is fixed last in the cycle." + ("" if practice else
-                                                      "\nMandatory in study mode (tick Practice / demo mode to change it)."))
-
-    def _on_hand_order_chosen(self, *_args):
-        self._hand_order_manual = True          # the operator overrode the counterbalanced default
-
-    def _on_participant_id_changed(self, *_args):
-        """Odd participant numbers start with the left hand, even with the right, unless overridden."""
-        pid = self.input_contributor.text()
-        if self._hand_order_manual or not valid_participant_id(pid):
-            return
-        if str(self.combo_hand_order.currentData()) not in ("left_right", "right_left"):
-            return
-        idx = self.combo_hand_order.findData(default_hand_order(pid))
-        if idx >= 0 and idx != self.combo_hand_order.currentIndex():
-            self.combo_hand_order.setCurrentIndex(idx)
+    def _refresh_hand_warning(self, *_args):
+        """Red outline until a hand is chosen, so a forgotten selection is impossible to miss."""
+        chosen = bool(self.combo_hand_order.currentData())
+        self.combo_hand_order.setStyleSheet(
+            "" if chosen else f"QComboBox {{ border: 2px solid {THEME_COLORS['special']}; font-weight: 700; }}")
 
     def _emit_settings_changed(self, *_args):
         self._update_plan_label()
@@ -4460,6 +4497,12 @@ class DataCollectionDialog(QDialog):
             QMessageBox.warning(self, "Participant ID", "The participant ID must be the letter S followed by 2-3 digits "
                                 "(for example S01). Do not enter a name.")
             return
+        if not self.combo_hand_order.currentData():
+            self.combo_hand_order.setFocus()
+            self._refresh_hand_warning()
+            QMessageBox.warning(self, "Select the Hand", "Choose which hand wears the armband (Left hand only or "
+                                "Right hand only) under Session Plan > Hands before proceeding.")
+            return
         if self.spin_temp_start.value() <= 0.0 or self.spin_humidity_start.value() <= 0.0:
             self.btn_additional.setChecked(True)      # show the fields that are missing
             QMessageBox.warning(self, "Room Conditions", "Temperature and humidity are required: enter the values "
@@ -4470,6 +4513,25 @@ class DataCollectionDialog(QDialog):
         if not self.labels_saved or len(self.task_labels) == 0:
             QMessageBox.warning(self, "Task Labels", "Click Edit and save class labels before proceeding.")
             return
+        hand = str(self.combo_hand_order.currentData())
+        done = find_existing_sessions(self.input_record_dir.text().strip() or DATASET_DIR,
+                                      self.input_contributor.text(), self.spin_session_day.value(), hand)
+        hand_text = hand.upper()
+        if done:
+            answer = QMessageBox.question(
+                self, "Already Recorded",
+                f"{normalize_participant_id(self.input_contributor.text())} already has a {hand_text} hand recording for "
+                f"Day {self.spin_session_day.value()}:\n{done[-1]}\n\nRecord it again?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+        else:
+            answer = QMessageBox.question(
+                self, "Confirm Hand",
+                f"Recording the {hand_text} hand.\nIs the armband on the {hand_text} forearm?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if answer != QMessageBox.Yes:
+                return
         self.session_seed = secrets.randbits(32)     # fresh seed per session; saved with the recording
         self._emit_settings_changed()                # let the main window store the seed it will start with
         self.task_protocol.configure(**self._protocol_kwargs(self.settings_payload()))
@@ -4524,6 +4586,7 @@ class DataCollectionDialog(QDialog):
         self._set_upper_section_locked(False)
         self._set_protocol_dimmed(True)
         self.btn_start_session.setText("Proceed")
+        self.combo_hand_order.setCurrentIndex(0)     # the next session must choose its hand again
         self._update_access_state()
         self.protocol_finished.emit()
 
@@ -5692,6 +5755,7 @@ class EMGVisualizer(QMainWindow):
         }
         self.record_missing_packets = 0
         self.record_gap_events = 0
+        self.contact_report = None           # channel_quality report of the last calibration
         self._session_csv_path = ""
         # Continuous session recording (see session_recording.py)
         self.session_recorder = None
@@ -7091,6 +7155,7 @@ class EMGVisualizer(QMainWindow):
         self.calibration_dialog.port_config_requested.connect(self.open_port_configuration_dialog)
         self.calibration_dialog.finished.connect(self.on_calibration_dialog_closed)
         self.calibration_dialog.set_calibrated_state(self.is_calibrated)
+        self.calibration_dialog.set_contact_report(self.contact_report)
         center_window(self.calibration_dialog, self)
         self.calibration_dialog.show()
 
@@ -7739,8 +7804,7 @@ class EMGVisualizer(QMainWindow):
             f"session_day={int(self.study_meta['session_day'])}",
             f"hand_order={'+'.join(hands_for_order(self.study_meta['hand_order'])).lower()}",
             f"max_cycles_per_block={int(self.study_meta['max_cycles_per_block'])}",
-            f"block_break_s={float(self.study_meta['block_break_s']):.0f}",
-            f"hand_switch_break_s={float(self.study_meta['hand_switch_s']):.0f}",
+            "breaks=none",
             f"temp_start_c={_value_or_na(self.study_meta['temp_start_c'], '{:.1f}')}",
             f"humidity_start_pct={_value_or_na(self.study_meta['humidity_start_pct'], '{:.0f}')}",
             f"consent_form_version={CONSENT_FORM_VERSION if self.contribution_agreed else 'NOT_CONSENTED'}",
@@ -7935,8 +7999,7 @@ class EMGVisualizer(QMainWindow):
                       "rest_s": float(self.task_rest_s), "settle_s": float(self.task_settle_s),
                       "record_rest": bool(self.task_record_rest),
                       "randomize_order": bool(self.task_randomize_order or not sm["practice_mode"]),
-                      "max_cycles_per_block": int(sm["max_cycles_per_block"]),
-                      "block_break_s": float(sm["block_break_s"]), "hand_switch_break_s": float(sm["hand_switch_s"]),
+                      "breaks": "none (one continuous session)",
                       "recording": "continuous (all phases), labelled afterwards by device frame ID"},
             environment={"temperature_c": float(sm["temp_start_c"]), "humidity_pct": float(sm["humidity_start_pct"])},
             participant={"blood_group": self.participant_blood_group, "height_cm": self.participant_height_cm or None,
@@ -7949,6 +8012,7 @@ class EMGVisualizer(QMainWindow):
                 "skin_preparation": sm["electrode"].get("skin_preparation"),
                 "electrode_type": sm["electrode"].get("electrode_type"),
                 "photo_filename": sm["electrode"].get("photo_filename")},
+            channel_contact=summary_for_metadata(self.contact_report),
             files={"signals": f"signals_{session}.csv", "events": f"events_{session}.csv",
                    "quality": f"quality_{session}.json", "metadata_text": f"metadata_{session}.txt",
                    "raw_frames": f"raw_{session}.bin"},
@@ -7985,6 +8049,20 @@ class EMGVisualizer(QMainWindow):
         if not self.task_labels_locked:
             QMessageBox.warning(self, "Task Labels", "Save task labels in Data Collection before starting.")
             return
+        if str(self.study_meta["hand_order"]) not in HAND_SEQUENCES or not str(self.study_meta["hand_order"]):
+            QMessageBox.warning(self, "Select the Hand", "Choose Left hand only or Right hand only in Data Collection first.")
+            return
+        report = self.contact_report
+        if report is not None and not report["ready"]:
+            bad = [c for c in report["channels"] if c["grade"] in ("POOR", "NO SIGNAL")]
+            names = ", ".join(f"{c['name']} ({c['grade'].lower()})" for c in bad)
+            answer = QMessageBox.question(
+                self, "Electrode Contact",
+                f"The last calibration found poor contact on: {names}.\n\nBad channels spoil the whole recording. "
+                "Recalibrate first?\n\nYes = go back and fix it   |   No = record anyway",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if answer == QMessageBox.Yes:
+                return
 
         labels = self.parse_task_labels()
         if len(labels) == 0:
@@ -8025,8 +8103,7 @@ class EMGVisualizer(QMainWindow):
             hand_order=self.study_meta["hand_order"],
             session_day=self.study_meta["session_day"],
             max_cycles_per_block=self.study_meta["max_cycles_per_block"],
-            block_break_s=self.study_meta["block_break_s"],
-            hand_switch_s=self.study_meta["hand_switch_s"],
+            block_break_s=0, hand_switch_s=0,
         )
         if not started:
             rec, self.session_recorder, self.session_events = self.session_recorder, None, None
@@ -8042,8 +8119,10 @@ class EMGVisualizer(QMainWindow):
             idx = self.session_events.add(phase_name, label, hand, trial_id, block, cycle_no, time.monotonic(), planned_ms)
             if str(phase_name).strip().lower() == "prepare":
                 self._cycle_event_start = idx
-        if str(phase_name).strip().lower() in ("break", "switch hand") and self.recorded_sample_count() > 0:
-            # Protect the data collected so far: a 60-minute session should not hinge on one final save.
+        if (str(phase_name).strip().lower() == "prepare" and int(cycle_no) > 1
+                and (int(cycle_no) - 1) % CHECKPOINT_EVERY_CYCLES == 0 and self.recorded_sample_count() > 0):
+            # Protect the data collected so far without interrupting the participant: the checkpoint is
+            # written by a background worker while the session keeps running.
             try:
                 self.queue_session_finalize(close_recorder=False, checkpoint=True)
             except Exception:
@@ -8687,6 +8766,9 @@ class EMGVisualizer(QMainWindow):
 
         self.calibration_active = True
         self.is_calibrated = False
+        self.contact_report = None
+        if self.calibration_dialog:
+            self.calibration_dialog.set_contact_report(None)
         self.rest_capture = []
         self.flex_capture = []
         self.current_cal_phase_idx = -1
@@ -8823,6 +8905,12 @@ class EMGVisualizer(QMainWindow):
         if self.rf_model is not None:
             self.set_rf_status_reason(f"Buffering stream (0/{self.rf_window_samples} samples)", "success")
 
+        # Electrode contact check from the same REST / FLEX captures.
+        flex_arr = np.vstack(self.flex_capture).astype(np.float32) if len(self.flex_capture) > 0 else None
+        names = [self.channel_display_name(i) for i in range(emg_count)]
+        self.contact_report = assess_channels(
+            rest[:, :emg_count], None if flex_arr is None else flex_arr[:, :emg_count], SAMPLE_RATE, names) if emg_count > 0 else None
+
         summary = (
             f"Calibration complete.\n"
             f"Baseline (ADC): {np.array2string(self.baseline_offsets, precision=1)}\n"
@@ -8832,7 +8920,9 @@ class EMGVisualizer(QMainWindow):
         )
         if self.calibration_dialog:
             self.calibration_dialog.set_finished(summary)
-            self.calibration_dialog.accept()
+            self.calibration_dialog.set_contact_report(self.contact_report)   # stays open so the result can be read
+        if self.contact_report is not None and not self.contact_report["ready"]:
+            self.set_status("Calibrated - " + self.contact_report["message"], "#ff9800")
 
     def stop_calibration_if_running(self):
         if self.calibration_active:
@@ -9608,8 +9698,18 @@ class EMGVisualizer(QMainWindow):
             self._set_pill(self.pill_link, f"\u25cf {medium}{rate}", kind)
         else:
             self._set_pill(self.pill_link, "\u25cb Disconnected", "idle")
-        self._set_pill(self.pill_cal, "\u2713 Calibrated" if self.is_calibrated else "Not calibrated",
-                       "ok" if self.is_calibrated else "idle")
+        cal_text, cal_kind = ("Not calibrated", "idle")
+        if self.is_calibrated:
+            cal_text, cal_kind = "\u2713 Calibrated", "ok"
+            rep = self.contact_report
+            if rep is not None:
+                good = rep["counts"].get("GOOD", 0)
+                cal_text += f" {good}/{len(rep['channels'])} good"
+                if not rep["ready"]:
+                    cal_kind = "bad"
+                elif rep["counts"].get("FAIR"):
+                    cal_kind = "warn"
+        self._set_pill(self.pill_cal, cal_text, cal_kind)
         # model and recording pills only appear when there is something to show (saves header width)
         has_model = self.rf_model is not None
         self.pill_model.setVisible(has_model)
@@ -9680,17 +9780,54 @@ class EMGVisualizer(QMainWindow):
         self.lbl_csv_rows.setText(f"CSV rows: {rows:,}")
         if self.data_collection_dialog is None:
             return
-        pct = (100.0 * rows / expected) if expected > 0 else 0.0
-        text = f"CSV rows recorded: {rows:,} / {expected:,} expected ({pct:.1f}%)"
-        kind = "accent"
         rec = self.session_recorder
+        proto = self.data_collection_dialog.task_protocol
+        running = bool(proto.is_running)
+        fraction = (rows / expected) if expected > 0 else 0.0
+        text = f"CSV file: {rows:,} / {expected:,} rows ({100.0 * min(1.0, fraction):.1f}%) = {rows / SAMPLE_RATE:.0f} s of data"
+        kind = "accent"
+        if running and expected > 0:
+            # Compare with where the timeline is NOW: rows must grow by SAMPLE_RATE per second of session.
+            should_have = int(proto.elapsed_ms() / 1000.0 * SAMPLE_RATE)
+            lag = should_have - rows
+            if lag > SAMPLE_RATE:            # more than 1 s of frames missing from the file
+                text += f" | BEHIND by {lag:,} rows ({lag / SAMPLE_RATE:.1f} s): the stream is stalling"
+                kind = "danger"
+            else:
+                text += " | on schedule"
+                kind = "ok"
+        elif rec is not None and rows > expected > 0:
+            text += " | extra rows from pauses"
         if rec is not None and rec.rows >= 2000 and rec.valid_rows / rec.rows < MIN_RECORD_SAMPLE_RATIO:
             text += f" | VALID {100.0 * rec.valid_rows / rec.rows:.1f}% (< {100 * MIN_RECORD_SAMPLE_RATIO:.0f}%)"
-            kind = "warn"
-        if self.record_missing_packets > 0:
-            text += f" | lost packets: {self.record_missing_packets:,}"
-            kind = "warn"
-        self.data_collection_dialog.set_csv_counter(text, kind)
+            kind = "warn" if kind != "danger" else kind
+        self.data_collection_dialog.set_csv_counter(text, kind, fraction)
+
+        # Packet loss, shown for the whole session (and before it, from the link statistics).
+        snap = self.packet_tracer.snapshot() if self.is_connected else None
+        parts, stat_kind = [], "ok"
+        if rec is not None:
+            missing_frames = max(0, int(rec.rows) - int(rec.valid_rows))
+            loss_pct = 100.0 * missing_frames / rec.rows if rec.rows else 0.0
+            parts.append(f"Packets lost: {self.record_missing_packets:,} in {self.record_gap_events:,} gap(s)")
+            parts.append(f"missing frames: {missing_frames:,} ({loss_pct:.2f}%)")
+            if self.record_missing_packets > 0 or missing_frames > 0:
+                stat_kind = "danger" if loss_pct >= 100.0 * (1.0 - MIN_RECORD_SAMPLE_RATIO) else "warn"
+        elif snap is not None:
+            parts.append(f"Packets lost: {snap['missing']:,} ({snap['loss_pct']:.2f}%)")
+            stat_kind = {"ok": "ok", "warn": "warn", "bad": "danger"}.get(packet_health_kind(snap), "ok")
+        else:
+            parts.append("Packets lost: -- (not connected)")
+            stat_kind = "accent"
+        if snap is not None:
+            parts.append(f"link {snap['pkt_rate']:.0f}/{snap['expected_pkt_rate']:.0f} pkt/s")
+        rep = self.contact_report
+        if rep is not None:
+            good = rep["counts"].get("GOOD", 0)
+            parts.append(f"electrode contact: {good}/{len(rep['channels'])} good")
+            if not rep["ready"] and stat_kind == "ok":
+                stat_kind = "warn"
+        self.data_collection_dialog.set_live_stats("  |  ".join(parts), stat_kind)
 
     def open_packet_tracer_window(self):
         if self.packet_tracer_window is not None and self.packet_tracer_window.isVisible():
@@ -9729,7 +9866,8 @@ class EMGVisualizer(QMainWindow):
                 ("Disconnect", "Enabled" if self.is_connected else "Disabled", "Stops the stream and releases the port."),
                 ("Calibrate", "Done" if self.is_calibrated else "Required",
                  f"Channel Calibration: captures REST then FLEX ({self.cal_rest_seconds} s / {self.cal_flex_seconds} s) to set baselines "
-                 "and thresholds. Graph, analysis, recording and classification stay locked until it is done."),
+                 "and thresholds, then rates every channel's electrode contact (Good / Fair / Poor) with advice on how to fix it. "
+                 "Graph, analysis, recording and classification stay locked until it is done."),
                 ("Channels", str(self.num_channels),
                  "COM port and Wi-Fi: fixed 8 EMG + Roll/Pitch/Yaw (11). Simulator: 2-11 channels, set in the calibration window."),
             ]),
@@ -9763,25 +9901,24 @@ class EMGVisualizer(QMainWindow):
                  f"{_value_or_na(self.participant_weight_kg, '{:.1f}')} kg, age {_value_or_na(self.participant_age_years, '{:d}', cast=int)}",
                  "Optional (Additional Information); saved to the metadata, N/A when empty."),
                 ("Electrode placement", electrode_text,
-                 "Optional (Additional Information): landmark and distance, channel 1 muscle, skin preparation, electrode type, photo file and forearm circumference."),
+                 "Optional (Additional Information): landmark and distance, channel 1 muscle, skin preparation, electrode type and forearm circumference."),
                 ("Room conditions", f"{sm['temp_start_c']:.1f} C / {sm['humidity_start_pct']:.0f} %",
                  "REQUIRED (Additional Information): temperature and humidity at the start of the session."),
-                ("Session / Hands", f"Day {sm['session_day']} | {hands}",
-                 f"Study day 1 or 2 and the hand order. By default odd participants start left and even participants right "
-                 f"(order source: {sm['hand_order_source']}); you can override it."),
-                ("Practice / demo mode", on_off(sm["practice_mode"]),
-                 "Saves under a 'practice_' folder, outside the dataset. Only in this mode can randomization be switched off."),
+                ("Session / Hands", f"Day {sm['session_day']} | {hands or 'not chosen'}",
+                 "Study day 1 or 2 and the hand (Left hand only / Right hand only). It is never pre-selected: choose it "
+                 "every session. Proceed asks you to confirm it and warns if that participant / day / hand was already recorded."),
                 ("Class labels", ", ".join(self.task_labels), "Gestures recorded (dataset names and codes); the rest period is its own class."),
-                ("Repeats per hand", str(self.task_repeats), "Repetitions of every class per hand (study: 9)."),
+                ("Repeats per hand", str(self.task_repeats), "Repetitions of every class per hand (study: 9); editable next to the Time button."),
                 ("Prepare / Perform / Rest", f"{self.task_prep_s:g} / {self.task_hold_s:g} / {self.task_rest_s:g} s",
-                 "One task cycle (study: 4 + 3 + 3 = 10 s)."),
-                ("Randomize order", "On (locked)" if not sm["practice_mode"] else on_off(self.task_randomize_order),
+                 "Fixed by the study: one task cycle is 4 + 3 + 3 = 10 s (not editable)."),
+                ("Randomize order", "Always on",
                  f"Gesture order is shuffled each repetition from a per-session seed ({sm['seed'] or 'set at Proceed'}), saved in the metadata."),
-                ("Fixed protocol timing", f"{sm['max_cycles_per_block']} cycles | breaks {sm['block_break_s']:.0f} / {sm['hand_switch_s']:.0f} s",
-                 "At most 30 cycles per block, a 3.5 min break between blocks and 5 min when the armband changes arm. 'Skip Break' ends one early."),
+                ("Session length", "No breaks",
+                 "The cycles run back to back. The Session Activity panel shows elapsed time, time left and total time; "
+                 f"the CSV progress bar and packet-loss line stay visible for the whole session. A background checkpoint is saved every {CHECKPOINT_EVERY_CYCLES} cycles."),
                 ("Pause / Resume", "During a session",
                  "Pause for any interruption. Recording continues but is labelled 'paused'; a pause mid-cycle restarts that cycle from Prepare (the interrupted attempt is labelled 'aborted')."),
-                ("Save folder", self.record_save_dir, "Each session gets its own folder; a checkpoint is written at every break."),
+                ("Save folder", self.record_save_dir, "Each session gets its own folder; a checkpoint is written in the background while recording."),
                 ("Session files", "signals / events / quality / metadata",
                  "Every frame is recorded continuously (raw ADC counts) and labelled afterwards by device frame ID; gaps are explicit Valid=0 rows."),
                 ("Live recording counter", f"{self.recorded_sample_count():,} rows{valid_text}",

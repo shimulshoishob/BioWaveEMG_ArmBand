@@ -1,0 +1,10 @@
+Model: Neural Network (MLP)
+Run Folder: trained_model/mlp/run_20261106_000819
+Model File: trained_model/mlp/run_20261106_000819/mlp_model.joblib
+Recordings: 1 file(s) | Split: segments
+Accuracy: 0.9534 | Balanced accuracy: 0.9276 | Macro F1: 0.9422
+Train windows: 1116 | Test windows: 279
+Training time: 0.1 s | Prediction time: 0.82 ms per window
+Window: 200 ms (100 samples) | Stride: 50 ms (25 samples) | Edge trim: 250 ms
+Input channels: 8
+Classes: down, fist_close, left, rest, right, up

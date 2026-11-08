@@ -1,0 +1,233 @@
+{
+  "schema_version": 1,
+  "session": "S01_day01_right_20261105T195454Z",
+  "signal_mode": "raw",
+  "channel_map": [
+    {
+      "channel": 1,
+      "column": "Ch1",
+      "name": "EMG1",
+      "type": "emg",
+      "unit": "ADC counts (12-bit, raw, 0-4095)"
+    },
+    {
+      "channel": 2,
+      "column": "Ch2",
+      "name": "EMG2",
+      "type": "emg",
+      "unit": "ADC counts (12-bit, raw, 0-4095)"
+    },
+    {
+      "channel": 3,
+      "column": "Ch3",
+      "name": "EMG3",
+      "type": "emg",
+      "unit": "ADC counts (12-bit, raw, 0-4095)"
+    },
+    {
+      "channel": 4,
+      "column": "Ch4",
+      "name": "EMG4",
+      "type": "emg",
+      "unit": "ADC counts (12-bit, raw, 0-4095)"
+    },
+    {
+      "channel": 5,
+      "column": "Ch5",
+      "name": "EMG5",
+      "type": "emg",
+      "unit": "ADC counts (12-bit, raw, 0-4095)"
+    },
+    {
+      "channel": 6,
+      "column": "Ch6",
+      "name": "EMG6",
+      "type": "emg",
+      "unit": "ADC counts (12-bit, raw, 0-4095)"
+    },
+    {
+      "channel": 7,
+      "column": "Ch7",
+      "name": "EMG7",
+      "type": "emg",
+      "unit": "ADC counts (12-bit, raw, 0-4095)"
+    },
+    {
+      "channel": 8,
+      "column": "Ch8",
+      "name": "EMG8",
+      "type": "emg",
+      "unit": "ADC counts (12-bit, raw, 0-4095)"
+    },
+    {
+      "channel": 9,
+      "column": "IMU_roll",
+      "name": "roll",
+      "type": "imu_orientation",
+      "unit": "degrees"
+    },
+    {
+      "channel": 10,
+      "column": "IMU_pitch",
+      "name": "pitch",
+      "type": "imu_orientation",
+      "unit": "degrees"
+    },
+    {
+      "channel": 11,
+      "column": "IMU_yaw",
+      "name": "yaw",
+      "type": "imu_orientation",
+      "unit": "degrees"
+    }
+  ],
+  "label_map": {
+    "labels": [
+      {
+        "old_name": "Rest",
+        "name": "rest",
+        "code": 0
+      },
+      {
+        "old_name": "Left",
+        "name": "left",
+        "code": 1
+      },
+      {
+        "old_name": "Right",
+        "name": "right",
+        "code": 2
+      },
+      {
+        "old_name": "fist_close",
+        "name": "fist_close",
+        "code": 3
+      },
+      {
+        "old_name": "Up",
+        "name": "up",
+        "code": 4
+      },
+      {
+        "old_name": "Down",
+        "name": "down",
+        "code": 5
+      },
+      {
+        "old_name": "Double_Closed_Fist",
+        "name": "double_fist_close",
+        "code": 6
+      },
+      {
+        "old_name": "Victory_Sign",
+        "name": "victory_sign",
+        "code": 7
+      },
+      {
+        "old_name": "Thumbs_Up",
+        "name": "thumbs_up",
+        "code": 8
+      },
+      {
+        "old_name": "Pinch_using_thumb_and_index_finger",
+        "name": "pinch_thumb_index",
+        "code": 9
+      },
+      {
+        "old_name": "Settle",
+        "name": "settle",
+        "code": 98
+      },
+      {
+        "old_name": "Prepare",
+        "name": "prepare",
+        "code": 99
+      }
+    ],
+    "phases": {
+      "paused": 97,
+      "aborted": 96
+    }
+  },
+  "mode": "study",
+  "participant_id": "S01",
+  "consent_form_version": "BWEMG-consent-v1.0",
+  "software": {
+    "app_version": "2.0.0",
+    "git_commit": "8bba8425e9dfa6616ce1b75cda6f51bca389154a",
+    "git_dirty": false,
+    "python": "3.13.0",
+    "platform": "win32"
+  },
+  "device": {
+    "firmware_version": "emg-imu-2.0.0",
+    "device_id": "D0F4D190A994",
+    "device_name": "BioWave-EMG-IMU-2026",
+    "sampling_rate_hz": 500.0,
+    "imu_ready": true,
+    "connection_medium": "wifi",
+    "configured_sampling_rate_hz": 500,
+    "sampling_rate_source": "device"
+  },
+  "session_info": {
+    "session_day": 1,
+    "hand_order": "right",
+    "hand_order_source": "manual",
+    "hand_order_counterbalanced_default": "left_right",
+    "start_utc": "2026-11-05T19:54:54Z",
+    "host_clock": "time.monotonic (seconds)",
+    "random_seed": 1851533064
+  },
+  "protocol": {
+    "labels": [
+      "left",
+      "right",
+      "fist_close",
+      "up",
+      "down",
+      "rest"
+    ],
+    "repeats_per_class_per_hand": 3,
+    "prepare_s": 4.0,
+    "perform_s": 3.0,
+    "rest_s": 3.0,
+    "settle_s": 0.0,
+    "record_rest": true,
+    "randomize_order": true,
+    "max_cycles_per_block": 30,
+    "block_break_s": 210.0,
+    "hand_switch_break_s": 230.0,
+    "recording": "continuous (all phases), labelled afterwards by device frame ID"
+  },
+  "environment": {
+    "temperature_c": 6.0,
+    "humidity_pct": 23.0
+  },
+  "participant": {
+    "blood_group": null,
+    "height_cm": null,
+    "weight_kg": null,
+    "age_years": null
+  },
+  "electrode_placement": {
+    "landmark": null,
+    "distance_from_landmark_cm": null,
+    "channel_1_muscle": null,
+    "forearm_circumference_cm": null,
+    "skin_preparation": null,
+    "electrode_type": null,
+    "photo_filename": null
+  },
+  "files": {
+    "signals": "signals_S01_day01_right_20261105T195454Z.csv",
+    "events": "events_S01_day01_right_20261105T195454Z.csv",
+    "quality": "quality_S01_day01_right_20261105T195454Z.json",
+    "metadata_text": "metadata_S01_day01_right_20261105T195454Z.txt",
+    "raw_frames": "raw_S01_day01_right_20261105T195454Z.bin"
+  },
+  "result": {
+    "rows": 90240,
+    "valid_sample_ratio": 0.9989472517730497,
+    "meets_valid_sample_threshold": true
+  }
+}

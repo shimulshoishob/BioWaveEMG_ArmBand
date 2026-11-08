@@ -1,0 +1,27 @@
+{
+  "created_at_text": "2026-11-06 00:45:47",
+  "dataset_paths": [
+    "dataset/S03_day01_left_20261103T092948Z/signals_S03_day01_left_20261103T092948Z.csv"
+  ],
+  "output_dir": "trained_model",
+  "run_name": "run",
+  "model": "svm_rbf",
+  "model_name": "SVM (RBF kernel)",
+  "model_params": {
+    "c": 10.0,
+    "gamma": "scale"
+  },
+  "input_kind": "features",
+  "window_ms": 200,
+  "stride_ms": 50,
+  "trim_ms": 250,
+  "window_samples": 100,
+  "stride_samples": 25,
+  "test_size": 0.2,
+  "split_mode": "segments",
+  "random_seed": 42,
+  "class_weight_balanced": true,
+  "auto_load_model": true,
+  "sample_rate_hz": 500,
+  "input_channels": 8
+}
