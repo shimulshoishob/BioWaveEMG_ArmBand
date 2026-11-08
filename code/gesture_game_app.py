@@ -21,6 +21,8 @@ from PyQt5.QtWidgets import (
     QApplication,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QSpinBox,
     QMainWindow,
     QPushButton,
     QVBoxLayout,
@@ -54,14 +56,27 @@ class GestureBridgeClient:
     def __init__(self, host=GESTURE_BRIDGE_HOST, port=GESTURE_BRIDGE_PORT):
         self.latest = {"label": "N/A", "conf_pct": 0.0, "model": "", "ts": 0.0}
         self._sock = None
+        self.host = host
+        self.port = int(port)
+        self.error = ""
+        self.packets = 0
+        self.rebind(host, port)
+
+    def rebind(self, host, port):
+        """(Re)open the listening socket; returns True on success, else sets self.error."""
+        self.close()
+        self.host, self.port, self.error = host, int(port), ""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, int(port)))
             sock.setblocking(False)
             self._sock = sock
-        except OSError:
+            return True
+        except (OSError, OverflowError) as exc:
+            self.error = str(exc)
             self._sock = None
+            return False
 
     @property
     def listening(self):
@@ -77,6 +92,7 @@ class GestureBridgeClient:
                     break
                 try:
                     msg = json.loads(data.decode("utf-8"))
+                    self.packets += 1
                     self.latest = {
                         "label": str(msg.get("label", "N/A")),
                         "conf_pct": float(msg.get("conf_pct", 0.0)),
@@ -437,6 +453,29 @@ class GestureGameWindow(QMainWindow):
         self.lbl_link.setWordWrap(True)
         layout.addWidget(self.lbl_link)
 
+        # --- connectivity panel: where to listen for the BioWave app's gesture stream ---
+        conn_row = QHBoxLayout()
+        conn_row.addWidget(QLabel("Listen on:"))
+        self.txt_bridge_host = QLineEdit(GESTURE_BRIDGE_HOST)
+        self.txt_bridge_host.setToolTip("127.0.0.1 = same PC only; 0.0.0.0 = accept from other PCs on the network")
+        conn_row.addWidget(self.txt_bridge_host, 1)
+        self.spin_bridge_port = QSpinBox()
+        self.spin_bridge_port.setRange(1024, 65535)
+        self.spin_bridge_port.setValue(GESTURE_BRIDGE_PORT)
+        conn_row.addWidget(self.spin_bridge_port)
+        self.btn_bridge_apply = QPushButton("Connect")
+        self.btn_bridge_apply.setStyleSheet(themed_button_style("accent"))
+        self.btn_bridge_apply.clicked.connect(self.apply_bridge_settings)
+        conn_row.addWidget(self.btn_bridge_apply)
+        layout.addLayout(conn_row)
+        self.lbl_conn_help = QLabel(
+            "Steps: 1) start mouse_controller.py or main.py, connect the EMG device, load a model and "
+            "calibrate; 2) keep the host/port here equal to the sender's (default 127.0.0.1:5005); "
+            "3) press Connect to re-open the link.")
+        self.lbl_conn_help.setWordWrap(True)
+        self.lbl_conn_help.setStyleSheet(themed_label_style("muted"))
+        layout.addWidget(self.lbl_conn_help)
+
         self.game_widget = GestureGameWidget()
         self.game_widget.game_over.connect(self._on_game_over)
         self.game_widget.lives_changed.connect(self._on_lives_changed)
@@ -466,6 +505,13 @@ class GestureGameWindow(QMainWindow):
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.poll_gesture)
         self.poll_timer.start(GAME_GESTURE_POLL_MS)
+        self.poll_gesture()
+        self.game_widget.setFocus()
+
+    def apply_bridge_settings(self):
+        host = self.txt_bridge_host.text().strip() or GESTURE_BRIDGE_HOST
+        if not self.bridge.rebind(host, self.spin_bridge_port.value()):
+            self.lbl_status.setText(f"Could not listen on {host}:{self.spin_bridge_port.value()} - {self.bridge.error}")
         self.poll_gesture()
         self.game_widget.setFocus()
 
@@ -502,11 +548,15 @@ class GestureGameWindow(QMainWindow):
     def poll_gesture(self):
         label, conf_pct, model, online = self.bridge.poll()
         if not self.bridge.listening:
-            text, kind = f"Gesture link: UDP port {GESTURE_BRIDGE_PORT} busy - keyboard only.", "muted"
+            text, kind = (f"Gesture link: cannot listen on {self.bridge.host}:{self.bridge.port} "
+                          f"({self.bridge.error or 'port busy'}) - keyboard only. Close the other game "
+                          f"instance or pick another port."), "muted"
         elif online:
             text, kind = f"Gesture link: live | {model or 'model'} | {label} ({conf_pct:.0f}%)", "success"
         else:
-            text, kind = "Gesture link: waiting for BioWave main app (keyboard works).", "muted"
+            text, kind = (f"Gesture link: listening on {self.bridge.host}:{self.bridge.port}, waiting for "
+                          f"the BioWave app (no gestures received yet - connect the device, load a model and "
+                          f"calibrate there; keyboard works)."), "muted"
         self.lbl_link.setText(text)
         self.lbl_link.setStyleSheet(themed_label_style(kind))
         if online:

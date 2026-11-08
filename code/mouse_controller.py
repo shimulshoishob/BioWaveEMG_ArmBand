@@ -23,6 +23,7 @@ import sys
 import os
 import time
 import threading
+import json
 import socket
 import struct
 import subprocess
@@ -90,7 +91,12 @@ SAMPLE_RATE = 500                  # Hz, matches the ESP32 firmware.
 WINDOW_SIZE = 1000                 # Rolling sample buffer length (channels x samples).
 DEFAULT_WIRED_CHANNELS = 4
 
-DEFAULT_DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"
+PLACEHOLDER_DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY"
+MIN_DEVICE_ACCESS_KEY_LEN = 16
+CONTROL_RETRY_BACKOFF_S = (0.2, 0.5, 1.0)   # waits before retry 1..3 of a control command
+DEVICE_SECRET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "device_secret.json")
+GESTURE_BRIDGE_HOST = "127.0.0.1"   # Predictions are mirrored here for gesture_game_app.py
+GESTURE_BRIDGE_PORT = 5005
 WIFI_STREAM_PORT = 5000
 WIFI_CONTROL_PORT = 5001
 DISCOVERY_ADDRESS = "255.255.255.255"
@@ -129,6 +135,64 @@ MOUSE_ACTIONS = [
 
 # ============================ HELPER FUNCTIONS ============================
 
+def load_device_access_key(path=DEVICE_SECRET_PATH):
+    """Key from the gitignored device_secret.json, or "" when missing/unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return str(json.load(fh).get("device_access_key", "")).strip()
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def access_key_problem(key):
+    """Why ``key`` cannot be used with a device, or "" when acceptable."""
+    key = str(key or "").strip()
+    if not key:
+        return "No device access key is set. Put it in code/device_secret.json or type it into the Access Key box."
+    if key == PLACEHOLDER_DEVICE_ACCESS_KEY:
+        return "The device access key is still the placeholder. Use the same key as in the firmware's secrets.h."
+    if len(key) < MIN_DEVICE_ACCESS_KEY_LEN:
+        return f"The device access key is too short (minimum {MIN_DEVICE_ACCESS_KEY_LEN} characters)."
+    return ""
+
+
+def local_broadcast_addresses():
+    """Subnet-broadcast address of every local IPv4 adapter plus the limited broadcast.
+
+    On Windows a 255.255.255.255 datagram leaves through ONE adapter only (often a VPN or
+    virtual switch), so the ESP32 on the real Wi-Fi never sees DISCOVER. Sending to each
+    adapter's /24 broadcast fixes that.
+    """
+    addrs = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip.startswith("127.") or ip.startswith("169.254."):
+                continue
+            addrs.append(".".join(ip.split(".")[:3] + ["255"]))
+    except OSError:
+        pass
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("192.0.2.1", 1))
+            addrs.append(".".join(probe.getsockname()[0].split(".")[:3] + ["255"]))
+        finally:
+            probe.close()
+    except OSError:
+        pass
+    addrs.append(DISCOVERY_ADDRESS)
+    return list(dict.fromkeys(addrs))
+
+
+def _parse_rate_field(text):
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def sign_message(secret, *parts):
     message = "|".join(str(part) for part in parts)
     return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -143,6 +207,35 @@ def get_local_ip_for_target(target_ip):
         probe.close()
 
 
+class GesturePublisher:
+    """Mirrors each prediction to localhost UDP for gesture_game_app.py (never raises)."""
+
+    def __init__(self, host=GESTURE_BRIDGE_HOST, port=GESTURE_BRIDGE_PORT):
+        self._addr = (host, int(port))
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setblocking(False)
+        except OSError:
+            self._sock = None
+
+    def publish(self, label, conf_pct, model=""):
+        if self._sock is None:
+            return
+        try:
+            msg = json.dumps({"label": str(label), "conf_pct": round(float(conf_pct), 1), "model": str(model)})
+            self._sock.sendto(msg.encode("utf-8"), self._addr)
+        except (OSError, ValueError):
+            pass
+
+    def close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+
 # ================================ DATACLASSES ==============================
 
 @dataclass
@@ -155,6 +248,7 @@ class DeviceInfo:
     imu_ready: bool
     streaming: bool
     firmware: str
+    sample_rate_hz: object = None
 
     @property
     def summary(self):
@@ -169,6 +263,7 @@ class SerialDeviceInfo:
     imu_ready: bool
     wifi_saved: bool
     firmware: str
+    sample_rate_hz: object = None
 
 
 # ============================ WIRELESS PROTOCOL =============================
@@ -180,7 +275,8 @@ class ControlProtocol:
     @staticmethod
     def parse_device_info(message, source_ip):
         parts = message.strip().split("|")
-        if len(parts) != 8 or parts[0] != "HELLO":
+        # 8 fields from firmware < 2.0; 2.0+ appends the sampling rate (Hz).
+        if len(parts) not in (8, 9) or parts[0] != "HELLO":
             raise ValueError("Unexpected device response.")
         return DeviceInfo(
             ip=source_ip,
@@ -191,6 +287,7 @@ class ControlProtocol:
             imu_ready=parts[5] == "1",
             streaming=parts[6] == "1",
             firmware=parts[7],
+            sample_rate_hz=_parse_rate_field(parts[8]) if len(parts) > 8 else None,
         )
 
     @staticmethod
@@ -219,46 +316,80 @@ class ControlProtocol:
             sock.close()
 
     @staticmethod
-    def discover():
+    def discover(extra_hosts=()):
+        """Broadcast DISCOVER on every local subnet and unicast to any ``extra_hosts``."""
         devices = {}
-        responses = ControlProtocol.send_and_receive(
-            "DISCOVER", DISCOVERY_ADDRESS, expect_multiple=True,
-            timeout=DISCOVERY_TIMEOUT, broadcast=True,
-        )
-        for response, source_ip in responses:
-            try:
-                device = ControlProtocol.parse_device_info(response, source_ip)
-                devices[device.ip] = device
-            except ValueError:
-                continue
+        targets = list(extra_hosts) + local_broadcast_addresses()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(0.2)
+        try:
+            for _attempt in range(2):          # UDP is lossy; send twice
+                for target in targets:
+                    try:
+                        sock.sendto(b"DISCOVER", (target, WIFI_CONTROL_PORT))
+                    except OSError:
+                        continue
+                deadline = time.monotonic() + DISCOVERY_TIMEOUT
+                while time.monotonic() < deadline:
+                    try:
+                        data, addr = sock.recvfrom(2048)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    try:
+                        device = ControlProtocol.parse_device_info(
+                            data.decode("utf-8", errors="replace"), addr[0])
+                        devices[device.ip] = device
+                    except ValueError:
+                        continue
+        finally:
+            sock.close()
         return list(devices.values())
 
     @staticmethod
-    def get_challenge(target_ip):
-        response, _ = ControlProtocol.send_and_receive("CHALLENGE", target_ip)
-        parts = response.strip().split("|")
-        if len(parts) != 2 or parts[0] != "CHALLENGE":
-            raise RuntimeError("Device did not return a valid challenge.")
-        return parts[1]
-
-    @staticmethod
-    def authenticated_command(target_ip, secret, command, *payload):
-        if not secret:
-            raise RuntimeError("Device access key is required.")
-        challenge = ControlProtocol.get_challenge(target_ip)
-        auth = sign_message(secret, command, challenge, *payload)
-        message = "|".join([command, challenge, *payload, auth])
-        response, _ = ControlProtocol.send_and_receive(message, target_ip)
-
-        parts = response.strip().split("|")
-        if not parts:
-            raise RuntimeError("Device returned an empty response.")
+    def _authenticated_once(target_ip, secret, command, payload, timeout):
+        # The firmware ties a challenge to the sender's (ip, port), so CHALLENGE and the
+        # signed command must leave from the SAME socket.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            destination = (target_ip, WIFI_CONTROL_PORT)
+            sock.sendto(b"CHALLENGE", destination)
+            parts = sock.recvfrom(2048)[0].decode("utf-8", errors="replace").strip().split("|")
+            if len(parts) != 2 or parts[0] != "CHALLENGE":
+                raise RuntimeError("Device did not return a valid challenge.")
+            challenge = parts[1]
+            auth = sign_message(secret, command, challenge, *payload)
+            sock.sendto("|".join([command, challenge, *payload, auth]).encode("utf-8"), destination)
+            parts = sock.recvfrom(2048)[0].decode("utf-8", errors="replace").strip().split("|")
+        finally:
+            sock.close()
         if parts[0] == "ERR":
-            detail = parts[1] if len(parts) > 1 else "UNKNOWN"
-            raise RuntimeError(f"Device rejected command: {detail}")
+            raise RuntimeError(f"Device rejected command: {parts[1] if len(parts) > 1 else 'UNKNOWN'}")
         if parts[0] != "ACK":
             raise RuntimeError("Unexpected device acknowledgement.")
         return parts[1:]
+
+    @staticmethod
+    def authenticated_command(target_ip, secret, command, *payload, timeout=CONTROL_TIMEOUT,
+                              backoff=CONTROL_RETRY_BACKOFF_S):
+        """Signed command with retries (fresh challenge each attempt) for lost UDP datagrams."""
+        problem = access_key_problem(secret)
+        if problem:
+            raise RuntimeError(problem)
+        last_error = None
+        for attempt in range(len(backoff) + 1):
+            if attempt:
+                time.sleep(backoff[attempt - 1])
+            try:
+                return ControlProtocol._authenticated_once(target_ip, secret, command, payload, timeout)
+            except (OSError, RuntimeError) as exc:
+                last_error = exc
+                if isinstance(exc, RuntimeError) and "rejected" in str(exc):
+                    break                      # wrong key etc.: retrying won't help
+        raise RuntimeError(f"{command} failed: {last_error}")
 
     @staticmethod
     def start_stream(target_ip, secret, client_ip, client_port):
@@ -313,11 +444,12 @@ class WiFiSerialProvisionProtocol:
         parts = response.split("|")
         if len(parts) >= 2 and parts[0] == "ERR":
             raise RuntimeError(f"ESP32 returned an error: {parts[1]}")
-        if len(parts) != 6 or parts[0] != "INFO":
+        if len(parts) not in (6, 7) or parts[0] != "INFO":
             raise RuntimeError(f"Unexpected serial response: {response}")
         return SerialDeviceInfo(
             port_name=port_name, device_id=parts[1], device_name=parts[2],
             imu_ready=parts[3] == "1", wifi_saved=parts[4] == "1", firmware=parts[5],
+            sample_rate_hz=_parse_rate_field(parts[6]) if len(parts) > 6 else None,
         )
 
     @staticmethod
@@ -787,7 +919,7 @@ class MouseControllerApp(QMainWindow):
         self.is_connected = False
         self.current_device = None
         self.discovered_devices = []
-        self.wireless_access_key = DEFAULT_DEVICE_ACCESS_KEY
+        self.wireless_access_key = load_device_access_key()
         self.num_channels = DEFAULT_WIRED_CHANNELS
         self.emg_channel_count = DEFAULT_WIRED_CHANNELS
 
@@ -841,6 +973,7 @@ class MouseControllerApp(QMainWindow):
         self.last_batch_received_monotonic = 0.0
         self.stream_invalid_until = 0.0
         self.decision_engine = GestureDecisionEngine()
+        self.gesture_bridge = GesturePublisher()
 
         # --- mouse control state ---
         self.class_action_map = {}
@@ -1114,7 +1247,7 @@ class MouseControllerApp(QMainWindow):
 
         key_row = QHBoxLayout()
         key_row.addWidget(QLabel("Access Key:"))
-        self.txt_access_key = QLineEdit(self.wireless_access_key)
+        self.txt_access_key = QLineEdit(self.wireless_access_key or "")
         self.txt_access_key.setEchoMode(QLineEdit.Password)
         key_row.addWidget(self.txt_access_key, 1)
         layout.addLayout(key_row)
@@ -1127,6 +1260,13 @@ class MouseControllerApp(QMainWindow):
         btn_discover.clicked.connect(self.discover_wireless_devices)
         device_row.addWidget(btn_discover)
         layout.addLayout(device_row)
+
+        ip_row = QHBoxLayout()
+        ip_row.addWidget(QLabel("Device IP:"))
+        self.txt_manual_ip = QLineEdit()
+        self.txt_manual_ip.setPlaceholderText("optional, e.g. 192.168.0.42 (if auto-discovery finds nothing)")
+        ip_row.addWidget(self.txt_manual_ip, 1)
+        layout.addLayout(ip_row)
 
         self.lbl_device_info = QLabel("No wireless device discovered yet.")
         self.lbl_device_info.setWordWrap(True)
@@ -1186,7 +1326,14 @@ class MouseControllerApp(QMainWindow):
     # ------------------------------------------------------------ wireless
     def discover_wireless_devices(self):
         try:
-            self.discovered_devices = ControlProtocol.discover()
+            manual_ip = self.txt_manual_ip.text().strip()
+            self.btn_wireless_connect.setEnabled(False)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                self.discovered_devices = ControlProtocol.discover([manual_ip] if manual_ip else [])
+            finally:
+                QApplication.restoreOverrideCursor()
+                self.btn_wireless_connect.setEnabled(not self.is_connected or self.connection_medium == "wireless")
         except Exception as exc:
             QMessageBox.warning(self, "Discovery Failed", str(exc))
             return
@@ -1194,7 +1341,9 @@ class MouseControllerApp(QMainWindow):
         for device in self.discovered_devices:
             self.combo_devices.addItem(device.summary, device)
         if not self.discovered_devices:
-            self.lbl_device_info.setText("No BioWave wireless devices replied on the current Wi-Fi.")
+            self.lbl_device_info.setText(
+                "No BioWave device replied. Check: PC and ESP32 on the same Wi-Fi (not guest/isolated), "
+                "device provisioned over USB, UDP 5001 allowed in the firewall, or type the device IP above.")
         self._refresh_device_info()
 
     def _refresh_device_info(self):
@@ -1221,8 +1370,9 @@ class MouseControllerApp(QMainWindow):
             QMessageBox.warning(self, "No Device", "Discover and select a wireless device first.")
             return
         access_key = self.txt_access_key.text().strip()
-        if not access_key:
-            QMessageBox.warning(self, "Missing Access Key", "Enter the device access key before connecting.")
+        problem = access_key_problem(access_key)
+        if problem:
+            QMessageBox.warning(self, "Access Key", problem)
             return
         self.wireless_access_key = access_key
 
@@ -1679,6 +1829,8 @@ class MouseControllerApp(QMainWindow):
 
         self.lbl_prediction.setText(label.upper())
         self.lbl_conf.setText(f"Conf: {conf_pct:.1f}%" if conf_pct is not None else "Conf: unavailable")
+        if conf_pct is not None:
+            self.gesture_bridge.publish(label, conf_pct, os.path.basename(self.rf_model_path) if self.rf_model_path else "")
         quality_good = self.last_signal_quality is not None and self.last_signal_quality.state == "GOOD"
         self.decision_engine.min_confidence = self.spin_conf.value() / 100.0
         decision = self.decision_engine.update(label, conf, margin, quality_good)
@@ -1758,6 +1910,7 @@ class MouseControllerApp(QMainWindow):
         if self.inference_worker:
             self.inference_worker.stop()
         self.performance_logger.stop()
+        self.gesture_bridge.close()
         if self._lab_suite_window is not None:
             self._lab_suite_window.close()
         event.accept()

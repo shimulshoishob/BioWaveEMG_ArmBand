@@ -1,0 +1,251 @@
+{
+  "created_at_text": "2026-11-08 02:15:32",
+  "accuracy": 0.9905325443786982,
+  "balanced_accuracy": 0.9842992680943345,
+  "macro_f1": 0.9848154176176174,
+  "train_windows": 6756,
+  "test_windows": 1690,
+  "train_seconds": 1.803054500000144,
+  "latency_ms": 6.963533333328087,
+  "num_features": 156,
+  "model": "svm_rbf",
+  "model_name": "SVM (RBF kernel)",
+  "model_params": {
+    "c": 10.0,
+    "gamma": "scale"
+  },
+  "classes": [
+    "double_fist_close",
+    "down",
+    "fist_close",
+    "left",
+    "pinch_thumb_index",
+    "rest",
+    "right",
+    "thumbs_up",
+    "up",
+    "victory_sign"
+  ],
+  "class_window_counts": {
+    "double_fist_close": 421,
+    "down": 423,
+    "fist_close": 422,
+    "left": 422,
+    "pinch_thumb_index": 422,
+    "rest": 4646,
+    "right": 425,
+    "thumbs_up": 421,
+    "up": 422,
+    "victory_sign": 422
+  },
+  "segment_count_by_file": {
+    "dataset/testing/S405_day01_left_20261107T195839Z/signals_S405_day01_left_20261107T195839Z.csv": 180
+  },
+  "channel_count_by_file": {
+    "dataset/testing/S405_day01_left_20261107T195839Z/signals_S405_day01_left_20261107T195839Z.csv": 8
+  },
+  "input_channels": 8,
+  "skipped_channel_segments": 0,
+  "confusion_matrix": [
+    [
+      83,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      83,
+      0,
+      0,
+      0,
+      2,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      84,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      84,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      84,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      1,
+      0,
+      927,
+      1,
+      0,
+      0,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      84,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      84,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      82,
+      2
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      4,
+      79
+    ]
+  ],
+  "classification_report_text": "                   precision     recall   f1-score    support\n\ndouble_fist_close     1.0000     0.9881     0.9940         84\n             down     1.0000     0.9765     0.9881         85\n       fist_close     1.0000     0.9882     0.9941         85\n             left     0.9767     1.0000     0.9882         84\npinch_thumb_index     0.9882     1.0000     0.9941         84\n             rest     0.9957     0.9968     0.9962        930\n            right     0.9882     0.9882     0.9882         85\n        thumbs_up     1.0000     1.0000     1.0000         84\n               up     0.9535     0.9647     0.9591         85\n     victory_sign     0.9518     0.9405     0.9461         84\n\n         accuracy                           0.9905       1690\n        macro avg     0.9854     0.9843     0.9848       1690\n     weighted avg     0.9906     0.9905     0.9905       1690",
+  "classification_report_dict": {
+    "double_fist_close": {
+      "precision": 1.0,
+      "recall": 0.9880952380952381,
+      "f1-score": 0.9940119760479041,
+      "support": 84.0
+    },
+    "down": {
+      "precision": 1.0,
+      "recall": 0.9764705882352941,
+      "f1-score": 0.9880952380952381,
+      "support": 85.0
+    },
+    "fist_close": {
+      "precision": 1.0,
+      "recall": 0.9882352941176471,
+      "f1-score": 0.9940828402366864,
+      "support": 85.0
+    },
+    "left": {
+      "precision": 0.9767441860465116,
+      "recall": 1.0,
+      "f1-score": 0.9882352941176471,
+      "support": 84.0
+    },
+    "pinch_thumb_index": {
+      "precision": 0.9882352941176471,
+      "recall": 1.0,
+      "f1-score": 0.9940828402366864,
+      "support": 84.0
+    },
+    "rest": {
+      "precision": 0.9957035445757251,
+      "recall": 0.9967741935483871,
+      "f1-score": 0.9962385814078453,
+      "support": 930.0
+    },
+    "right": {
+      "precision": 0.9882352941176471,
+      "recall": 0.9882352941176471,
+      "f1-score": 0.9882352941176471,
+      "support": 85.0
+    },
+    "thumbs_up": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 84.0
+    },
+    "up": {
+      "precision": 0.9534883720930233,
+      "recall": 0.9647058823529412,
+      "f1-score": 0.9590643274853801,
+      "support": 85.0
+    },
+    "victory_sign": {
+      "precision": 0.9518072289156626,
+      "recall": 0.9404761904761905,
+      "f1-score": 0.9461077844311377,
+      "support": 84.0
+    },
+    "accuracy": 0.9905325443786982,
+    "macro avg": {
+      "precision": 0.9854213919866217,
+      "recall": 0.9842992680943345,
+      "f1-score": 0.9848154176176174,
+      "support": 1690.0
+    },
+    "weighted avg": {
+      "precision": 0.9905685749384829,
+      "recall": 0.9905325443786982,
+      "f1-score": 0.9905279694495683,
+      "support": 1690.0
+    }
+  },
+  "history": [],
+  "model_file": "svm_rbf_model.joblib",
+  "run_dir": "trained_model/svm_rbf/run_20261108_021540",
+  "model_path": "trained_model/svm_rbf/run_20261108_021540/svm_rbf_model.joblib"
+}

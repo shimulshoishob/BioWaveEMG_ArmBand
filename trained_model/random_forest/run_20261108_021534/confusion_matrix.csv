@@ -1,0 +1,11 @@
+actual/predicted,double_fist_close,down,fist_close,left,pinch_thumb_index,rest,right,thumbs_up,up,victory_sign
+double_fist_close,83,0,1,0,0,0,0,0,0,0
+down,0,82,0,0,0,0,1,2,0,0
+fist_close,1,0,79,0,0,4,1,0,0,0
+left,0,0,0,79,0,0,0,0,4,1
+pinch_thumb_index,0,0,0,0,82,0,0,0,0,2
+rest,1,0,0,0,3,917,1,6,0,2
+right,0,1,0,0,0,1,83,0,0,0
+thumbs_up,0,0,0,0,0,0,0,84,0,0
+up,0,0,0,2,0,0,0,0,80,3
+victory_sign,0,0,0,0,0,0,0,0,3,81
