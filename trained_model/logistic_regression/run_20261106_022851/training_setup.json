@@ -1,0 +1,26 @@
+{
+  "created_at_text": "2026-11-06 02:28:42",
+  "dataset_paths": [
+    "dataset/S01_day01_right_20261105T195454Z/signals_S01_day01_right_20261105T195454Z.csv"
+  ],
+  "output_dir": "trained_model",
+  "run_name": "run",
+  "model": "logistic_regression",
+  "model_name": "Logistic Regression",
+  "model_params": {
+    "c": 1.0
+  },
+  "input_kind": "features",
+  "window_ms": 200,
+  "stride_ms": 50,
+  "trim_ms": 250,
+  "window_samples": 100,
+  "stride_samples": 25,
+  "test_size": 0.2,
+  "split_mode": "segments",
+  "random_seed": 42,
+  "class_weight_balanced": true,
+  "auto_load_model": true,
+  "sample_rate_hz": 500,
+  "input_channels": 8
+}

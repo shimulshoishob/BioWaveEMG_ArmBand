@@ -1,0 +1,625 @@
+{
+  "session": "S406_day01_right-left_20261108T034024Z",
+  "rows_total": 303325,
+  "rows_valid": 298510,
+  "valid_sample_ratio": 0.9841259375257562,
+  "loss_pct_valid_samples": 1.5874062474243833,
+  "min_valid_sample_ratio": 0.98,
+  "meets_valid_sample_threshold": true,
+  "sample_rate_hz": 500,
+  "transport": {
+    "kind": "wireless",
+    "packets_received": 68008,
+    "packets_missing": 1071,
+    "packets_late": 0,
+    "packets_duplicate": 0,
+    "packets_out_of_order": 486,
+    "packets_invalid": 0,
+    "frames_missing": 5355,
+    "loss_pct_packets": 1.5503988187437572,
+    "max_packet_gap_ms": 1481.99799998838,
+    "jitter_ms": 20.429165564976625
+  },
+  "gaps": [
+    {
+      "start_frame": 67149,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 67904,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 68534,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 68554,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 68569,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 68584,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 68759,
+      "length": 20,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 68784,
+      "length": 35,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 69304,
+      "length": 15,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 69324,
+      "length": 5,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 69334,
+      "length": 10,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 69354,
+      "length": 5,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 70659,
+      "length": 15,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 73464,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 73559,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 74039,
+      "length": 20,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 74654,
+      "length": 25,
+      "label": "right",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 76489,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 77299,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 77409,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 77424,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 77434,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 77444,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 77534,
+      "length": 125,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 77789,
+      "length": 625,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 78499,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 84684,
+      "length": 5,
+      "label": "up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 84729,
+      "length": 5,
+      "label": "up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 84984,
+      "length": 295,
+      "label": "up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 85864,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 89159,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 89504,
+      "length": 10,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 91164,
+      "length": 35,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 91939,
+      "length": 25,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 92124,
+      "length": 95,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 93069,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 93079,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 93104,
+      "length": 15,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 93129,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 93369,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 93384,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 100119,
+      "length": 5,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 100129,
+      "length": 5,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 100154,
+      "length": 5,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 100334,
+      "length": 50,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 100609,
+      "length": 60,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 100679,
+      "length": 5,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 100869,
+      "length": 200,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 101399,
+      "length": 590,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 108164,
+      "length": 40,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 108299,
+      "length": 40,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 108854,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 108879,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 109079,
+      "length": 50,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 113374,
+      "length": 175,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 120299,
+      "length": 200,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 120869,
+      "length": 165,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 215609,
+      "length": 10,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 215714,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 215749,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 215789,
+      "length": 85,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 216084,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 219784,
+      "length": 5,
+      "label": "rest",
+      "phase": "switch_hand"
+    },
+    {
+      "start_frame": 219969,
+      "length": 30,
+      "label": "rest",
+      "phase": "switch_hand"
+    },
+    {
+      "start_frame": 222624,
+      "length": 10,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 223139,
+      "length": 10,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 223419,
+      "length": 15,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 223934,
+      "length": 20,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 224159,
+      "length": 85,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 232709,
+      "length": 10,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 247969,
+      "length": 85,
+      "label": "double_fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 250509,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 251379,
+      "length": 215,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 251669,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 253684,
+      "length": 10,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 259164,
+      "length": 15,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 259604,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 259724,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 259924,
+      "length": 125,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 260114,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 260379,
+      "length": 15,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 261219,
+      "length": 25,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 267524,
+      "length": 75,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 267759,
+      "length": 245,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 268339,
+      "length": 5,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 269659,
+      "length": 90,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 317299,
+      "length": 100,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 336559,
+      "length": 260,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 346464,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 347099,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 356204,
+      "length": 35,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 356719,
+      "length": 25,
+      "label": "prepare",
+      "phase": "prepare"
+    }
+  ],
+  "device_counters": {
+    "queue_drops": 0,
+    "acq_overruns": 2,
+    "send_failures": 1220,
+    "wifi_reconnects": 0
+  },
+  "late_frames": 0,
+  "keepalive_restarts": [],
+  "emg_channels_recorded": 8,
+  "clipping_pct_per_channel": [
+    0.1461,
+    0.0,
+    2.9292,
+    0.2124,
+    0.0,
+    0.1581,
+    0.0382,
+    0.3253
+  ],
+  "phases": {
+    "end": {
+      "expected_frames": 0,
+      "actual_frames": 0,
+      "valid_frames": 0
+    },
+    "perform": {
+      "expected_frames": 90000,
+      "actual_frames": 89885,
+      "valid_frames": 88590
+    },
+    "prepare": {
+      "expected_frames": 120000,
+      "actual_frames": 120193,
+      "valid_frames": 118288
+    },
+    "rest": {
+      "expected_frames": 90000,
+      "actual_frames": 90432,
+      "valid_frames": 88852
+    },
+    "switch_hand": {
+      "expected_frames": 150000,
+      "actual_frames": 2815,
+      "valid_frames": 2780
+    }
+  },
+  "latency_estimate_s": 0.02822395000839606,
+  "events": 182
+}

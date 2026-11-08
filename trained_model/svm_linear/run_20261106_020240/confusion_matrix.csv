@@ -1,0 +1,7 @@
+actual/predicted,down,fist_close,left,rest,right,up
+down,27,0,0,0,0,0
+fist_close,0,28,0,0,0,0
+left,1,0,28,0,0,0
+rest,0,0,1,192,0,0
+right,0,0,0,1,27,0
+up,0,1,0,0,0,27

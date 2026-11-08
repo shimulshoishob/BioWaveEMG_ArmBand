@@ -1,0 +1,252 @@
+{
+  "created_at_text": "2026-11-08 02:15:32",
+  "accuracy": 0.9763313609467456,
+  "balanced_accuracy": 0.9666833830306315,
+  "macro_f1": 0.9626239922347496,
+  "train_windows": 6756,
+  "test_windows": 1690,
+  "train_seconds": 0.995496200004709,
+  "latency_ms": 71.85039999991811,
+  "num_features": 156,
+  "model": "random_forest",
+  "model_name": "Random Forest",
+  "model_params": {
+    "n_estimators": 150,
+    "max_depth": 16,
+    "min_samples_leaf": 2
+  },
+  "classes": [
+    "double_fist_close",
+    "down",
+    "fist_close",
+    "left",
+    "pinch_thumb_index",
+    "rest",
+    "right",
+    "thumbs_up",
+    "up",
+    "victory_sign"
+  ],
+  "class_window_counts": {
+    "double_fist_close": 421,
+    "down": 423,
+    "fist_close": 422,
+    "left": 422,
+    "pinch_thumb_index": 422,
+    "rest": 4646,
+    "right": 425,
+    "thumbs_up": 421,
+    "up": 422,
+    "victory_sign": 422
+  },
+  "segment_count_by_file": {
+    "dataset/testing/S405_day01_left_20261107T195839Z/signals_S405_day01_left_20261107T195839Z.csv": 180
+  },
+  "channel_count_by_file": {
+    "dataset/testing/S405_day01_left_20261107T195839Z/signals_S405_day01_left_20261107T195839Z.csv": 8
+  },
+  "input_channels": 8,
+  "skipped_channel_segments": 0,
+  "confusion_matrix": [
+    [
+      83,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      82,
+      0,
+      0,
+      0,
+      0,
+      1,
+      2,
+      0,
+      0
+    ],
+    [
+      1,
+      0,
+      79,
+      0,
+      0,
+      4,
+      1,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      79,
+      0,
+      0,
+      0,
+      0,
+      4,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      82,
+      0,
+      0,
+      0,
+      0,
+      2
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      3,
+      917,
+      1,
+      6,
+      0,
+      2
+    ],
+    [
+      0,
+      1,
+      0,
+      0,
+      0,
+      1,
+      83,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      84,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      2,
+      0,
+      0,
+      0,
+      0,
+      80,
+      3
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      3,
+      81
+    ]
+  ],
+  "classification_report_text": "                   precision     recall   f1-score    support\n\ndouble_fist_close     0.9765     0.9881     0.9822         84\n             down     0.9880     0.9647     0.9762         85\n       fist_close     0.9875     0.9294     0.9576         85\n             left     0.9753     0.9405     0.9576         84\npinch_thumb_index     0.9647     0.9762     0.9704         84\n             rest     0.9946     0.9860     0.9903        930\n            right     0.9651     0.9765     0.9708         85\n        thumbs_up     0.9130     1.0000     0.9545         84\n               up     0.9195     0.9412     0.9302         85\n     victory_sign     0.9101     0.9643     0.9364         84\n\n         accuracy                           0.9763       1690\n        macro avg     0.9594     0.9667     0.9626       1690\n     weighted avg     0.9770     0.9763     0.9765       1690",
+  "classification_report_dict": {
+    "double_fist_close": {
+      "precision": 0.9764705882352941,
+      "recall": 0.9880952380952381,
+      "f1-score": 0.9822485207100592,
+      "support": 84.0
+    },
+    "down": {
+      "precision": 0.9879518072289156,
+      "recall": 0.9647058823529412,
+      "f1-score": 0.9761904761904762,
+      "support": 85.0
+    },
+    "fist_close": {
+      "precision": 0.9875,
+      "recall": 0.9294117647058824,
+      "f1-score": 0.9575757575757575,
+      "support": 85.0
+    },
+    "left": {
+      "precision": 0.9753086419753086,
+      "recall": 0.9404761904761905,
+      "f1-score": 0.9575757575757575,
+      "support": 84.0
+    },
+    "pinch_thumb_index": {
+      "precision": 0.9647058823529412,
+      "recall": 0.9761904761904762,
+      "f1-score": 0.9704142011834319,
+      "support": 84.0
+    },
+    "rest": {
+      "precision": 0.9945770065075922,
+      "recall": 0.986021505376344,
+      "f1-score": 0.990280777537797,
+      "support": 930.0
+    },
+    "right": {
+      "precision": 0.9651162790697675,
+      "recall": 0.9764705882352941,
+      "f1-score": 0.9707602339181286,
+      "support": 85.0
+    },
+    "thumbs_up": {
+      "precision": 0.9130434782608695,
+      "recall": 1.0,
+      "f1-score": 0.9545454545454546,
+      "support": 84.0
+    },
+    "up": {
+      "precision": 0.9195402298850575,
+      "recall": 0.9411764705882353,
+      "f1-score": 0.9302325581395349,
+      "support": 85.0
+    },
+    "victory_sign": {
+      "precision": 0.9101123595505618,
+      "recall": 0.9642857142857143,
+      "f1-score": 0.9364161849710982,
+      "support": 84.0
+    },
+    "accuracy": 0.9763313609467456,
+    "macro avg": {
+      "precision": 0.9594326273066308,
+      "recall": 0.9666833830306315,
+      "f1-score": 0.9626239922347496,
+      "support": 1690.0
+    },
+    "weighted avg": {
+      "precision": 0.9770388537036546,
+      "recall": 0.9763313609467456,
+      "f1-score": 0.9764594380473312,
+      "support": 1690.0
+    }
+  },
+  "history": [],
+  "model_file": "random_forest_model.joblib",
+  "run_dir": "trained_model/random_forest/run_20261108_021534",
+  "model_path": "trained_model/random_forest/run_20261108_021534/random_forest_model.joblib"
+}

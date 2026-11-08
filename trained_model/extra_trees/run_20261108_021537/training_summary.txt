@@ -1,0 +1,10 @@
+Model: Extra Trees
+Run Folder: trained_model/extra_trees/run_20261108_021537
+Model File: trained_model/extra_trees/run_20261108_021537/extra_trees_model.joblib
+Recordings: 1 file(s) | Split: segments
+Accuracy: 0.9870 | Balanced accuracy: 0.9772 | Macro F1: 0.9782
+Train windows: 6756 | Test windows: 1690
+Training time: 0.8 s | Prediction time: 85.00 ms per window
+Window: 200 ms (100 samples) | Stride: 50 ms (25 samples) | Edge trim: 250 ms
+Input channels: 8
+Classes: double_fist_close, down, fist_close, left, pinch_thumb_index, rest, right, thumbs_up, up, victory_sign

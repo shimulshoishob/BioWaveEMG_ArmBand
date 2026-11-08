@@ -1,0 +1,146 @@
+{
+  "created_at_text": "2026-11-06 02:03:53",
+  "accuracy": 0.975975975975976,
+  "balanced_accuracy": 0.9729414992725696,
+  "macro_f1": 0.9658104339153827,
+  "train_windows": 1328,
+  "test_windows": 333,
+  "train_seconds": 0.20329560000027413,
+  "latency_ms": 5.287546666659182,
+  "num_features": 156,
+  "model": "logistic_regression",
+  "model_name": "Logistic Regression",
+  "model_params": {
+    "c": 1.0
+  },
+  "classes": [
+    "down",
+    "fist_close",
+    "left",
+    "rest",
+    "right",
+    "up"
+  ],
+  "class_window_counts": {
+    "down": 137,
+    "fist_close": 141,
+    "left": 142,
+    "rest": 961,
+    "right": 140,
+    "up": 140
+  },
+  "segment_count_by_file": {
+    "dataset/S01_day01_right_20261105T195454Z/signals_S01_day01_right_20261105T195454Z.csv": 39
+  },
+  "channel_count_by_file": {
+    "dataset/S01_day01_right_20261105T195454Z/signals_S01_day01_right_20261105T195454Z.csv": 8
+  },
+  "input_channels": 8,
+  "skipped_channel_segments": 1,
+  "confusion_matrix": [
+    [
+      27,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      28,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      0,
+      28,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      3,
+      189,
+      1,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      1,
+      27,
+      0
+    ],
+    [
+      0,
+      2,
+      0,
+      0,
+      0,
+      26
+    ]
+  ],
+  "classification_report_text": "              precision     recall   f1-score    support\n\n        down     0.9643     1.0000     0.9818         27\n  fist_close     0.9333     1.0000     0.9655         28\n        left     0.9032     0.9655     0.9333         29\n        rest     0.9947     0.9793     0.9869        193\n       right     0.9643     0.9643     0.9643         28\n          up     1.0000     0.9286     0.9630         28\n\n    accuracy                           0.9760        333\n   macro avg     0.9600     0.9729     0.9658        333\nweighted avg     0.9770     0.9760     0.9761        333",
+  "classification_report_dict": {
+    "down": {
+      "precision": 0.9642857142857143,
+      "recall": 1.0,
+      "f1-score": 0.9818181818181818,
+      "support": 27.0
+    },
+    "fist_close": {
+      "precision": 0.9333333333333333,
+      "recall": 1.0,
+      "f1-score": 0.9655172413793104,
+      "support": 28.0
+    },
+    "left": {
+      "precision": 0.9032258064516129,
+      "recall": 0.9655172413793104,
+      "f1-score": 0.9333333333333333,
+      "support": 29.0
+    },
+    "rest": {
+      "precision": 0.9947368421052631,
+      "recall": 0.9792746113989638,
+      "f1-score": 0.9869451697127938,
+      "support": 193.0
+    },
+    "right": {
+      "precision": 0.9642857142857143,
+      "recall": 0.9642857142857143,
+      "f1-score": 0.9642857142857143,
+      "support": 28.0
+    },
+    "up": {
+      "precision": 1.0,
+      "recall": 0.9285714285714286,
+      "f1-score": 0.9629629629629629,
+      "support": 28.0
+    },
+    "accuracy": 0.975975975975976,
+    "macro avg": {
+      "precision": 0.9599779017436063,
+      "recall": 0.9729414992725696,
+      "f1-score": 0.9658104339153827,
+      "support": 333.0
+    },
+    "weighted avg": {
+      "precision": 0.9770174370344149,
+      "recall": 0.975975975975976,
+      "f1-score": 0.9761370001558872,
+      "support": 333.0
+    }
+  },
+  "history": [],
+  "model_file": "logistic_regression_model.joblib",
+  "run_dir": "trained_model/logistic_regression/run_20261106_020359",
+  "model_path": "trained_model/logistic_regression/run_20261106_020359/logistic_regression_model.joblib"
+}

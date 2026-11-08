@@ -1,0 +1,147 @@
+{
+  "created_at_text": "2026-11-06 02:03:53",
+  "accuracy": 0.984984984984985,
+  "balanced_accuracy": 0.9702228911999028,
+  "macro_f1": 0.9774966247207261,
+  "train_windows": 1328,
+  "test_windows": 333,
+  "train_seconds": 0.47097919999987425,
+  "latency_ms": 101.38243999999759,
+  "num_features": 156,
+  "model": "extra_trees",
+  "model_name": "Extra Trees",
+  "model_params": {
+    "n_estimators": 200,
+    "max_depth": 0
+  },
+  "classes": [
+    "down",
+    "fist_close",
+    "left",
+    "rest",
+    "right",
+    "up"
+  ],
+  "class_window_counts": {
+    "down": 137,
+    "fist_close": 141,
+    "left": 142,
+    "rest": 961,
+    "right": 140,
+    "up": 140
+  },
+  "segment_count_by_file": {
+    "dataset/S01_day01_right_20261105T195454Z/signals_S01_day01_right_20261105T195454Z.csv": 39
+  },
+  "channel_count_by_file": {
+    "dataset/S01_day01_right_20261105T195454Z/signals_S01_day01_right_20261105T195454Z.csv": 8
+  },
+  "input_channels": 8,
+  "skipped_channel_segments": 1,
+  "confusion_matrix": [
+    [
+      26,
+      0,
+      0,
+      1,
+      0,
+      0
+    ],
+    [
+      1,
+      27,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      0,
+      28,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      193,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      2,
+      26,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      28
+    ]
+  ],
+  "classification_report_text": "              precision     recall   f1-score    support\n\n        down     0.9286     0.9630     0.9455         27\n  fist_close     1.0000     0.9643     0.9818         28\n        left     1.0000     0.9655     0.9825         29\n        rest     0.9847     1.0000     0.9923        193\n       right     1.0000     0.9286     0.9630         28\n          up     1.0000     1.0000     1.0000         28\n\n    accuracy                           0.9850        333\n   macro avg     0.9855     0.9702     0.9775        333\nweighted avg     0.9853     0.9850     0.9849        333",
+  "classification_report_dict": {
+    "down": {
+      "precision": 0.9285714285714286,
+      "recall": 0.9629629629629629,
+      "f1-score": 0.9454545454545454,
+      "support": 27.0
+    },
+    "fist_close": {
+      "precision": 1.0,
+      "recall": 0.9642857142857143,
+      "f1-score": 0.9818181818181818,
+      "support": 28.0
+    },
+    "left": {
+      "precision": 1.0,
+      "recall": 0.9655172413793104,
+      "f1-score": 0.9824561403508771,
+      "support": 29.0
+    },
+    "rest": {
+      "precision": 0.9846938775510204,
+      "recall": 1.0,
+      "f1-score": 0.9922879177377892,
+      "support": 193.0
+    },
+    "right": {
+      "precision": 1.0,
+      "recall": 0.9285714285714286,
+      "f1-score": 0.9629629629629629,
+      "support": 28.0
+    },
+    "up": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1-score": 1.0,
+      "support": 28.0
+    },
+    "accuracy": 0.984984984984985,
+    "macro avg": {
+      "precision": 0.9855442176870749,
+      "recall": 0.9702228911999028,
+      "f1-score": 0.9774966247207261,
+      "support": 333.0
+    },
+    "weighted avg": {
+      "precision": 0.9853373781945212,
+      "recall": 0.984984984984985,
+      "f1-score": 0.9849367596838243,
+      "support": 333.0
+    }
+  },
+  "history": [],
+  "model_file": "extra_trees_model.joblib",
+  "run_dir": "trained_model/extra_trees/run_20261106_020358",
+  "model_path": "trained_model/extra_trees/run_20261106_020358/extra_trees_model.joblib"
+}

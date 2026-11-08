@@ -1,0 +1,1172 @@
+{
+  "session": "S100_day01_left_20261107T182227Z",
+  "rows_total": 150190,
+  "rows_valid": 143765,
+  "valid_sample_ratio": 0.9572208535854584,
+  "loss_pct_valid_samples": 4.277914641454162,
+  "min_valid_sample_ratio": 0.98,
+  "meets_valid_sample_threshold": false,
+  "sample_rate_hz": 500,
+  "transport": {
+    "kind": "wireless",
+    "packets_received": 41741,
+    "packets_missing": 2175,
+    "packets_late": 0,
+    "packets_duplicate": 0,
+    "packets_out_of_order": 1475,
+    "packets_invalid": 0,
+    "frames_missing": 10875,
+    "loss_pct_packets": 4.952636852172329,
+    "max_packet_gap_ms": 1156.2080000003334,
+    "jitter_ms": 31.300083739653456
+  },
+  "gaps": [
+    {
+      "start_frame": 121024,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 121069,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 122629,
+      "length": 10,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 122644,
+      "length": 10,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 122819,
+      "length": 115,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 123689,
+      "length": 20,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 124729,
+      "length": 25,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 126824,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 126839,
+      "length": 50,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 127014,
+      "length": 15,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 129594,
+      "length": 25,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 131034,
+      "length": 50,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 132539,
+      "length": 5,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 132599,
+      "length": 5,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 133069,
+      "length": 75,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 134574,
+      "length": 40,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 134699,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 135189,
+      "length": 65,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 135774,
+      "length": 15,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 137689,
+      "length": 5,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 137914,
+      "length": 5,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 137924,
+      "length": 5,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 137934,
+      "length": 15,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 137964,
+      "length": 5,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 138054,
+      "length": 90,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 138149,
+      "length": 30,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 138244,
+      "length": 40,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 138594,
+      "length": 255,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 138869,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 141764,
+      "length": 50,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 141819,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 141829,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 141979,
+      "length": 80,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 142254,
+      "length": 35,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 142869,
+      "length": 15,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 145149,
+      "length": 55,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 145584,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 145769,
+      "length": 30,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 145819,
+      "length": 40,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 152679,
+      "length": 5,
+      "label": "double_fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 152714,
+      "length": 40,
+      "label": "double_fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 154819,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 155564,
+      "length": 25,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 155664,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 155939,
+      "length": 40,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 158329,
+      "length": 30,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 159069,
+      "length": 40,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 159669,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 168179,
+      "length": 25,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 177839,
+      "length": 5,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 177859,
+      "length": 5,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 177884,
+      "length": 10,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 178089,
+      "length": 15,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 178679,
+      "length": 15,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 179269,
+      "length": 20,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 179359,
+      "length": 80,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 181454,
+      "length": 30,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 182644,
+      "length": 5,
+      "label": "double_fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 184374,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 186034,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 186044,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 186304,
+      "length": 85,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 186729,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 186764,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 186774,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 186784,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 186794,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 215739,
+      "length": 15,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 217894,
+      "length": 75,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 219309,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 223409,
+      "length": 135,
+      "label": "right",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 223609,
+      "length": 10,
+      "label": "right",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 223794,
+      "length": 45,
+      "label": "right",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 223914,
+      "length": 5,
+      "label": "right",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 223924,
+      "length": 15,
+      "label": "right",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 224094,
+      "length": 95,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 224294,
+      "length": 20,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 224394,
+      "length": 15,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 225364,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 225374,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 225384,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 225394,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 225404,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 227364,
+      "length": 30,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 227629,
+      "length": 110,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 227744,
+      "length": 5,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 227754,
+      "length": 5,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 227774,
+      "length": 5,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 227789,
+      "length": 10,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 227979,
+      "length": 35,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 228099,
+      "length": 5,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 228109,
+      "length": 90,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 228214,
+      "length": 25,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 228264,
+      "length": 140,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 228434,
+      "length": 390,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 228889,
+      "length": 30,
+      "label": "pinch_thumb_index",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 229019,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 229069,
+      "length": 20,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 229429,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 229579,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 229594,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 230484,
+      "length": 50,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 231244,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 231289,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 231299,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 231319,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 231629,
+      "length": 30,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 231814,
+      "length": 80,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 233069,
+      "length": 5,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 233079,
+      "length": 10,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 233099,
+      "length": 10,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 233164,
+      "length": 80,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 233289,
+      "length": 10,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 233374,
+      "length": 25,
+      "label": "fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 235029,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 235264,
+      "length": 130,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 236604,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 236644,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 237904,
+      "length": 5,
+      "label": "double_fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 237914,
+      "length": 5,
+      "label": "double_fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 238084,
+      "length": 110,
+      "label": "double_fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 238269,
+      "length": 5,
+      "label": "double_fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 238449,
+      "length": 45,
+      "label": "double_fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 238514,
+      "length": 20,
+      "label": "double_fist_close",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 242139,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 242149,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 242359,
+      "length": 45,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 242989,
+      "length": 10,
+      "label": "up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 243064,
+      "length": 5,
+      "label": "up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 243174,
+      "length": 110,
+      "label": "up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 243379,
+      "length": 15,
+      "label": "up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 243419,
+      "length": 35,
+      "label": "up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 243459,
+      "length": 5,
+      "label": "up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 243684,
+      "length": 80,
+      "label": "up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 244469,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 244934,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 245129,
+      "length": 75,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 245334,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 245359,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 245419,
+      "length": 30,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 245544,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 246584,
+      "length": 10,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 247564,
+      "length": 25,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 247739,
+      "length": 30,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 247794,
+      "length": 20,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 247924,
+      "length": 70,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 248069,
+      "length": 20,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 248954,
+      "length": 10,
+      "label": "left",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 250004,
+      "length": 5,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 250079,
+      "length": 55,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 251559,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 253124,
+      "length": 45,
+      "label": "victory_sign",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 254229,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 256349,
+      "length": 85,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 256879,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 256939,
+      "length": 5,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 257894,
+      "length": 15,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 257914,
+      "length": 5,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 257924,
+      "length": 15,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 257969,
+      "length": 10,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 258049,
+      "length": 20,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 258074,
+      "length": 150,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 258324,
+      "length": 295,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 258624,
+      "length": 15,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 258669,
+      "length": 140,
+      "label": "thumbs_up",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 258929,
+      "length": 30,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 258969,
+      "length": 210,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 259329,
+      "length": 10,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 259689,
+      "length": 90,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 259814,
+      "length": 25,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 259904,
+      "length": 40,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 264024,
+      "length": 5,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 264059,
+      "length": 90,
+      "label": "down",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 264279,
+      "length": 20,
+      "label": "rest",
+      "phase": "rest"
+    },
+    {
+      "start_frame": 265499,
+      "length": 220,
+      "label": "prepare",
+      "phase": "prepare"
+    },
+    {
+      "start_frame": 267574,
+      "length": 55,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 267919,
+      "length": 5,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 267939,
+      "length": 30,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 267994,
+      "length": 25,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 268024,
+      "length": 5,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 268034,
+      "length": 5,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 268044,
+      "length": 15,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 268189,
+      "length": 80,
+      "label": "rest",
+      "phase": "perform"
+    },
+    {
+      "start_frame": 268274,
+      "length": 10,
+      "label": "rest",
+      "phase": "perform"
+    }
+  ],
+  "device_counters": {
+    "queue_drops": 0,
+    "acq_overruns": 1,
+    "send_failures": 1682,
+    "wifi_reconnects": 0
+  },
+  "late_frames": 0,
+  "keepalive_restarts": [],
+  "emg_channels_recorded": 8,
+  "clipping_pct_per_channel": [
+    2.9054,
+    0.0,
+    0.0,
+    0.962,
+    0.0035,
+    0.3408,
+    5.7684,
+    1.5546
+  ],
+  "phases": {
+    "end": {
+      "expected_frames": 0,
+      "actual_frames": 0,
+      "valid_frames": 0
+    },
+    "perform": {
+      "expected_frames": 45000,
+      "actual_frames": 44510,
+      "valid_frames": 41175
+    },
+    "prepare": {
+      "expected_frames": 60000,
+      "actual_frames": 60160,
+      "valid_frames": 58905
+    },
+    "rest": {
+      "expected_frames": 45000,
+      "actual_frames": 45520,
+      "valid_frames": 43685
+    }
+  },
+  "latency_estimate_s": 0.10140720000345027,
+  "events": 91
+}
