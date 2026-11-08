@@ -2330,7 +2330,7 @@ class TaskProtocolWidget(QWidget):
         self.rest_ms = int(DEFAULT_TASK_REST_S * 1000)
         self.settle_ms = int(DEFAULT_TASK_SETTLE_S * 1000)
         self.record_rest = True
-        self.randomize_order = True
+        self.randomize_order = False
         self.seed = 0
         self.hand_order = DEFAULT_HAND_ORDER
         self.session_day = DEFAULT_SESSION_DAY
@@ -2464,7 +2464,7 @@ class TaskProtocolWidget(QWidget):
 
     # -- configuration -----------------------------------------------------------
     def configure(self, labels, repeats, prep_s, hold_s, rest_s, record_rest=True,
-                  settle_s=DEFAULT_TASK_SETTLE_S, randomize_order=True, hand_order=DEFAULT_HAND_ORDER,
+                  settle_s=DEFAULT_TASK_SETTLE_S, randomize_order=False, hand_order=DEFAULT_HAND_ORDER,
                   session_day=DEFAULT_SESSION_DAY, max_cycles_per_block=DEFAULT_MAX_CYCLES_PER_BLOCK,
                   block_break_s=0, hand_switch_s=0, seed=0):   # break arguments are accepted and ignored: no breaks
         self.seed = int(seed)
@@ -2534,8 +2534,7 @@ class TaskProtocolWidget(QWidget):
     def build_steps(self):
         """Flatten the study design into timed steps.
 
-        Per hand: `repeats` repetitions of every class (order shuffled per repetition so
-        fatigue is spread across classes). There are no breaks: the cycles run back to back.
+        Per hand: `repeats` repetitions of every class (classes appear in the fixed list order every repetition, no shuffling). There are no breaks: the cycles run back to back.
         Trial ids keep counting up across hands so (label, trial) stays unique in the CSV.
         """
         steps = []
@@ -4371,7 +4370,7 @@ class DataCollectionDialog(QDialog):
             "record_rest": bool(self.check_record_rest.isChecked()),
             "repeats": int(self.spin_task_repeats.value()),
             **self._fixed_plan,
-            "randomize_order": True,          # mandatory: fatigue is spread across gestures
+            "randomize_order": False,         # gestures always appear in the fixed list order
             "csv_dir": self.input_record_dir.text().strip(),
         }
 
@@ -5778,7 +5777,7 @@ class EMGVisualizer(QMainWindow):
         self.task_rest_s = float(DEFAULT_TASK_REST_S)
         self.task_record_rest = True
         self.task_settle_s = float(DEFAULT_TASK_SETTLE_S)
-        self.task_randomize_order = True
+        self.task_randomize_order = False
         self.task_session_active = False
         self.record_save_dir = DATASET_DIR
         self.last_recorded_csv_path = os.path.join(DATASET_DIR, DEFAULT_RECORD_CSV)
@@ -7817,7 +7816,7 @@ class EMGVisualizer(QMainWindow):
             f"rest_s={float(self.task_rest_s)}",
             f"record_rest={bool(self.task_record_rest)}",
             f"settle_s={float(self.task_settle_s)}",
-            f"randomize_order={bool(self.task_randomize_order or not self.study_meta['practice_mode'])}",
+            f"randomize_order={bool(self.task_randomize_order)}",
             f"random_seed={int(self.study_meta['seed'])}",
             f"practice_mode={bool(self.study_meta['practice_mode'])}",
             f"hand_order_source={self.study_meta['hand_order_source']}",
@@ -7998,7 +7997,7 @@ class EMGVisualizer(QMainWindow):
                       "prepare_s": float(self.task_prep_s), "perform_s": float(self.task_hold_s),
                       "rest_s": float(self.task_rest_s), "settle_s": float(self.task_settle_s),
                       "record_rest": bool(self.task_record_rest),
-                      "randomize_order": bool(self.task_randomize_order or not sm["practice_mode"]),
+                      "randomize_order": bool(self.task_randomize_order),
                       "breaks": "none (one continuous session)",
                       "recording": "continuous (all phases), labelled afterwards by device frame ID"},
             environment={"temperature_c": float(sm["temp_start_c"]), "humidity_pct": float(sm["humidity_start_pct"])},
@@ -8098,7 +8097,7 @@ class EMGVisualizer(QMainWindow):
             rest_s=self.task_rest_s,
             record_rest=self.task_record_rest,
             settle_s=self.task_settle_s,
-            randomize_order=True if not self.study_meta["practice_mode"] else self.task_randomize_order,
+            randomize_order=bool(self.task_randomize_order),
             seed=self.study_meta["seed"],
             hand_order=self.study_meta["hand_order"],
             session_day=self.study_meta["session_day"],
@@ -9911,8 +9910,8 @@ class EMGVisualizer(QMainWindow):
                 ("Repeats per hand", str(self.task_repeats), "Repetitions of every class per hand (study: 9); editable next to the Time button."),
                 ("Prepare / Perform / Rest", f"{self.task_prep_s:g} / {self.task_hold_s:g} / {self.task_rest_s:g} s",
                  "Fixed by the study: one task cycle is 4 + 3 + 3 = 10 s (not editable)."),
-                ("Randomize order", "Always on",
-                 f"Gesture order is shuffled each repetition from a per-session seed ({sm['seed'] or 'set at Proceed'}), saved in the metadata."),
+                ("Gesture order", "Sequential",
+                 "Every repetition shows all gestures in the same fixed list order (no shuffling)."),
                 ("Session length", "No breaks",
                  "The cycles run back to back. The Session Activity panel shows elapsed time, time left and total time; "
                  f"the CSV progress bar and packet-loss line stay visible for the whole session. A background checkpoint is saved every {CHECKPOINT_EVERY_CYCLES} cycles."),

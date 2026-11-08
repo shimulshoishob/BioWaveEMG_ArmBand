@@ -15,20 +15,27 @@ def order(widget):
 
 
 class ProtocolTests(unittest.TestCase):
-    def widget(self, seed, randomize=True, hand_order="left_right"):
+    def widget(self, seed, randomize=False, hand_order="left_right"):
         w = app.TaskProtocolWidget()
         w.configure(app.DEFAULT_TASK_LABELS.split(","), 3, 4, 3, 3, randomize_order=randomize, hand_order=hand_order, seed=seed)
         return w
 
-    def test_same_seed_same_order_different_seed_different_order(self):
-        self.assertEqual(order(self.widget(123)), order(self.widget(123)))
-        self.assertNotEqual(order(self.widget(123)), order(self.widget(124)))
+    def test_default_order_is_sequential_in_every_repetition(self):
+        labels = app.DEFAULT_TASK_LABELS.split(",")
+        steps = order(self.widget(123))
+        self.assertEqual(steps, order(self.widget(124)))
+        n = len(labels)
+        for i in range(0, 3 * n, n):
+            self.assertEqual([x[2] for x in steps[i:i + n]], labels)
+
+    def test_shuffle_only_when_explicitly_requested(self):
+        self.assertNotEqual(order(self.widget(123, randomize=True)), order(self.widget(124, randomize=True)))
 
     def test_randomization_actually_shuffles_and_can_be_off_for_practice(self):
         fixed = order(self.widget(1, randomize=False))
         labels = app.DEFAULT_TASK_LABELS.split(",")
         self.assertEqual([x[2] for x in fixed[:10]], labels)
-        self.assertNotEqual([x[2] for x in order(self.widget(1))[:10]], labels)
+        self.assertNotEqual([x[2] for x in order(self.widget(1, randomize=True))[:10]], labels)
 
     def test_no_breaks_and_no_removed_options(self):
         w = self.widget(5, hand_order="left")
@@ -41,7 +48,7 @@ class ProtocolTests(unittest.TestCase):
         for gone in ("spin_hand_switch", "check_practice", "check_randomize_order", "input_photo"):
             self.assertFalse(hasattr(d, gone), gone)
         payload = d.settings_payload()
-        self.assertTrue(payload["randomize_order"])
+        self.assertFalse(payload["randomize_order"])
         self.assertEqual((payload["block_break_s"], payload["hand_switch_s"]), (0.0, 0.0))
 
     def test_hand_must_be_chosen_every_session_and_only_left_or_right_exist(self):
